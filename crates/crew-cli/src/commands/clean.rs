@@ -26,7 +26,7 @@ pub struct CleanCommand {
 
 impl Executable for CleanCommand {
     fn execute(self) -> Result<()> {
-        println!("{}", "dora-crew clean".cyan().bold());
+        println!("{}", "crew-rs clean".cyan().bold());
         println!();
 
         let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());

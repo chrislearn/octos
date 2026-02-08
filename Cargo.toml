@@ -12,9 +12,9 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85.0"
-authors = ["dora-crew team"]
+authors = ["crew-rs team"]
 license = "Apache-2.0"
-repository = "https://github.com/dora-rs/dora-crew"
+repository = "https://github.com/heyong4725/crew-rs"
 
 [workspace.dependencies]
 # Internal crates

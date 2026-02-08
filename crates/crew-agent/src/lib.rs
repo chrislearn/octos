@@ -1,4 +1,4 @@
-//! Agent runtime, tool execution, and coordination for dora-crew.
+//! Agent runtime, tool execution, and coordination for crew-rs.
 //!
 //! This crate provides:
 //! - Agent struct that runs the agent loop

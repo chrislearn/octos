@@ -1,4 +1,4 @@
-# dora-crew
+# crew-rs
 
 Rust-native coding agent orchestration framework. Build fast, modular AI coding agents with multi-provider LLM support.
 
@@ -166,7 +166,7 @@ Config values support `${VAR_NAME}` syntax:
 ## Architecture
 
 ```
-dora-crew/
+crew-rs/
   crates/
     crew-core/      # Types, task model, protocols
     crew-memory/    # Episodic memory store

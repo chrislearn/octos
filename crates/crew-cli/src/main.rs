@@ -1,4 +1,4 @@
-//! dora-crew CLI entry point.
+//! crew-rs CLI entry point.
 
 use clap::Parser;
 use color_eyre::eyre::Result;

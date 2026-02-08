@@ -1,8 +1,8 @@
-# Product Requirements Document: dora-crew
+# Product Requirements Document: crew-rs
 
 ## Executive Summary
 
-dora-crew is a Rust-native coding agent orchestration framework that enables developers to deploy, coordinate, and manage AI coding agents for software engineering tasks. The framework provides a simple CLI interface for running autonomous coding tasks with support for multiple LLM providers, resumable execution, and episodic memory.
+crew-rs is a Rust-native coding agent orchestration framework that enables developers to deploy, coordinate, and manage AI coding agents for software engineering tasks. The framework provides a simple CLI interface for running autonomous coding tasks with support for multiple LLM providers, resumable execution, and episodic memory.
 
 ## Problem Statement
 
@@ -217,7 +217,7 @@ crew run --coordinate "Implement user authentication with OAuth"
 
 ### A. Competitive Analysis
 
-| Feature | dora-crew | Codex CLI | Aider | Continue |
+| Feature | crew-rs | Codex CLI | Aider | Continue |
 |---------|-----------|-----------|-------|----------|
 | Language | Rust | Rust | Python | TypeScript |
 | Multi-provider | Yes | No | Yes | Yes |

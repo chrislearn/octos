@@ -1,6 +1,6 @@
-//! Core types, task model, and protocols for dora-crew.
+//! Core types, task model, and protocols for crew-rs.
 //!
-//! This crate defines the foundational types used across all dora-crew crates:
+//! This crate defines the foundational types used across all crew-rs crates:
 //! - Task model (Task, TaskStatus, TaskKind)
 //! - Agent roles and identifiers
 //! - Message protocol between agents

@@ -1,4 +1,4 @@
-# User Manual: dora-crew
+# User Manual: crew-rs
 
 ## Table of Contents
 
@@ -17,7 +17,7 @@
 
 ## Introduction
 
-dora-crew is a command-line tool for running AI coding agents. It enables you to:
+crew-rs is a command-line tool for running AI coding agents. It enables you to:
 
 - Execute coding tasks using natural language instructions
 - Switch between multiple LLM providers (Anthropic, OpenAI, Google)
@@ -49,8 +49,8 @@ dora-crew is a command-line tool for running AI coding agents. It enables you to
 
 ```bash
 # Clone the repository
-git clone https://github.com/dora-rs/dora-crew
-cd dora-crew
+git clone https://github.com/heyong4725/crew-rs
+cd crew-rs
 
 # Build and install
 cargo install --path crates/crew-cli
@@ -100,7 +100,7 @@ crew run "Add a hello world function to src/main.rs"
 The agent will show real-time progress:
 
 ```
-dora-crew
+crew-rs
 
 Goal: Add a hello world function to src/main.rs
 Working dir: /home/user/project
@@ -132,7 +132,7 @@ Files modified:
 
 ### Configuration Files
 
-dora-crew looks for configuration in this order:
+crew-rs looks for configuration in this order:
 
 1. `.crew/config.json` in the current directory (project-specific)
 2. `~/.config/crew/config.json` (global)
@@ -321,7 +321,7 @@ Options:
 **Example Output:**
 
 ```
-dora-crew
+crew-rs
 
 Resumable tasks:
 
@@ -354,7 +354,7 @@ Options:
 **Example Output:**
 
 ```
-dora-crew
+crew-rs
 
 Task: abc12345
 
@@ -514,7 +514,7 @@ crew run --provider anthropic \
 
 ### Understanding Task State
 
-When you run a task, dora-crew saves state to `.crew/tasks/`:
+When you run a task, crew-rs saves state to `.crew/tasks/`:
 
 ```
 .crew/

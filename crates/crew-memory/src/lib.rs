@@ -1,4 +1,4 @@
-//! Episodic memory layer for dora-crew.
+//! Episodic memory layer for crew-rs.
 //!
 //! This crate provides persistent memory for agents:
 //! - Episode storage (summaries of completed tasks)

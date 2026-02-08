@@ -24,7 +24,7 @@ pub struct InitCommand {
 
 impl Executable for InitCommand {
     fn execute(self) -> Result<()> {
-        println!("{}", "dora-crew init".cyan().bold());
+        println!("{}", "crew-rs init".cyan().bold());
         println!();
 
         let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());

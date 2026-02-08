@@ -1,8 +1,8 @@
-# Architecture Document: dora-crew
+# Architecture Document: crew-rs
 
 ## Overview
 
-dora-crew is structured as a Rust workspace with 5 crates, each with a specific responsibility. The architecture follows a layered design with clear separation of concerns.
+crew-rs is structured as a Rust workspace with 5 crates, each with a specific responsibility. The architecture follows a layered design with clear separation of concerns.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -495,7 +495,7 @@ API Call  │Fail │
 ## File Structure
 
 ```
-dora-crew/
+crew-rs/
 ├── Cargo.toml                 # Workspace definition
 ├── README.md                  # Project overview
 ├── docs/

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "CLI interface for dora-crew"
+description = "CLI interface for crew-rs"
 
 [[bin]]
 name = "crew"

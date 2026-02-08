@@ -20,7 +20,7 @@ fn test_help_command() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("dora-crew"));
+    assert!(stdout.contains("crew-rs"));
     assert!(stdout.contains("init"));
     assert!(stdout.contains("run"));
     assert!(stdout.contains("resume"));

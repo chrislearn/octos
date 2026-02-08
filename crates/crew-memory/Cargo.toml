@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Episodic memory layer for dora-crew, extends codex-state"
+description = "Episodic memory layer for crew-rs, extends codex-state"
 
 [dependencies]
 crew-core = { workspace = true }

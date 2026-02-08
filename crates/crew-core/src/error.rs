@@ -1,11 +1,11 @@
-//! Error types for dora-crew with actionable messages.
+//! Error types for crew-rs with actionable messages.
 
 use std::fmt;
 
-/// Result type for dora-crew operations.
+/// Result type for crew-rs operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Error type for dora-crew operations.
+/// Error type for crew-rs operations.
 #[derive(Debug)]
 pub struct Error {
     /// The error kind.

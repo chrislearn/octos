@@ -1,4 +1,4 @@
-//! CLI commands for dora-crew.
+//! CLI commands for crew-rs.
 
 mod clean;
 mod completions;
@@ -19,7 +19,7 @@ pub use resume::ResumeCommand;
 pub use run::RunCommand;
 pub use status::StatusCommand;
 
-/// dora-crew: Rust-native coding agent orchestration.
+/// crew-rs: Rust-native coding agent orchestration.
 #[derive(Debug, Parser)]
 #[command(name = "crew")]
 #[command(author, version, about, long_about = None)]

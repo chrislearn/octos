@@ -74,7 +74,7 @@ impl Executable for ResumeCommand {
 
 impl ResumeCommand {
     async fn run_async(self) -> Result<()> {
-        println!("{}", "dora-crew".cyan().bold());
+        println!("{}", "crew-rs".cyan().bold());
         println!();
 
         let cwd = self

@@ -1,4 +1,4 @@
-//! LLM provider abstraction for dora-crew.
+//! LLM provider abstraction for crew-rs.
 //!
 //! This crate provides a unified interface for interacting with LLM providers:
 //! - Anthropic (Claude)
