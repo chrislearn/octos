@@ -34,6 +34,9 @@ tracing-subscriber = { workspace = true }
 default = []
 telegram = ["crew-bus/telegram"]
 discord = ["crew-bus/discord"]
+slack = ["crew-bus/slack"]
+whatsapp = ["crew-bus/whatsapp"]
+feishu = ["crew-bus/feishu"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }

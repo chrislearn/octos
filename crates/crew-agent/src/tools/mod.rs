@@ -62,6 +62,11 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), Arc::new(tool));
     }
 
+    /// Register a tool from an existing Arc (for keeping a separate reference).
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.name().to_string(), tool);
+    }
+
     /// Get tool specifications for the LLM.
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools
@@ -92,6 +97,8 @@ pub mod glob_tool;
 pub mod grep_tool;
 pub mod read_file;
 pub mod shell;
+pub mod message;
+pub mod spawn;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
@@ -101,8 +108,10 @@ pub use delegate_batch::DelegateBatchTool;
 pub use edit_file::EditFileTool;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
+pub use message::MessageTool;
 pub use read_file::ReadFileTool;
 pub use shell::ShellTool;
+pub use spawn::SpawnTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;

@@ -67,9 +67,30 @@ impl MemoryStore {
             .wrap_err("failed to write today's notes")
     }
 
+    /// Read recent daily notes (excluding today). Returns `(date, content)` pairs.
+    pub async fn read_recent(&self, days: u32) -> Result<Vec<(String, String)>> {
+        let today = chrono::Local::now().date_naive();
+        let mut entries = Vec::new();
+
+        for i in 1..=days {
+            let date = today - chrono::Duration::days(i64::from(i));
+            let date_str = date.format("%Y-%m-%d").to_string();
+            let path = self.memory_dir.join(format!("{date_str}.md"));
+
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => entries.push((date_str, content)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).wrap_err("failed to read recent notes"),
+            }
+        }
+
+        Ok(entries)
+    }
+
     /// Build a formatted context string for injection into the system prompt.
     pub async fn get_memory_context(&self) -> String {
         let long_term = self.read_long_term().await.unwrap_or_default();
+        let recent = self.read_recent(7).await.unwrap_or_default();
         let today = self.read_today().await.unwrap_or_default();
 
         let mut ctx = String::new();
@@ -78,6 +99,13 @@ impl MemoryStore {
             ctx.push_str("## Long-term Memory\n\n");
             ctx.push_str(&long_term);
             ctx.push_str("\n\n");
+        }
+
+        if !recent.is_empty() {
+            ctx.push_str("## Recent Activity\n\n");
+            for (date, content) in &recent {
+                ctx.push_str(&format!("### {date}\n{content}\n\n"));
+            }
         }
 
         if !today.is_empty() {
@@ -160,5 +188,53 @@ mod tests {
         assert!(ctx.contains("I am a bot"));
         assert!(ctx.contains("## Today's Notes"));
         assert!(ctx.contains("did something"));
+    }
+
+    #[tokio::test]
+    async fn test_read_recent_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let recent = store.read_recent(7).await.unwrap();
+        assert!(recent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_recent_with_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        // Write a file for yesterday
+        let yesterday = (chrono::Local::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let path = dir.path().join("memory").join(format!("{yesterday}.md"));
+        tokio::fs::write(&path, "# yesterday\nsome notes\n")
+            .await
+            .unwrap();
+
+        let recent = store.read_recent(7).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].0, yesterday);
+        assert!(recent[0].1.contains("some notes"));
+    }
+
+    #[tokio::test]
+    async fn test_get_memory_context_includes_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        store.write_long_term("long term").await.unwrap();
+
+        // Write yesterday's notes
+        let yesterday = (chrono::Local::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let path = dir.path().join("memory").join(format!("{yesterday}.md"));
+        tokio::fs::write(&path, "yesterday notes").await.unwrap();
+
+        let ctx = store.get_memory_context().await;
+        assert!(ctx.contains("## Long-term Memory"));
+        assert!(ctx.contains("## Recent Activity"));
+        assert!(ctx.contains("yesterday notes"));
     }
 }

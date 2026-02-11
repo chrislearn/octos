@@ -22,6 +22,11 @@ impl AgentHandle {
     ) -> Result<(), mpsc::error::SendError<OutboundMessage>> {
         self.out_tx.send(msg).await
     }
+
+    /// Clone the outbound sender for use by tools (e.g. MessageTool).
+    pub fn outbound_sender(&self) -> mpsc::Sender<OutboundMessage> {
+        self.out_tx.clone()
+    }
 }
 
 /// Handle given to channels — sends inbound, receives outbound for dispatch.

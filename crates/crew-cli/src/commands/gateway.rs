@@ -7,19 +7,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Utc;
 use clap::Args;
 use colored::Colorize;
-use crew_agent::{Agent, AgentConfig, SilentReporter, SkillsLoader, ToolRegistry};
-use crew_bus::{ChannelManager, CliChannel, CronService, SessionManager, create_bus};
+use crew_agent::{Agent, AgentConfig, MessageTool, SilentReporter, SkillsLoader, SpawnTool, ToolRegistry};
+use crew_bus::{ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager, create_bus};
 use crew_core::{AgentId, AgentRole, Message, MessageRole, OutboundMessage};
 use crew_llm::{
     LlmProvider, RetryProvider, anthropic::AnthropicProvider, gemini::GeminiProvider,
-    openai::OpenAIProvider,
+    openai::OpenAIProvider, openrouter::OpenRouterProvider,
 };
 use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
 use tracing::info;
 
+use std::path::Path;
+
 use super::Executable;
-use crate::config::Config;
+use crate::config::{Config, detect_provider};
 use crate::cron_tool::CronTool;
 
 /// Run as a persistent gateway daemon.
@@ -77,12 +79,15 @@ impl GatewayCommand {
             Config::load(&cwd)?
         };
 
+        let model = self.model.or(config.model.clone());
+        let base_url = self.base_url.or(config.base_url.clone());
         let provider_name = self
             .provider
             .or(config.provider.clone())
+            .or_else(|| {
+                model.as_deref().and_then(detect_provider).map(String::from)
+            })
             .unwrap_or_else(|| "anthropic".to_string());
-        let model = self.model.or(config.model.clone());
-        let base_url = self.base_url.or(config.base_url.clone());
 
         let gw_config = config
             .gateway
@@ -131,10 +136,92 @@ impl GatewayCommand {
                 println!("{}: {}", "Model".green(), p.model_id());
                 Arc::new(p)
             }
+            "openrouter" => {
+                let api_key = config.get_api_key("openrouter")?;
+                let model_name =
+                    model.unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".to_string());
+                let mut p = OpenRouterProvider::new(&api_key, &model_name);
+                if let Some(url) = &base_url {
+                    p = p.with_base_url(url);
+                }
+                println!("{}: {}", "Model".green(), p.model_id());
+                Arc::new(p)
+            }
+            // OpenAI-compatible providers (same API, different base URL)
+            "deepseek" => {
+                let api_key = config.get_api_key("deepseek")?;
+                let model_name = model.unwrap_or_else(|| "deepseek-chat".to_string());
+                let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
+                    base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"),
+                );
+                println!("{}: {}", "Model".green(), p.model_id());
+                Arc::new(p)
+            }
+            "groq" => {
+                let api_key = config.get_api_key("groq")?;
+                let model_name =
+                    model.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
+                let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
+                    base_url.as_deref().unwrap_or("https://api.groq.com/openai/v1"),
+                );
+                println!("{}: {}", "Model".green(), p.model_id());
+                Arc::new(p)
+            }
+            "moonshot" | "kimi" => {
+                let api_key = config.get_api_key("moonshot")?;
+                let model_name = model.unwrap_or_else(|| "kimi-k2.5".to_string());
+                let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
+                    base_url.as_deref().unwrap_or("https://api.moonshot.ai/v1"),
+                );
+                println!("{}: {}", "Model".green(), p.model_id());
+                Arc::new(p)
+            }
+            "dashscope" | "qwen" => {
+                let api_key = config.get_api_key("dashscope")?;
+                let model_name = model.unwrap_or_else(|| "qwen-max".to_string());
+                let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
+                    base_url
+                        .as_deref()
+                        .unwrap_or("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+                );
+                println!("{}: {}", "Model".green(), p.model_id());
+                Arc::new(p)
+            }
+            "minimax" => {
+                let api_key = config.get_api_key("minimax")?;
+                let model_name = model.unwrap_or_else(|| "MiniMax-Text-01".to_string());
+                let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
+                    base_url.as_deref().unwrap_or("https://api.minimax.io/v1"),
+                );
+                println!("{}: {}", "Model".green(), p.model_id());
+                Arc::new(p)
+            }
+            "ollama" => {
+                let model_name = model.unwrap_or_else(|| "llama3.2".to_string());
+                let p = OpenAIProvider::new("ollama", &model_name).with_base_url(
+                    base_url.as_deref().unwrap_or("http://localhost:11434/v1"),
+                );
+                println!("{}: {}", "Model".green(), p.model_id());
+                Arc::new(p)
+            }
+            "vllm" => {
+                let api_key = config
+                    .get_api_key("vllm")
+                    .unwrap_or_else(|_| "token".to_string());
+                let model_name = model.ok_or_else(|| {
+                    eyre::eyre!("vllm provider requires --model to be specified")
+                })?;
+                let url = base_url.ok_or_else(|| {
+                    eyre::eyre!("vllm provider requires --base-url to be specified")
+                })?;
+                let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(&url);
+                println!("{}: {}", "Model".green(), p.model_id());
+                Arc::new(p)
+            }
             other => {
                 eyre::bail!(
-                    "unknown provider: {}. Use 'anthropic', 'openai', or 'gemini'",
-                    other
+                    "unknown provider: {other}. Valid: anthropic, openai, gemini, openrouter, \
+                     deepseek, groq, moonshot, dashscope, minimax, ollama, vllm"
                 );
             }
         };
@@ -163,8 +250,11 @@ impl GatewayCommand {
         // Create message bus (before publisher is consumed by channel manager)
         let (mut agent_handle, publisher) = create_bus();
 
-        // Clone inbound sender for cron service before publisher is consumed
+        // Clone senders before publisher is consumed
         let cron_inbound_tx = publisher.inbound_sender();
+        let heartbeat_inbound_tx = publisher.inbound_sender();
+        let spawn_inbound_tx = publisher.inbound_sender();
+        let out_tx = agent_handle.outbound_sender();
 
         // Initialize cron service
         let cron_service = Arc::new(CronService::new(
@@ -173,13 +263,35 @@ impl GatewayCommand {
         ));
         cron_service.start();
 
-        // Build tool registry with cron tool
+        // Initialize heartbeat service
+        let heartbeat_service = Arc::new(HeartbeatService::new(
+            &cwd,
+            heartbeat_inbound_tx,
+            crew_bus::heartbeat::DEFAULT_INTERVAL_SECS,
+        ));
+        heartbeat_service.start();
+
+        // Build tool registry
         let mut tools = ToolRegistry::with_builtins(&cwd);
         tools.register(CronTool::new(cron_service.clone()));
+
+        // Message tool (cross-channel messaging)
+        let message_tool = Arc::new(MessageTool::new(out_tx));
+        tools.register_arc(message_tool.clone() as Arc<dyn crew_agent::Tool>);
+
+        // Spawn tool (background subagents)
+        let spawn_tool = Arc::new(SpawnTool::new(
+            llm.clone(),
+            memory.clone(),
+            cwd.clone(),
+            spawn_inbound_tx,
+        ));
+        tools.register_arc(spawn_tool.clone() as Arc<dyn crew_agent::Tool>);
 
         // Build enhanced system prompt
         let system_prompt = build_system_prompt(
             gw_config.system_prompt.as_deref(),
+            &data_dir,
             &memory_store,
             &skills_loader,
         )
@@ -240,6 +352,52 @@ impl GatewayCommand {
                         shutdown.clone(),
                     )));
                 }
+                #[cfg(feature = "slack")]
+                "slack" => {
+                    let bot_env =
+                        settings_str(&entry.settings, "bot_token_env", "SLACK_BOT_TOKEN");
+                    let app_env =
+                        settings_str(&entry.settings, "app_token_env", "SLACK_APP_TOKEN");
+                    let bot_token = std::env::var(&bot_env)
+                        .wrap_err_with(|| format!("{bot_env} environment variable not set"))?;
+                    let app_token = std::env::var(&app_env)
+                        .wrap_err_with(|| format!("{app_env} environment variable not set"))?;
+                    channel_mgr.register(Arc::new(crew_bus::SlackChannel::new(
+                        &bot_token,
+                        &app_token,
+                        entry.allowed_senders.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+                #[cfg(feature = "whatsapp")]
+                "whatsapp" => {
+                    let url =
+                        settings_str(&entry.settings, "bridge_url", "ws://localhost:3001");
+                    channel_mgr.register(Arc::new(crew_bus::WhatsAppChannel::new(
+                        &url,
+                        entry.allowed_senders.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+                #[cfg(feature = "feishu")]
+                "feishu" | "lark" => {
+                    let id_env =
+                        settings_str(&entry.settings, "app_id_env", "FEISHU_APP_ID");
+                    let secret_env =
+                        settings_str(&entry.settings, "app_secret_env", "FEISHU_APP_SECRET");
+                    let app_id = std::env::var(&id_env)
+                        .wrap_err_with(|| format!("{id_env} environment variable not set"))?;
+                    let app_secret = std::env::var(&secret_env)
+                        .wrap_err_with(|| {
+                            format!("{secret_env} environment variable not set")
+                        })?;
+                    channel_mgr.register(Arc::new(crew_bus::FeishuChannel::new(
+                        &app_id,
+                        &app_secret,
+                        entry.allowed_senders.clone(),
+                        shutdown.clone(),
+                    )));
+                }
                 other => {
                     println!(
                         "{}: channel '{}' not supported, skipping",
@@ -294,6 +452,10 @@ impl GatewayCommand {
             } else {
                 (inbound.channel.clone(), inbound.chat_id.clone())
             };
+
+            // Update per-message context for tools
+            message_tool.set_context(&reply_channel, &reply_chat_id);
+            spawn_tool.set_context(&reply_channel, &reply_chat_id);
 
             let session_key = inbound.session_key();
             info!(
@@ -362,6 +524,7 @@ impl GatewayCommand {
             }
         }
 
+        heartbeat_service.stop().await;
         cron_service.stop().await;
         channel_mgr.stop_all().await?;
         println!("{}", "Gateway stopped.".dimmed());
@@ -369,13 +532,21 @@ impl GatewayCommand {
     }
 }
 
-/// Build the system prompt with memory context and skills.
+/// Build the system prompt with bootstrap files, memory context, and skills.
 async fn build_system_prompt(
     base: Option<&str>,
+    data_dir: &Path,
     memory_store: &MemoryStore,
     skills_loader: &SkillsLoader,
 ) -> String {
     let mut prompt = base.unwrap_or("You are a helpful AI assistant.").to_string();
+
+    // Append bootstrap files (AGENTS.md, SOUL.md, USER.md, etc.)
+    let bootstrap = load_bootstrap_files(data_dir);
+    if !bootstrap.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&bootstrap);
+    }
 
     // Append memory context
     let memory_ctx = memory_store.get_memory_context().await;
@@ -408,11 +579,39 @@ async fn build_system_prompt(
 }
 
 /// Extract a string value from channel settings JSON, with a default fallback.
-#[cfg(any(feature = "telegram", feature = "discord"))]
+#[cfg(any(
+    feature = "telegram",
+    feature = "discord",
+    feature = "slack",
+    feature = "whatsapp",
+    feature = "feishu"
+))]
 fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> String {
     settings
         .get(key)
         .and_then(|v| v.as_str())
         .unwrap_or(default)
         .to_string()
+}
+
+/// Load optional bootstrap/personality files from the .crew/ directory.
+fn load_bootstrap_files(data_dir: &Path) -> String {
+    const FILES: &[&str] = &[
+        "AGENTS.md",
+        "SOUL.md",
+        "USER.md",
+        "TOOLS.md",
+        "IDENTITY.md",
+    ];
+    let mut parts = Vec::new();
+    for filename in FILES {
+        let path = data_dir.join(filename);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                parts.push(format!("## {filename}\n\n{trimmed}"));
+            }
+        }
+    }
+    parts.join("\n\n")
 }

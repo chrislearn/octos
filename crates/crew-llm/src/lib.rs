@@ -14,6 +14,7 @@ mod types;
 pub mod anthropic;
 pub mod gemini;
 pub mod openai;
+pub mod openrouter;
 
 pub use config::ChatConfig;
 pub use provider::LlmProvider;

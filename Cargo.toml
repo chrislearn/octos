@@ -71,6 +71,7 @@ futures = "0.3"
 # Channel integrations (optional, pulled in via feature flags)
 teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
 serenity = { version = "0.12", default-features = false, features = ["rustls_backend", "gateway", "client", "http", "model"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["rustls-tls-native-roots"] }
 
 # Tracing
 tracing = "0.1"

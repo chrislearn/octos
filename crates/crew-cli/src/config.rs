@@ -153,15 +153,22 @@ impl Config {
     }
 
     /// Validate the configuration.
+    #[allow(clippy::manual_map)]
     pub fn validate(&self) -> Result<Vec<String>> {
         let mut warnings = Vec::new();
 
         // Check provider is valid
         if let Some(ref provider) = self.provider {
-            if !["anthropic", "openai", "gemini"].contains(&provider.as_str()) {
+            const VALID: &[&str] = &[
+                "anthropic", "openai", "gemini", "openrouter",
+                "deepseek", "groq", "moonshot", "kimi",
+                "dashscope", "qwen", "minimax", "ollama", "vllm",
+            ];
+            if !VALID.contains(&provider.as_str()) {
                 warnings.push(format!(
-                    "Unknown provider '{}'. Valid options: anthropic, openai, gemini",
-                    provider
+                    "Unknown provider '{}'. Valid options: {}",
+                    provider,
+                    VALID.join(", ")
                 ));
             }
         }
@@ -180,6 +187,36 @@ impl Config {
 
         Ok(warnings)
     }
+}
+
+/// Detect LLM provider from model name when no explicit provider is set.
+pub fn detect_provider(model: &str) -> Option<&'static str> {
+    let m = model.to_lowercase();
+    if m.contains("claude") {
+        return Some("anthropic");
+    }
+    if m.contains("gpt") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
+        return Some("openai");
+    }
+    if m.contains("gemini") {
+        return Some("gemini");
+    }
+    if m.contains("deepseek") {
+        return Some("deepseek");
+    }
+    if m.contains("kimi") || m.contains("moonshot") {
+        return Some("moonshot");
+    }
+    if m.contains("qwen") {
+        return Some("dashscope");
+    }
+    if m.contains("minimax") {
+        return Some("minimax");
+    }
+    if m.contains("llama") || m.contains("mixtral") {
+        return Some("groq");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -238,6 +275,33 @@ mod tests {
         let json = r#"{"channels": [{"type": "cli"}]}"#;
         let gw: GatewayConfig = serde_json::from_str(json).unwrap();
         assert_eq!(gw.max_history, 50);
+    }
+
+    #[test]
+    fn test_detect_provider_claude() {
+        assert_eq!(detect_provider("claude-sonnet-4-20250514"), Some("anthropic"));
+        assert_eq!(detect_provider("claude-3-haiku"), Some("anthropic"));
+    }
+
+    #[test]
+    fn test_detect_provider_openai() {
+        assert_eq!(detect_provider("gpt-4o"), Some("openai"));
+        assert_eq!(detect_provider("o1-mini"), Some("openai"));
+        assert_eq!(detect_provider("o3-mini"), Some("openai"));
+    }
+
+    #[test]
+    fn test_detect_provider_others() {
+        assert_eq!(detect_provider("gemini-2.0-flash"), Some("gemini"));
+        assert_eq!(detect_provider("deepseek-chat"), Some("deepseek"));
+        assert_eq!(detect_provider("kimi-k2.5"), Some("moonshot"));
+        assert_eq!(detect_provider("qwen-max"), Some("dashscope"));
+        assert_eq!(detect_provider("llama-3.3-70b"), Some("groq"));
+    }
+
+    #[test]
+    fn test_detect_provider_unknown() {
+        assert_eq!(detect_provider("some-custom-model"), None);
     }
 
     #[test]
