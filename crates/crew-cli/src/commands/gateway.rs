@@ -7,19 +7,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Utc;
 use clap::Args;
 use colored::Colorize;
-use crew_agent::{Agent, AgentConfig, SilentReporter, ToolRegistry};
-use crew_bus::{ChannelManager, CliChannel, SessionManager, create_bus};
+use crew_agent::{Agent, AgentConfig, SilentReporter, SkillsLoader, ToolRegistry};
+use crew_bus::{ChannelManager, CliChannel, CronService, SessionManager, create_bus};
 use crew_core::{AgentId, AgentRole, Message, MessageRole, OutboundMessage};
 use crew_llm::{
     LlmProvider, RetryProvider, anthropic::AnthropicProvider, gemini::GeminiProvider,
     openai::OpenAIProvider,
 };
-use crew_memory::EpisodeStore;
+use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
 use tracing::info;
 
 use super::Executable;
 use crate::config::Config;
+use crate::cron_tool::CronTool;
 
 /// Run as a persistent gateway daemon.
 #[derive(Debug, Args)]
@@ -151,7 +152,38 @@ impl GatewayCommand {
                 .wrap_err("failed to open episode store")?,
         );
 
-        let tools = ToolRegistry::with_builtins(&cwd);
+        // Initialize memory store
+        let memory_store = MemoryStore::open(&data_dir)
+            .await
+            .wrap_err("failed to open memory store")?;
+
+        // Initialize skills loader
+        let skills_loader = SkillsLoader::new(&data_dir);
+
+        // Create message bus (before publisher is consumed by channel manager)
+        let (mut agent_handle, publisher) = create_bus();
+
+        // Clone inbound sender for cron service before publisher is consumed
+        let cron_inbound_tx = publisher.inbound_sender();
+
+        // Initialize cron service
+        let cron_service = Arc::new(CronService::new(
+            data_dir.join("cron.json"),
+            cron_inbound_tx,
+        ));
+        cron_service.start();
+
+        // Build tool registry with cron tool
+        let mut tools = ToolRegistry::with_builtins(&cwd);
+        tools.register(CronTool::new(cron_service.clone()));
+
+        // Build enhanced system prompt
+        let system_prompt = build_system_prompt(
+            gw_config.system_prompt.as_deref(),
+            &memory_store,
+            &skills_loader,
+        )
+        .await;
 
         // Build the agent
         let agent_config = AgentConfig {
@@ -163,7 +195,7 @@ impl GatewayCommand {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
 
-        let mut agent = Agent::new(
+        let agent = Agent::new(
             AgentId::new("gateway"),
             AgentRole::Worker,
             llm,
@@ -172,14 +204,8 @@ impl GatewayCommand {
         )
         .with_config(agent_config)
         .with_reporter(Arc::new(SilentReporter))
-        .with_shutdown(shutdown.clone());
-
-        if let Some(ref prompt) = gw_config.system_prompt {
-            agent = agent.with_system_prompt(prompt.clone());
-        }
-
-        // Create message bus
-        let (mut agent_handle, publisher) = create_bus();
+        .with_shutdown(shutdown.clone())
+        .with_system_prompt(system_prompt);
 
         // Create session manager
         let mut session_mgr =
@@ -250,6 +276,25 @@ impl GatewayCommand {
                 break;
             }
 
+            // Route cron-triggered messages to their target channel
+            let (reply_channel, reply_chat_id) = if inbound.channel == "system" {
+                let ch = inbound
+                    .metadata
+                    .get("deliver_to_channel")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("cli")
+                    .to_string();
+                let cid = inbound
+                    .metadata
+                    .get("deliver_to_chat_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&inbound.chat_id)
+                    .to_string();
+                (ch, cid)
+            } else {
+                (inbound.channel.clone(), inbound.chat_id.clone())
+            };
+
             let session_key = inbound.session_key();
             info!(
                 channel = %inbound.channel,
@@ -289,8 +334,8 @@ impl GatewayCommand {
 
                     // Send response back through channel
                     let outbound = OutboundMessage {
-                        channel: inbound.channel.clone(),
-                        chat_id: inbound.chat_id.clone(),
+                        channel: reply_channel.clone(),
+                        chat_id: reply_chat_id.clone(),
                         content: conv_response.content,
                         reply_to: None,
                         media: vec![],
@@ -303,8 +348,8 @@ impl GatewayCommand {
                 }
                 Err(e) => {
                     let error_msg = OutboundMessage {
-                        channel: inbound.channel.clone(),
-                        chat_id: inbound.chat_id.clone(),
+                        channel: reply_channel.clone(),
+                        chat_id: reply_chat_id.clone(),
                         content: format!("Error: {e}"),
                         reply_to: None,
                         media: vec![],
@@ -317,10 +362,49 @@ impl GatewayCommand {
             }
         }
 
+        cron_service.stop().await;
         channel_mgr.stop_all().await?;
         println!("{}", "Gateway stopped.".dimmed());
         Ok(())
     }
+}
+
+/// Build the system prompt with memory context and skills.
+async fn build_system_prompt(
+    base: Option<&str>,
+    memory_store: &MemoryStore,
+    skills_loader: &SkillsLoader,
+) -> String {
+    let mut prompt = base.unwrap_or("You are a helpful AI assistant.").to_string();
+
+    // Append memory context
+    let memory_ctx = memory_store.get_memory_context().await;
+    if !memory_ctx.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&memory_ctx);
+    }
+
+    // Append always-on skills
+    if let Ok(always_names) = skills_loader.get_always_skills().await {
+        if !always_names.is_empty() {
+            if let Ok(skills_content) = skills_loader.load_skills_for_context(&always_names).await {
+                if !skills_content.is_empty() {
+                    prompt.push_str("\n\n## Active Skills\n\n");
+                    prompt.push_str(&skills_content);
+                }
+            }
+        }
+    }
+
+    // Append skills summary
+    if let Ok(summary) = skills_loader.build_skills_summary().await {
+        if !summary.is_empty() {
+            prompt.push_str("\n\n## Available Skills\n\n");
+            prompt.push_str(&summary);
+        }
+    }
+
+    prompt
 }
 
 /// Extract a string value from channel settings JSON, with a default fallback.

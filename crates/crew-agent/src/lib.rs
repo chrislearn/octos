@@ -10,10 +10,12 @@
 mod agent;
 pub mod policy;
 pub mod progress;
+pub mod skills;
 pub mod tools;
 
 pub use agent::{Agent, AgentConfig, ConversationResponse};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
+pub use skills::{SkillInfo, SkillsLoader};
 pub use tools::{
     EditFileTool, GlobTool, GrepTool, ReadFileTool, ShellTool, Tool, ToolRegistry, ToolResult,
     WebFetchTool, WebSearchTool, WriteFileTool,

@@ -5,6 +5,7 @@ use color_eyre::eyre::Result;
 
 mod commands;
 pub mod config;
+pub mod cron_tool;
 
 use commands::{Args, Executable};
 

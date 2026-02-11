@@ -412,12 +412,14 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
 name = "crew-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "clap",
  "clap_complete",
@@ -476,6 +478,7 @@ dependencies = [
  "redb",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-test",
  "tracing",

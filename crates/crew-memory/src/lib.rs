@@ -8,9 +8,11 @@
 //! Designed to wrap/extend codex-state when that dependency is enabled.
 
 mod episode;
+mod memory_store;
 mod store;
 mod task_store;
 
 pub use episode::{Episode, EpisodeOutcome};
+pub use memory_store::MemoryStore;
 pub use store::EpisodeStore;
 pub use task_store::{TaskState, TaskStore};

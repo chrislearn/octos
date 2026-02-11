@@ -1,0 +1,360 @@
+//! Cron service that fires scheduled jobs into the message bus.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use chrono::Utc;
+use crew_core::InboundMessage;
+use eyre::{Result, WrapErr};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
+
+use crate::cron_types::{CronJob, CronPayload, CronSchedule, CronStore};
+
+/// Service that manages and executes cron jobs.
+pub struct CronService {
+    store_path: PathBuf,
+    store: Mutex<CronStore>,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    running: AtomicBool,
+    timer_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl CronService {
+    /// Create a new cron service, loading persisted jobs from disk.
+    pub fn new(store_path: impl AsRef<Path>, inbound_tx: mpsc::Sender<InboundMessage>) -> Self {
+        let store_path = store_path.as_ref().to_path_buf();
+        let store = load_store(&store_path).unwrap_or_default();
+
+        Self {
+            store_path,
+            store: Mutex::new(store),
+            inbound_tx,
+            running: AtomicBool::new(false),
+            timer_handle: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Start the cron service: recompute next runs and arm the timer.
+    pub fn start(self: &std::sync::Arc<Self>) {
+        self.running.store(true, Ordering::Relaxed);
+        let now_ms = Utc::now().timestamp_millis();
+
+        {
+            let mut store = self.store.lock().unwrap();
+            for job in &mut store.jobs {
+                if job.enabled && job.state.next_run_at_ms.is_none() {
+                    job.compute_next_run(now_ms);
+                }
+            }
+        }
+
+        self.arm_timer();
+        info!("cron service started");
+    }
+
+    /// Stop the cron service, cancelling any pending timer.
+    pub async fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        let mut handle = self.timer_handle.lock().await;
+        if let Some(h) = handle.take() {
+            h.abort();
+        }
+        info!("cron service stopped");
+    }
+
+    /// Add a new cron job.
+    pub fn add_job(
+        self: &std::sync::Arc<Self>,
+        name: String,
+        schedule: CronSchedule,
+        payload: CronPayload,
+    ) -> Result<CronJob> {
+        let now_ms = Utc::now().timestamp_millis();
+        let id = short_id();
+
+        let delete_after_run = matches!(schedule, CronSchedule::At { .. });
+
+        let mut job = CronJob {
+            id: id.clone(),
+            name,
+            enabled: true,
+            schedule,
+            payload,
+            state: Default::default(),
+            created_at_ms: now_ms,
+            delete_after_run,
+        };
+        job.compute_next_run(now_ms);
+
+        let result = job.clone();
+
+        {
+            let mut store = self.store.lock().unwrap();
+            store.jobs.push(job);
+        }
+
+        self.save_store()?;
+        self.arm_timer();
+
+        debug!(id = %id, "added cron job");
+        Ok(result)
+    }
+
+    /// Remove a cron job by ID. Returns true if found and removed.
+    pub fn remove_job(self: &std::sync::Arc<Self>, id: &str) -> bool {
+        let removed = {
+            let mut store = self.store.lock().unwrap();
+            let before = store.jobs.len();
+            store.jobs.retain(|j| j.id != id);
+            store.jobs.len() < before
+        };
+
+        if removed {
+            let _ = self.save_store();
+            self.arm_timer();
+            debug!(id = %id, "removed cron job");
+        }
+
+        removed
+    }
+
+    /// List all enabled jobs, sorted by next run time.
+    pub fn list_jobs(&self) -> Vec<CronJob> {
+        let store = self.store.lock().unwrap();
+        let mut jobs: Vec<_> = store.jobs.iter().filter(|j| j.enabled).cloned().collect();
+        jobs.sort_by_key(|j| j.state.next_run_at_ms.unwrap_or(i64::MAX));
+        jobs
+    }
+
+    /// Arm a timer for the earliest due job.
+    fn arm_timer(self: &std::sync::Arc<Self>) {
+        if !self.running.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let earliest_ms = {
+            let store = self.store.lock().unwrap();
+            store
+                .jobs
+                .iter()
+                .filter(|j| j.enabled)
+                .filter_map(|j| j.state.next_run_at_ms)
+                .min()
+        };
+
+        let Some(target_ms) = earliest_ms else {
+            return;
+        };
+
+        let now_ms = Utc::now().timestamp_millis();
+        let delay_ms = (target_ms - now_ms).max(0) as u64;
+
+        let this = std::sync::Arc::clone(self);
+
+        // Cancel existing timer
+        let this2 = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            let mut handle = this2.timer_handle.lock().await;
+            if let Some(h) = handle.take() {
+                h.abort();
+            }
+
+            let new_handle = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                this.on_timer().await;
+            });
+
+            *handle = Some(new_handle);
+        });
+    }
+
+    /// Called when the timer fires: execute due jobs, update state, re-arm.
+    async fn on_timer(self: &std::sync::Arc<Self>) {
+        if !self.running.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+
+        // Collect due jobs
+        let due_jobs: Vec<CronJob> = {
+            let store = self.store.lock().unwrap();
+            store
+                .jobs
+                .iter()
+                .filter(|j| j.is_due(now_ms))
+                .cloned()
+                .collect()
+        };
+
+        for job in &due_jobs {
+            self.execute_job(job).await;
+        }
+
+        // Update state
+        {
+            let mut store = self.store.lock().unwrap();
+            let mut to_delete = Vec::new();
+
+            for stored_job in &mut store.jobs {
+                if due_jobs.iter().any(|d| d.id == stored_job.id) {
+                    stored_job.state.last_run_at_ms = Some(now_ms);
+                    stored_job.state.last_status = Some("ok".into());
+
+                    if stored_job.delete_after_run {
+                        to_delete.push(stored_job.id.clone());
+                    } else {
+                        stored_job.compute_next_run(now_ms);
+                    }
+                }
+            }
+
+            store.jobs.retain(|j| !to_delete.contains(&j.id));
+        }
+
+        let _ = self.save_store();
+        self.arm_timer();
+    }
+
+    /// Fire a single job by sending an InboundMessage into the bus.
+    async fn execute_job(&self, job: &CronJob) {
+        info!(job_id = %job.id, name = %job.name, "executing cron job");
+
+        let msg = InboundMessage {
+            channel: "system".into(),
+            sender_id: "cron".into(),
+            chat_id: job.id.clone(),
+            content: job.payload.message.clone(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({
+                "cron_job_id": job.id,
+                "deliver_to_channel": job.payload.channel,
+                "deliver_to_chat_id": job.payload.chat_id,
+            }),
+        };
+
+        if let Err(e) = self.inbound_tx.send(msg).await {
+            warn!(error = %e, job_id = %job.id, "failed to send cron message to bus");
+        }
+    }
+
+    fn save_store(&self) -> Result<()> {
+        let store = self.store.lock().unwrap();
+        let json = serde_json::to_string_pretty(&*store).wrap_err("failed to serialize cron store")?;
+        std::fs::write(&self.store_path, json).wrap_err("failed to write cron store")?;
+        Ok(())
+    }
+}
+
+fn load_store(path: &Path) -> Option<CronStore> {
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Generate a short 8-char hex ID.
+fn short_id() -> String {
+    let id = uuid::Uuid::now_v7();
+    format!("{:x}", id.as_u128())[..8].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_service(dir: &std::path::Path) -> (std::sync::Arc<CronService>, mpsc::Receiver<InboundMessage>) {
+        let (tx, rx) = mpsc::channel(64);
+        let service = std::sync::Arc::new(CronService::new(dir.join("cron.json"), tx));
+        (service, rx)
+    }
+
+    #[tokio::test]
+    async fn test_list_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+        assert!(service.list_jobs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_and_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+
+        let job = service
+            .add_job(
+                "reminder".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                CronPayload {
+                    message: "check in".into(),
+                    deliver: false,
+                    channel: None,
+                    chat_id: None,
+                },
+            )
+            .unwrap();
+
+        let jobs = service.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job.id);
+        assert_eq!(jobs[0].name, "reminder");
+    }
+
+    #[tokio::test]
+    async fn test_add_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+
+        let job = service
+            .add_job(
+                "temp".into(),
+                CronSchedule::At {
+                    at_ms: i64::MAX - 1,
+                },
+                CronPayload {
+                    message: "once".into(),
+                    deliver: false,
+                    channel: None,
+                    chat_id: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(service.list_jobs().len(), 1);
+        assert!(service.remove_job(&job.id));
+        assert!(service.list_jobs().is_empty());
+        assert!(!service.remove_job("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn test_persistence_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("cron.json");
+
+        {
+            let (tx, _rx) = mpsc::channel(64);
+            let service = std::sync::Arc::new(CronService::new(&store_path, tx));
+            service
+                .add_job(
+                    "persist".into(),
+                    CronSchedule::Every { every_ms: 1000 },
+                    CronPayload {
+                        message: "msg".into(),
+                        deliver: false,
+                        channel: None,
+                        chat_id: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        // Reload
+        let (tx, _rx) = mpsc::channel(64);
+        let service = std::sync::Arc::new(CronService::new(&store_path, tx));
+        let jobs = service.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "persist");
+    }
+}
