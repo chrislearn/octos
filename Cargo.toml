@@ -38,6 +38,7 @@ async-trait = "0.1"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 
 # Error handling (dora-rs pattern)
 eyre = "0.6"
@@ -51,7 +52,7 @@ dirs = "5"
 rustyline = "15"
 
 # HTTP client (using rustls for pure Rust, no OpenSSL)
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "multipart"] }
 htmd = "0.5"
 
 # Database (pure Rust)

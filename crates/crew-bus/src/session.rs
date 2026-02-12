@@ -163,6 +163,7 @@ mod tests {
         Message {
             role,
             content: content.into(),
+            media: vec![],
             tool_calls: None,
             tool_call_id: None,
             timestamp: Utc::now(),

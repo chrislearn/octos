@@ -1,6 +1,7 @@
 //! Telegram channel using teloxide long polling.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -8,25 +9,36 @@ use async_trait::async_trait;
 use chrono::Utc;
 use crew_core::{InboundMessage, OutboundMessage};
 use eyre::{Result, WrapErr};
+use reqwest::Client;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, UpdateKind};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::channel::Channel;
+use crate::media::download_media;
 
 pub struct TelegramChannel {
     bot: Bot,
     allowed_senders: HashSet<String>,
     shutdown: Arc<AtomicBool>,
+    media_dir: PathBuf,
+    http: Client,
 }
 
 impl TelegramChannel {
-    pub fn new(token: &str, allowed_senders: Vec<String>, shutdown: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        token: &str,
+        allowed_senders: Vec<String>,
+        shutdown: Arc<AtomicBool>,
+        media_dir: PathBuf,
+    ) -> Self {
         Self {
             bot: Bot::new(token),
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
+            media_dir,
+            http: Client::new(),
         }
     }
 
@@ -37,10 +49,27 @@ impl TelegramChannel {
         if self.allowed_senders.contains(sender_id) {
             return true;
         }
-        // Support "id|username" compound format (nanobot pattern)
         sender_id
             .split('|')
             .any(|part| self.allowed_senders.contains(part))
+    }
+
+    /// Download a file from Telegram by file_id.
+    async fn download_telegram_file(&self, file_id: &str, ext: &str) -> Result<PathBuf> {
+        let file = self
+            .bot
+            .get_file(file_id)
+            .await
+            .wrap_err("failed to get file info from Telegram")?;
+
+        let url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.bot.token(),
+            file.path
+        );
+
+        let filename = format!("{}{}", file.meta.unique_id, ext);
+        download_media(&self.http, &url, &[], &self.media_dir, &filename).await
     }
 }
 
@@ -74,10 +103,62 @@ impl Channel for TelegramChannel {
             };
 
             if let UpdateKind::Message(msg) = update.kind {
-                let text = match msg.text() {
-                    Some(t) => t.to_string(),
-                    None => continue,
-                };
+                // Extract text: plain text or caption (for photos/documents)
+                let text = msg
+                    .text()
+                    .or(msg.caption())
+                    .unwrap_or("")
+                    .to_string();
+
+                // Download media attachments
+                let mut media = Vec::new();
+
+                if let Some(sizes) = msg.photo() {
+                    if let Some(photo) = sizes.last() {
+                        match self.download_telegram_file(&photo.file.id, ".jpg").await {
+                            Ok(path) => media.push(path.display().to_string()),
+                            Err(e) => warn!("failed to download photo: {e}"),
+                        }
+                    }
+                }
+
+                if let Some(voice) = msg.voice() {
+                    match self.download_telegram_file(&voice.file.id, ".ogg").await {
+                        Ok(path) => media.push(path.display().to_string()),
+                        Err(e) => warn!("failed to download voice: {e}"),
+                    }
+                }
+
+                if let Some(audio) = msg.audio() {
+                    let ext = audio
+                        .file_name
+                        .as_ref()
+                        .and_then(|n| std::path::Path::new(n).extension())
+                        .map(|e| format!(".{}", e.to_string_lossy()))
+                        .unwrap_or_else(|| ".mp3".to_string());
+                    match self.download_telegram_file(&audio.file.id, &ext).await {
+                        Ok(path) => media.push(path.display().to_string()),
+                        Err(e) => warn!("failed to download audio: {e}"),
+                    }
+                }
+
+                if let Some(doc) = msg.document() {
+                    let ext = doc
+                        .file_name
+                        .as_ref()
+                        .and_then(|n| std::path::Path::new(n).extension())
+                        .map(|e| format!(".{}", e.to_string_lossy()))
+                        .unwrap_or_default();
+                    match self.download_telegram_file(&doc.file.id, &ext).await {
+                        Ok(path) => media.push(path.display().to_string()),
+                        Err(e) => warn!("failed to download document: {e}"),
+                    }
+                }
+
+                // Skip messages with no text and no media
+                if text.is_empty() && media.is_empty() {
+                    continue;
+                }
 
                 let sender_id = msg
                     .from
@@ -101,7 +182,7 @@ impl Channel for TelegramChannel {
                     chat_id: msg.chat.id.0.to_string(),
                     content: text,
                     timestamp: Utc::now(),
-                    media: vec![],
+                    media,
                     metadata: serde_json::json!({}),
                 };
 
@@ -148,6 +229,8 @@ mod tests {
             bot: Bot::new("test:token"),
             allowed_senders: allowed.into_iter().map(String::from).collect(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            media_dir: PathBuf::from("/tmp/test-media"),
+            http: Client::new(),
         }
     }
 

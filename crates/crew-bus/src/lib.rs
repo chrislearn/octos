@@ -6,6 +6,7 @@ pub mod cli_channel;
 pub mod cron_service;
 pub mod cron_types;
 pub mod heartbeat;
+pub mod media;
 pub mod session;
 
 #[cfg(feature = "telegram")]

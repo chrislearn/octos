@@ -1,0 +1,38 @@
+services:
+  # ─────────────────────────────────────────────
+  # crew-rs Chat (one-shot query)
+  #   docker compose --profile agent run --rm crew-agent -m "Hello"
+  # ─────────────────────────────────────────────
+  crew-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crew-agent
+    profiles:
+      - agent
+    volumes:
+      - ./.crew/config.json:/root/.crew/config.json:ro
+      - crew-workspace:/root/.crew
+    entrypoint: ["crew", "chat"]
+    stdin_open: true
+    tty: true
+
+  # ─────────────────────────────────────────────
+  # crew-rs Gateway (long-running bot)
+  #   docker compose --profile gateway up -d
+  # ─────────────────────────────────────────────
+  crew-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crew-gateway
+    restart: unless-stopped
+    profiles:
+      - gateway
+    volumes:
+      - ./.crew/config.json:/root/.crew/config.json:ro
+      - crew-workspace:/root/.crew
+    command: ["gateway"]
+
+volumes:
+  crew-workspace:

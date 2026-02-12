@@ -1,0 +1,7 @@
+target/
+.git/
+.crew/
+*.md
+!crates/crew-agent/skills/**/SKILL.md
+docs/
+.github/

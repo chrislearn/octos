@@ -1,6 +1,7 @@
 //! Discord channel using serenity gateway + REST API.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -8,28 +9,37 @@ use async_trait::async_trait;
 use chrono::Utc;
 use crew_core::{InboundMessage, OutboundMessage};
 use eyre::{Result, WrapErr};
+use reqwest::Client as HttpClient;
 use serenity::all::{Context, EventHandler, GatewayIntents, Http, Message as DiscordMessage, Ready};
 use serenity::Client;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::channel::Channel;
+use crate::media::download_media;
 
 pub struct DiscordChannel {
     token: String,
     http: Arc<Http>,
     allowed_senders: HashSet<String>,
     shutdown: Arc<AtomicBool>,
+    media_dir: PathBuf,
 }
 
 impl DiscordChannel {
-    pub fn new(token: &str, allowed_senders: Vec<String>, shutdown: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        token: &str,
+        allowed_senders: Vec<String>,
+        shutdown: Arc<AtomicBool>,
+        media_dir: PathBuf,
+    ) -> Self {
         let http = Arc::new(Http::new(token));
         Self {
             token: token.to_string(),
             http,
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
+            media_dir,
         }
     }
 }
@@ -38,6 +48,8 @@ impl DiscordChannel {
 struct Handler {
     inbound_tx: mpsc::Sender<InboundMessage>,
     allowed_senders: HashSet<String>,
+    media_dir: PathBuf,
+    download_http: HttpClient,
 }
 
 #[async_trait]
@@ -53,13 +65,36 @@ impl EventHandler for Handler {
             return;
         }
 
+        // Download attachments
+        let mut media = Vec::new();
+        for attachment in &msg.attachments {
+            let ext = std::path::Path::new(&attachment.filename)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!(".{e}"))
+                .unwrap_or_default();
+            let filename = format!("{}{}", attachment.id, ext);
+            match download_media(
+                &self.download_http,
+                &attachment.url,
+                &[],
+                &self.media_dir,
+                &filename,
+            )
+            .await
+            {
+                Ok(path) => media.push(path.display().to_string()),
+                Err(e) => warn!("failed to download Discord attachment: {e}"),
+            }
+        }
+
         let inbound = InboundMessage {
             channel: "discord".into(),
             sender_id,
             chat_id: msg.channel_id.to_string(),
             content: msg.content.clone(),
             timestamp: Utc::now(),
-            media: vec![],
+            media,
             metadata: serde_json::json!({
                 "message_id": msg.id.to_string(),
                 "guild_id": msg.guild_id.map(|g| g.to_string()),
@@ -92,6 +127,8 @@ impl Channel for DiscordChannel {
         let handler = Handler {
             inbound_tx,
             allowed_senders: self.allowed_senders.clone(),
+            media_dir: self.media_dir.clone(),
+            download_http: HttpClient::new(),
         };
 
         let mut client = Client::builder(&self.token, intents)
@@ -141,6 +178,7 @@ mod tests {
             http: Arc::new(Http::new("test.token")),
             allowed_senders: allowed.into_iter().map(String::from).collect(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            media_dir: PathBuf::from("/tmp/test-media"),
         }
     }
 

@@ -11,12 +11,12 @@ use crew_agent::{Agent, AgentConfig, MessageTool, SilentReporter, SkillsLoader, 
 use crew_bus::{ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager, create_bus};
 use crew_core::{AgentId, Message, MessageRole, OutboundMessage};
 use crew_llm::{
-    LlmProvider, RetryProvider, anthropic::AnthropicProvider, gemini::GeminiProvider,
-    openai::OpenAIProvider, openrouter::OpenRouterProvider,
+    GroqTranscriber, LlmProvider, RetryProvider, anthropic::AnthropicProvider,
+    gemini::GeminiProvider, openai::OpenAIProvider, openrouter::OpenRouterProvider,
 };
 use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
-use tracing::info;
+use tracing::{info, warn};
 
 use std::path::Path;
 
@@ -244,6 +244,17 @@ impl GatewayCommand {
         };
 
         let data_dir = cwd.join(".crew");
+        let media_dir = data_dir.join("media");
+        let _ = &media_dir; // used by channel feature gates below
+
+        // Create voice transcriber if GROQ_API_KEY is set
+        let transcriber = std::env::var("GROQ_API_KEY")
+            .ok()
+            .map(|key| {
+                println!("{}: Groq Whisper", "Transcriber".green());
+                GroqTranscriber::new(key)
+            });
+
         let memory = Arc::new(
             EpisodeStore::open(&data_dir)
                 .await
@@ -349,6 +360,7 @@ impl GatewayCommand {
                         &token,
                         entry.allowed_senders.clone(),
                         shutdown.clone(),
+                        media_dir.clone(),
                     )));
                 }
                 #[cfg(feature = "discord")]
@@ -360,6 +372,7 @@ impl GatewayCommand {
                         &token,
                         entry.allowed_senders.clone(),
                         shutdown.clone(),
+                        media_dir.clone(),
                     )));
                 }
                 #[cfg(feature = "slack")]
@@ -377,6 +390,7 @@ impl GatewayCommand {
                         &app_token,
                         entry.allowed_senders.clone(),
                         shutdown.clone(),
+                        media_dir.clone(),
                     )));
                 }
                 #[cfg(feature = "whatsapp")]
@@ -439,9 +453,35 @@ impl GatewayCommand {
         println!();
 
         // Main loop: process inbound messages
-        while let Some(inbound) = agent_handle.recv_inbound().await {
+        while let Some(mut inbound) = agent_handle.recv_inbound().await {
             if shutdown.load(Ordering::Relaxed) {
                 break;
+            }
+
+            // Transcribe audio media and separate images
+            let mut image_media = Vec::new();
+            if let Some(ref transcriber) = transcriber {
+                for path in &inbound.media {
+                    if crew_bus::media::is_audio(path) {
+                        match transcriber.transcribe(std::path::Path::new(path)).await {
+                            Ok(text) => {
+                                let prefix = format!("[Voice transcription: {text}]\n\n");
+                                inbound.content = format!("{prefix}{}", inbound.content);
+                            }
+                            Err(e) => warn!("transcription failed: {e}"),
+                        }
+                    } else if crew_bus::media::is_image(path) {
+                        image_media.push(path.clone());
+                    }
+                }
+            } else {
+                // No transcriber: just keep image media
+                image_media = inbound
+                    .media
+                    .iter()
+                    .filter(|p| crew_bus::media::is_image(p))
+                    .cloned()
+                    .collect();
             }
 
             // Route cron-triggered messages to their target channel
@@ -479,8 +519,10 @@ impl GatewayCommand {
             let session = session_mgr.get_or_create(&session_key);
             let history: Vec<Message> = session.get_history(gw_config.max_history).to_vec();
 
-            // Process message through agent
-            let response = agent.process_message(&inbound.content, &history).await;
+            // Process message through agent (with images for vision)
+            let response = agent
+                .process_message(&inbound.content, &history, image_media)
+                .await;
 
             match response {
                 Ok(conv_response) => {
@@ -488,6 +530,7 @@ impl GatewayCommand {
                     let user_msg = Message {
                         role: MessageRole::User,
                         content: inbound.content.clone(),
+                        media: vec![],
                         tool_calls: None,
                         tool_call_id: None,
                         timestamp: Utc::now(),
@@ -498,6 +541,7 @@ impl GatewayCommand {
                     let assistant_msg = Message {
                         role: MessageRole::Assistant,
                         content: conv_response.content.clone(),
+                        media: vec![],
                         tool_calls: None,
                         tool_call_id: None,
                         timestamp: Utc::now(),

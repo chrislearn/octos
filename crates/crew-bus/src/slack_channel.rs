@@ -1,6 +1,7 @@
 //! Slack channel using Socket Mode (WebSocket + HTTP).
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,6 +25,7 @@ pub struct SlackChannel {
     allowed_senders: HashSet<String>,
     shutdown: Arc<AtomicBool>,
     http: Client,
+    media_dir: PathBuf,
 }
 
 impl SlackChannel {
@@ -32,6 +34,7 @@ impl SlackChannel {
         app_token: &str,
         allowed_senders: Vec<String>,
         shutdown: Arc<AtomicBool>,
+        media_dir: PathBuf,
     ) -> Self {
         Self {
             bot_token: bot_token.to_string(),
@@ -39,6 +42,7 @@ impl SlackChannel {
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
             http: Client::new(),
+            media_dir,
         }
     }
 
@@ -272,6 +276,45 @@ impl Channel for SlackChannel {
                     text.to_string()
                 };
 
+                // Download files if present
+                let mut media = Vec::new();
+                if let Some(files) = event.get("files").and_then(|v| v.as_array()) {
+                    let auth = format!("Bearer {}", self.bot_token);
+                    for file in files {
+                        let url = file
+                            .get("url_private_download")
+                            .and_then(|v| v.as_str());
+                        let name = file
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("file");
+                        let file_id = file
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        if let Some(url) = url {
+                            let ext = std::path::Path::new(name)
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .map(|e| format!(".{e}"))
+                                .unwrap_or_default();
+                            let filename = format!("{file_id}{ext}");
+                            match crate::media::download_media(
+                                &self.http,
+                                url,
+                                &[("Authorization", auth.as_str())],
+                                &self.media_dir,
+                                &filename,
+                            )
+                            .await
+                            {
+                                Ok(path) => media.push(path.display().to_string()),
+                                Err(e) => warn!("failed to download Slack file: {e}"),
+                            }
+                        }
+                    }
+                }
+
                 let thread_ts = event
                     .get("thread_ts")
                     .or_else(|| event.get("ts"))
@@ -291,7 +334,7 @@ impl Channel for SlackChannel {
                     chat_id: chat_id.to_string(),
                     content: clean_text,
                     timestamp: Utc::now(),
-                    media: vec![],
+                    media,
                     metadata: serde_json::json!({
                         "slack": {
                             "thread_ts": thread_ts,
@@ -359,6 +402,7 @@ mod tests {
             allowed_senders: allowed.into_iter().map(String::from).collect(),
             shutdown: Arc::new(AtomicBool::new(false)),
             http: Client::new(),
+            media_dir: PathBuf::from("/tmp/test-media"),
         }
     }
 

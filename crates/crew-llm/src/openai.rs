@@ -6,6 +6,8 @@ use eyre::{Result, WrapErr};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::vision;
+
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
 use crate::types::{ChatResponse, StopReason, TokenUsage, ToolSpec};
@@ -53,16 +55,20 @@ impl LlmProvider for OpenAIProvider {
     ) -> Result<ChatResponse> {
         let openai_messages: Vec<OpenAIMessage> = messages
             .iter()
-            .map(|m| OpenAIMessage {
-                role: match m.role {
+            .map(|m| {
+                let role = match m.role {
                     crew_core::MessageRole::System => "system",
                     crew_core::MessageRole::User => "user",
                     crew_core::MessageRole::Assistant => "assistant",
                     crew_core::MessageRole::Tool => "tool",
-                },
-                content: Some(&m.content),
-                tool_call_id: m.tool_call_id.as_deref(),
-                tool_calls: None,
+                };
+                let content = build_openai_content(m);
+                OpenAIMessage {
+                    role,
+                    content,
+                    tool_call_id: m.tool_call_id.as_deref(),
+                    tool_calls: None,
+                }
             })
             .collect();
 
@@ -174,11 +180,65 @@ struct OpenAIRequest<'a> {
 struct OpenAIMessage<'a> {
     role: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<&'a str>,
+    content: Option<OpenAIContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAIToolCall>>,
+}
+
+/// Content can be plain text or multipart (text + images).
+#[derive(Serialize)]
+#[serde(untagged)]
+enum OpenAIContent {
+    Text(String),
+    Parts(Vec<OpenAIContentPart>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum OpenAIContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: OpenAIImageUrl },
+}
+
+#[derive(Serialize)]
+struct OpenAIImageUrl {
+    url: String,
+}
+
+fn build_openai_content(msg: &Message) -> Option<OpenAIContent> {
+    let images: Vec<_> = msg
+        .media
+        .iter()
+        .filter(|p| vision::is_image(p))
+        .collect();
+
+    if images.is_empty() {
+        if msg.content.is_empty() {
+            return None;
+        }
+        return Some(OpenAIContent::Text(msg.content.clone()));
+    }
+
+    let mut parts = Vec::new();
+    for path in images {
+        if let Ok((mime, data)) = vision::encode_image(path) {
+            parts.push(OpenAIContentPart::ImageUrl {
+                image_url: OpenAIImageUrl {
+                    url: format!("data:{mime};base64,{data}"),
+                },
+            });
+        }
+    }
+    if !msg.content.is_empty() {
+        parts.push(OpenAIContentPart::Text {
+            text: msg.content.clone(),
+        });
+    }
+    Some(OpenAIContent::Parts(parts))
 }
 
 #[derive(Serialize)]

@@ -6,6 +6,8 @@ use eyre::{Result, WrapErr};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::vision;
+
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
 use crate::types::{ChatResponse, StopReason, TokenUsage, ToolSpec};
@@ -64,9 +66,7 @@ impl LlmProvider for GeminiProvider {
                 crew_core::MessageRole::User | crew_core::MessageRole::Tool => {
                     contents.push(GeminiContent {
                         role: "user".to_string(),
-                        parts: vec![GeminiPart::Text {
-                            text: msg.content.clone(),
-                        }],
+                        parts: build_gemini_parts(msg),
                     });
                 }
                 crew_core::MessageRole::Assistant => {
@@ -155,6 +155,9 @@ impl LlmProvider for GeminiProvider {
                         arguments: function_call.args,
                     });
                 }
+                GeminiPart::InlineData { .. } => {
+                    // InlineData is only used in requests, not responses
+                }
             }
         }
 
@@ -219,10 +222,53 @@ enum GeminiPart {
     Text {
         text: String,
     },
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: GeminiInlineData,
+    },
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: GeminiFunctionCall,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+struct GeminiInlineData {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    data: String,
+}
+
+fn build_gemini_parts(msg: &Message) -> Vec<GeminiPart> {
+    let images: Vec<_> = msg
+        .media
+        .iter()
+        .filter(|p| vision::is_image(p))
+        .collect();
+
+    if images.is_empty() {
+        return vec![GeminiPart::Text {
+            text: msg.content.clone(),
+        }];
+    }
+
+    let mut parts = Vec::new();
+    for path in images {
+        if let Ok((mime, data)) = vision::encode_image(path) {
+            parts.push(GeminiPart::InlineData {
+                inline_data: GeminiInlineData {
+                    mime_type: mime,
+                    data,
+                },
+            });
+        }
+    }
+    if !msg.content.is_empty() {
+        parts.push(GeminiPart::Text {
+            text: msg.content.clone(),
+        });
+    }
+    parts
 }
 
 #[derive(Serialize, Deserialize)]

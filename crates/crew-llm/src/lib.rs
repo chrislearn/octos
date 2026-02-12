@@ -10,13 +10,16 @@ mod config;
 mod provider;
 mod retry;
 mod types;
+pub mod vision;
 
 pub mod anthropic;
 pub mod gemini;
 pub mod openai;
 pub mod openrouter;
+pub mod transcription;
 
 pub use config::ChatConfig;
 pub use provider::LlmProvider;
 pub use retry::{RetryConfig, RetryProvider};
+pub use transcription::GroqTranscriber;
 pub use types::{ChatResponse, StopReason, TokenUsage, ToolSpec};

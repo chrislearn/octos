@@ -7,6 +7,7 @@ mod completions;
 mod cron;
 mod gateway;
 mod init;
+mod skills;
 mod status;
 
 use clap::{Parser, Subcommand};
@@ -19,6 +20,7 @@ pub use completions::CompletionsCommand;
 pub use cron::CronCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
+pub use skills::SkillsCommand;
 pub use status::StatusCommand;
 
 /// crew-rs: Rust-native coding agent orchestration.
@@ -41,6 +43,8 @@ pub enum Command {
     Cron(CronCommand),
     /// Initialize a new .crew configuration.
     Init(InitCommand),
+    /// Manage agent skills (list, install, remove).
+    Skills(SkillsCommand),
     /// Show system status.
     Status(StatusCommand),
     /// Run as a persistent messaging gateway.
@@ -63,6 +67,7 @@ impl Executable for Command {
             Self::Chat(cmd) => cmd.execute(),
             Self::Cron(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
+            Self::Skills(cmd) => cmd.execute(),
             Self::Status(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),

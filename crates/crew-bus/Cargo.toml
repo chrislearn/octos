@@ -10,9 +10,9 @@ description = "Message bus, channels, and session management for crew-rs gateway
 default = []
 telegram = ["teloxide"]
 discord = ["serenity"]
-slack = ["tokio-tungstenite", "reqwest"]
+slack = ["tokio-tungstenite"]
 whatsapp = ["tokio-tungstenite"]
-feishu = ["tokio-tungstenite", "reqwest"]
+feishu = ["tokio-tungstenite"]
 
 [dependencies]
 crew-core = { workspace = true }
@@ -26,12 +26,12 @@ cron = { workspace = true }
 eyre = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+reqwest = { workspace = true }
 
 # Optional: channel integrations
 teloxide = { workspace = true, optional = true }
 serenity = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

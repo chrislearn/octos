@@ -56,6 +56,9 @@ impl std::fmt::Display for AgentId {
 pub struct Message {
     pub role: MessageRole,
     pub content: String,
+    /// Media file paths (images, audio) attached to this message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,6 +144,7 @@ mod tests {
         let msg = Message {
             role: MessageRole::User,
             content: "Hello".to_string(),
+            media: vec![],
             tool_calls: None,
             tool_call_id: None,
             timestamp: Utc::now(),
@@ -151,6 +155,8 @@ mod tests {
 
         // tool_calls should be skipped when None
         assert!(!json.contains("tool_calls"));
+        // empty media should be skipped
+        assert!(!json.contains("media"));
     }
 
     #[test]

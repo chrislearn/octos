@@ -110,16 +110,17 @@ impl Agent {
     }
 
     /// Process a single message in conversation mode (chat/gateway).
-    /// Takes the user's message and conversation history, runs the agent loop,
-    /// and returns the response.
+    /// Takes the user's message, conversation history, and optional media paths.
     pub async fn process_message(
         &self,
         user_content: &str,
         history: &[Message],
+        media: Vec<String>,
     ) -> Result<ConversationResponse> {
         let mut messages = vec![Message {
             role: MessageRole::System,
             content: self.system_prompt.clone(),
+            media: vec![],
             tool_calls: None,
             tool_call_id: None,
             timestamp: chrono::Utc::now(),
@@ -130,6 +131,7 @@ impl Agent {
         messages.push(Message {
             role: MessageRole::User,
             content: user_content.to_string(),
+            media,
             tool_calls: None,
             tool_call_id: None,
             timestamp: chrono::Utc::now(),
@@ -364,6 +366,7 @@ impl Agent {
         let mut messages = vec![Message {
             role: MessageRole::System,
             content: self.system_prompt.clone(),
+            media: vec![],
             tool_calls: None,
             tool_call_id: None,
             timestamp: chrono::Utc::now(),
@@ -412,6 +415,7 @@ impl Agent {
                 messages.push(Message {
                     role: MessageRole::System,
                     content: context_str,
+                    media: vec![],
                     tool_calls: None,
                     tool_call_id: None,
                     timestamp: chrono::Utc::now(),
@@ -440,6 +444,7 @@ impl Agent {
         messages.push(Message {
             role: MessageRole::User,
             content: task_content,
+            media: vec![],
             tool_calls: None,
             tool_call_id: None,
             timestamp: chrono::Utc::now(),
@@ -452,6 +457,7 @@ impl Agent {
         Message {
             role: MessageRole::Assistant,
             content: response.content.clone().unwrap_or_default(),
+            media: vec![],
             tool_calls: if response.tool_calls.is_empty() {
                 None
             } else {
@@ -547,6 +553,7 @@ impl Agent {
             messages.push(Message {
                 role: MessageRole::Tool,
                 content,
+                media: vec![],
                 tool_calls: None,
                 tool_call_id: Some(tool_call.id.clone()),
                 timestamp: chrono::Utc::now(),

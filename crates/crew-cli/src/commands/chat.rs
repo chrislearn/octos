@@ -145,7 +145,7 @@ impl ChatCommand {
 
         // Single-message mode: send one message and exit
         if let Some(msg) = self.message {
-            let response = agent.process_message(&msg, &[]).await?;
+            let response = agent.process_message(&msg, &[], vec![]).await?;
             println!("{}", response.content);
             return Ok(());
         }
@@ -198,12 +198,13 @@ impl ChatCommand {
             }
 
             // Process message
-            let response = agent.process_message(input, &history).await?;
+            let response = agent.process_message(input, &history, vec![]).await?;
 
             // Append to history
             history.push(Message {
                 role: MessageRole::User,
                 content: input.to_string(),
+                media: vec![],
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: chrono::Utc::now(),
@@ -211,6 +212,7 @@ impl ChatCommand {
             history.push(Message {
                 role: MessageRole::Assistant,
                 content: response.content.clone(),
+                media: vec![],
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: chrono::Utc::now(),

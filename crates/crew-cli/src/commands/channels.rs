@@ -24,6 +24,12 @@ pub struct ChannelsCommand {
 pub enum ChannelsSubcommand {
     /// Show configured channels and their status.
     Status,
+    /// Link WhatsApp device via QR code (requires Node.js bridge).
+    Login {
+        /// Path to the bridge directory (default: ./bridge).
+        #[arg(long)]
+        bridge_dir: Option<PathBuf>,
+    },
 }
 
 impl Executable for ChannelsCommand {
@@ -32,6 +38,7 @@ impl Executable for ChannelsCommand {
 
         match self.subcommand {
             ChannelsSubcommand::Status => cmd_status(&cwd),
+            ChannelsSubcommand::Login { bridge_dir } => cmd_login(bridge_dir),
         }
     }
 }
@@ -112,6 +119,47 @@ fn is_channel_compiled(channel_type: &str) -> bool {
         "feishu" | "lark" => true,
         _ => false,
     }
+}
+
+fn cmd_login(bridge_dir: Option<PathBuf>) -> Result<()> {
+    let dir = bridge_dir.unwrap_or_else(|| PathBuf::from("bridge"));
+    if !dir.exists() {
+        eyre::bail!(
+            "Bridge directory not found: {}\nClone or create a WhatsApp bridge (Baileys) at that path.",
+            dir.display()
+        );
+    }
+
+    println!("{}", "crew-rs WhatsApp Login".cyan().bold());
+    println!("Scan the QR code with your phone to connect.");
+    println!();
+
+    // Install npm deps if node_modules missing
+    let node_modules = dir.join("node_modules");
+    if !node_modules.exists() {
+        println!("{}", "Installing bridge dependencies...".dimmed());
+        let status = std::process::Command::new("npm")
+            .arg("install")
+            .current_dir(&dir)
+            .status()
+            .map_err(|_| eyre::eyre!("npm not found. Please install Node.js (20+)."))?;
+        if !status.success() {
+            eyre::bail!("npm install failed");
+        }
+    }
+
+    // Launch bridge
+    let status = std::process::Command::new("npm")
+        .arg("start")
+        .current_dir(&dir)
+        .status()
+        .map_err(|_| eyre::eyre!("npm not found. Please install Node.js (20+)."))?;
+
+    if !status.success() {
+        eyre::bail!("Bridge process exited with error");
+    }
+
+    Ok(())
 }
 
 fn channel_config_summary(channel_type: &str, settings: &serde_json::Value) -> String {

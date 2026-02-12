@@ -6,6 +6,8 @@ use eyre::{Result, WrapErr};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::vision;
+
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
 use crate::types::{ChatResponse, StopReason, TokenUsage, ToolSpec};
@@ -57,14 +59,15 @@ impl LlmProvider for AnthropicProvider {
             messages: messages
                 .iter()
                 .filter(|m| m.role != crew_core::MessageRole::System)
-                .map(|m| AnthropicMessage {
-                    role: match m.role {
+                .map(|m| {
+                    let role = match m.role {
                         crew_core::MessageRole::User => "user",
                         crew_core::MessageRole::Assistant => "assistant",
-                        crew_core::MessageRole::Tool => "user", // Tool results sent as user
-                        crew_core::MessageRole::System => "user", // Filtered above
-                    },
-                    content: &m.content,
+                        crew_core::MessageRole::Tool => "user",
+                        crew_core::MessageRole::System => "user",
+                    };
+                    let content = build_anthropic_content(m);
+                    AnthropicMessage { role, content }
                 })
                 .collect(),
             system: messages
@@ -156,7 +159,62 @@ struct AnthropicRequest<'a> {
 #[derive(Serialize)]
 struct AnthropicMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    content: AnthropicContent,
+}
+
+/// Content can be plain text or multipart (text + images).
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AnthropicContent {
+    Text(String),
+    Parts(Vec<AnthropicContentBlock>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum AnthropicContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: AnthropicImageSource },
+}
+
+#[derive(Serialize)]
+struct AnthropicImageSource {
+    r#type: String,
+    media_type: String,
+    data: String,
+}
+
+fn build_anthropic_content(msg: &Message) -> AnthropicContent {
+    let images: Vec<_> = msg
+        .media
+        .iter()
+        .filter(|p| vision::is_image(p))
+        .collect();
+
+    if images.is_empty() {
+        return AnthropicContent::Text(msg.content.clone());
+    }
+
+    let mut parts = Vec::new();
+    for path in images {
+        if let Ok((mime, data)) = vision::encode_image(path) {
+            parts.push(AnthropicContentBlock::Image {
+                source: AnthropicImageSource {
+                    r#type: "base64".into(),
+                    media_type: mime,
+                    data,
+                },
+            });
+        }
+    }
+    if !msg.content.is_empty() {
+        parts.push(AnthropicContentBlock::Text {
+            text: msg.content.clone(),
+        });
+    }
+    AnthropicContent::Parts(parts)
 }
 
 #[derive(Deserialize)]
