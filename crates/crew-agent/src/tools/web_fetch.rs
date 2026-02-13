@@ -188,6 +188,7 @@ fn is_private_host(host: &str) -> bool {
             std::net::IpAddr::V6(v6) => {
                 v6.is_loopback()           // ::1
                     || v6.is_unspecified() // ::
+                    || v6.is_multicast()   // ff00::/8
                     // ULA fc00::/7
                     || matches!(v6.segments()[0], 0xfc00..=0xfdff)
                     // Link-local fe80::/10
@@ -297,6 +298,7 @@ mod tests {
         assert!(is_private_host("fe80::1"));           // link-local
         assert!(is_private_host("::ffff:127.0.0.1")); // IPv4-mapped loopback
         assert!(is_private_host("::ffff:192.168.1.1"));// IPv4-mapped private
+        assert!(is_private_host("ff02::1"));            // multicast
         assert!(is_private_host("fec0::1"));           // site-local (deprecated)
         assert!(is_private_host("::192.168.1.1"));     // IPv4-compatible (deprecated)
     }
