@@ -516,21 +516,97 @@ JSON-RPC stdio transport for Model Context Protocol servers.
 
 **McpTool execution**: `tools/call` with name + arguments. Extracts `content[].text` from response.
 
-### Skills
+### Skills System
 
-Markdown files with YAML frontmatter at `.crew/skills/`:
+Skills are markdown instruction files that extend agent capabilities. Two sources: built-in (compiled into binary) and workspace (user-installed).
+
+#### Skill File Format (SKILL.md)
 
 ```yaml
 ---
 name: skill_name
 description: What it does
-requires_bins: binary1, binary2
-requires_env: ENV_VAR1, ENV_VAR2
-always: true|false
+requires_bins: binary1, binary2    # comma-separated, checked via `which`
+requires_env: ENV_VAR1, ENV_VAR2   # comma-separated, checked via std::env::var()
+always: true|false                 # auto-load into system prompt when available
 ---
+Skill instructions here (markdown). This body is injected into the agent's
+system prompt when the skill is activated.
 ```
 
-**6 built-in skills** (compile-time `include_str!()`): cron, github, skill-creator, summarize, tmux, weather. Workspace skills override built-ins with same name.
+**Frontmatter parsing**: Simple `key: value` line matching (not full YAML). `split_frontmatter()` finds content between `---` delimiters. `strip_frontmatter()` returns body only.
+
+#### SkillInfo
+
+```rust
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,          // filesystem path or "(built-in)/name/SKILL.md"
+    pub available: bool,        // bins_ok && env_ok
+    pub always: bool,           // auto-load into system prompt
+    pub builtin: bool,          // true if from BUILTIN_SKILLS, false if workspace
+}
+```
+
+**Availability check**: `available = requires_bins all found on PATH AND requires_env all set`. Missing requirements make the skill unavailable but still listed.
+
+#### SkillsLoader
+
+```rust
+pub struct SkillsLoader {
+    skills_dir: PathBuf,        // {data_dir}/skills/
+}
+```
+
+**Methods**:
+- `list_skills()` — scans workspace dir + built-ins. Workspace skills override built-ins with same name (checked via HashSet). Results sorted alphabetically.
+- `load_skill(name)` — returns body (frontmatter stripped). Checks workspace first, falls back to built-in.
+- `build_skills_summary()` — generates XML for system prompt injection:
+  ```xml
+  <skills>
+    <skill available="true">
+      <name>skill_name</name>
+      <description>What it does</description>
+      <location>/path/to/SKILL.md</location>
+    </skill>
+  </skills>
+  ```
+- `get_always_skills()` — filters skills where `always: true` AND `available: true`.
+- `load_skills_for_context(names)` — loads multiple skills, joins with `\n---\n`.
+
+#### Built-in Skills (6, compile-time `include_str!()`)
+
+```rust
+pub struct BuiltinSkill {
+    pub name: &'static str,
+    pub content: &'static str,  // full SKILL.md including frontmatter
+}
+pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[...];
+```
+
+| Skill | Purpose |
+|---|---|
+| cron | Task scheduling instructions |
+| github | GitHub integration (issues, PRs) |
+| skill-creator | Create new skills |
+| summarize | Conversation summarization |
+| tmux | Terminal multiplexer control |
+| weather | Weather information retrieval |
+
+#### CLI Management (`crew skills`)
+
+- `list` — shows built-in skills (with override status) + workspace skills
+- `install <user/repo/skill-name>` — fetches `SKILL.md` from `https://raw.githubusercontent.com/{repo}/main/SKILL.md` (15s timeout), saves to `.crew/skills/{name}/SKILL.md`. Fails if skill already exists.
+- `remove <name>` — deletes `.crew/skills/{name}/` directory
+
+#### Integration with Gateway
+
+In the gateway command, skills are loaded during system prompt construction:
+1. `get_always_skills()` — collects auto-load skill names
+2. `load_skills_for_context(names)` — loads and joins skill bodies
+3. `build_skills_summary()` — appends XML skill index to system prompt
+4. Always-on skill content is prepended to the system prompt
 
 ### Plugins
 
