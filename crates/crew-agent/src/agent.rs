@@ -333,7 +333,12 @@ impl Agent {
                         if self.config.save_episodes {
                             let summary = response.content.clone().unwrap_or_default();
                             let summary_truncated = if summary.len() > 500 {
-                                format!("{}...", &summary[..500])
+                                // Find a valid char boundary at or before byte 500
+                                let mut end = 500;
+                                while !summary.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                format!("{}...", &summary[..end])
                             } else {
                                 summary
                             };

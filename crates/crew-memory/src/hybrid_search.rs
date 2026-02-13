@@ -20,8 +20,8 @@ pub struct HybridIndex {
     hnsw: Option<Hnsw<'static, f32, DistCosine>>,
     /// Which docs have embeddings (by index)
     has_embedding: Vec<bool>,
-    /// Vector dimension (retained for future validation)
-    _dimension: usize,
+    /// Expected vector dimension.
+    dimension: usize,
 }
 
 const BM25_K1: f64 = 1.2;
@@ -38,7 +38,7 @@ impl HybridIndex {
             texts: Vec::new(),
             hnsw: None,
             has_embedding: Vec::new(),
-            _dimension: dimension,
+            dimension,
         }
     }
 
@@ -70,9 +70,10 @@ impl HybridIndex {
                 .push((doc_idx, tf));
         }
 
-        // Insert embedding into HNSW if provided
-        self.has_embedding.push(embedding.is_some());
-        if let Some(emb) = embedding {
+        // Insert embedding into HNSW if provided and dimension matches
+        let valid_emb = embedding.filter(|e| e.len() == self.dimension);
+        self.has_embedding.push(valid_emb.is_some());
+        if let Some(emb) = valid_emb {
             let normalized = l2_normalize(emb);
             let hnsw = self.hnsw.get_or_insert_with(|| {
                 Hnsw::new(16, 10000, 16, 200, DistCosine)
@@ -82,8 +83,12 @@ impl HybridIndex {
     }
 
     /// Add an embedding to an existing document (by episode_id).
-    /// Returns false if the episode_id is not found.
+    /// Returns false if the episode_id is not found or dimension mismatches.
     pub fn add_embedding(&mut self, episode_id: &str, embedding: &[f32]) -> bool {
+        if embedding.len() != self.dimension {
+            return false;
+        }
+
         let Some(doc_idx) = self.ids.iter().position(|id| id == episode_id) else {
             return false;
         };
@@ -117,8 +122,9 @@ impl HybridIndex {
         // BM25 scores
         let bm25_scores = self.bm25_score(query_text, fetch_count);
 
-        // Vector scores
-        let vector_scores: HashMap<usize, f32> = match (query_embedding, &self.hnsw) {
+        // Vector scores (skip if dimension mismatches)
+        let valid_query_emb = query_embedding.filter(|e| e.len() == self.dimension);
+        let vector_scores: HashMap<usize, f32> = match (valid_query_emb, &self.hnsw) {
             (Some(emb), Some(hnsw)) => {
                 let normalized = l2_normalize(emb);
                 let neighbors = hnsw.search(&normalized, fetch_count, 30);
