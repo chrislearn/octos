@@ -10,6 +10,7 @@
 mod agent;
 pub mod builtin_skills;
 mod compaction;
+mod sanitize;
 pub mod policy;
 pub mod progress;
 pub mod skills;

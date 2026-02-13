@@ -54,6 +54,9 @@ pub enum ProgressEvent {
     /// Hit token budget limit.
     TokenBudgetExceeded { used: u32, limit: u32 },
 
+    /// Hit wall-clock timeout.
+    WallClockTimeoutReached { elapsed: Duration, limit: Duration },
+
     /// Streaming text chunk from LLM.
     StreamChunk { text: String, iteration: u32 },
 
@@ -311,6 +314,16 @@ impl ProgressReporter for ConsoleReporter {
                     self.yellow(&format!(
                         "⚠ Token budget exceeded ({} used, {} limit).",
                         used, limit
+                    ))
+                );
+            }
+            ProgressEvent::WallClockTimeoutReached { limit, .. } => {
+                println!();
+                println!(
+                    "{} Increase with --max-timeout",
+                    self.yellow(&format!(
+                        "⚠ Wall-clock timeout ({:.0}s limit).",
+                        limit.as_secs_f64()
                     ))
                 );
             }

@@ -13,5 +13,8 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 eyre = { workspace = true }
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 tokio-test = { workspace = true }

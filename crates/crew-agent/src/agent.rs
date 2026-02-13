@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crew_core::{AgentId, Message, MessageRole, Task, TaskResult, TokenUsage};
 use crew_llm::{
@@ -24,6 +24,8 @@ pub struct AgentConfig {
     pub max_iterations: u32,
     /// Maximum total tokens (input + output) before stopping. None = unlimited.
     pub max_tokens: Option<u32>,
+    /// Wall-clock timeout for the entire agent run. None = unlimited.
+    pub max_timeout: Option<Duration>,
     /// Whether to save episodes to memory.
     pub save_episodes: bool,
 }
@@ -33,6 +35,7 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 50,
             max_tokens: None,
+            max_timeout: Some(Duration::from_secs(600)),
             save_episodes: true,
         }
     }
@@ -169,6 +172,7 @@ impl Agent {
         let mut total_usage = TokenUsage::default();
         let mut files_modified = Vec::new();
         let mut iteration = 0u32;
+        let start = Instant::now();
 
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
@@ -187,6 +191,20 @@ impl Agent {
                     files_modified,
                     streamed: false,
                 });
+            }
+
+            if let Some(timeout) = self.config.max_timeout {
+                if start.elapsed() > timeout {
+                    return Ok(ConversationResponse {
+                        content: format!(
+                            "Wall-clock timeout ({:.0}s limit).",
+                            timeout.as_secs_f64()
+                        ),
+                        token_usage: total_usage,
+                        files_modified,
+                        streamed: false,
+                    });
+                }
             }
 
             if let Some(max_tokens) = self.config.max_tokens {
@@ -301,6 +319,31 @@ impl Agent {
                         return Ok(TaskResult {
                             success: false,
                             output: format!("Task stopped after {} tokens (budget: {}).", used, max_tokens),
+                            files_modified,
+                            subtasks: Vec::new(),
+                            token_usage: total_usage,
+                        });
+                    }
+                }
+
+                if let Some(timeout) = self.config.max_timeout {
+                    if task_start.elapsed() > timeout {
+                        warn!(
+                            elapsed_s = task_start.elapsed().as_secs(),
+                            limit_s = timeout.as_secs(),
+                            "hit wall-clock timeout"
+                        );
+                        self.reporter.report(ProgressEvent::WallClockTimeoutReached {
+                            elapsed: task_start.elapsed(),
+                            limit: timeout,
+                        });
+                        return Ok(TaskResult {
+                            success: false,
+                            output: format!(
+                                "Task stopped after {:.0}s (wall-clock timeout: {:.0}s).",
+                                task_start.elapsed().as_secs_f64(),
+                                timeout.as_secs_f64()
+                            ),
                             files_modified,
                             subtasks: Vec::new(),
                             token_usage: total_usage,
@@ -624,6 +667,8 @@ impl Agent {
                         (format!("Error: {e}"), None, None)
                     }
                 };
+
+                let content = crate::sanitize::sanitize_tool_output(&content);
 
                 (
                     Message {

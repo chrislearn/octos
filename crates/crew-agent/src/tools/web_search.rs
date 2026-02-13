@@ -156,10 +156,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[allow(unsafe_code)]
     async fn test_missing_api_key() {
         // Ensure BRAVE_API_KEY is not set for this test
         let was_set = std::env::var("BRAVE_API_KEY").ok();
         if was_set.is_some() {
+            // SAFETY: test-only, single-threaded
             unsafe { std::env::remove_var("BRAVE_API_KEY") };
         }
 
@@ -174,6 +176,7 @@ mod tests {
 
         // Restore if it was set
         if let Some(key) = was_set {
+            // SAFETY: test-only, single-threaded
             unsafe { std::env::set_var("BRAVE_API_KEY", key) };
         }
     }

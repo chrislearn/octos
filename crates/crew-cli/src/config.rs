@@ -400,8 +400,9 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(unsafe_code)]
     fn test_expand_env_var() {
-        // SAFETY: This is a test running in isolation
+        // SAFETY: test-only, single-threaded
         unsafe {
             std::env::set_var("TEST_VAR", "hello");
         }
@@ -415,7 +416,7 @@ mod tests {
             Config::expand_env_var("${UNDEFINED_VAR}"),
             "${UNDEFINED_VAR}"
         );
-        // SAFETY: This is a test running in isolation
+        // SAFETY: test-only, single-threaded
         unsafe {
             std::env::remove_var("TEST_VAR");
         }

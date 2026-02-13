@@ -158,8 +158,8 @@ impl ChatCommand {
         let reporter = Arc::new(ConsoleReporter::new().with_verbose(self.verbose));
         let agent_config = AgentConfig {
             max_iterations: self.max_iterations,
-            max_tokens: None,
             save_episodes: false,
+            ..Default::default()
         };
         let mut agent = Agent::new(
             AgentId::new("chat"),

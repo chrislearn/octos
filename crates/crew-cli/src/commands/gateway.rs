@@ -351,8 +351,8 @@ impl GatewayCommand {
         // Build the agent
         let agent_config = AgentConfig {
             max_iterations: self.max_iterations,
-            max_tokens: None,
             save_episodes: false,
+            ..Default::default()
         };
 
         let shutdown = Arc::new(AtomicBool::new(false));
