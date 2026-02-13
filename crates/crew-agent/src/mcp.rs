@@ -16,6 +16,18 @@ use tracing::{info, warn};
 
 use crate::tools::{Tool, ToolRegistry, ToolResult};
 
+/// Maximum size for a single JSON-RPC response line (1MB).
+const MAX_LINE_BYTES: usize = 1_048_576;
+
+/// Environment variable names blocked for MCP servers (security-sensitive).
+const BLOCKED_ENV_KEYS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+];
+
 /// Configuration for a single MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
@@ -51,8 +63,7 @@ impl McpConnection {
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.flush().await?;
 
-        let mut buf = String::new();
-        self.reader.read_line(&mut buf).await?;
+        let buf = read_line_limited(&mut self.reader, MAX_LINE_BYTES).await?;
 
         let response: JsonRpcResponse =
             serde_json::from_str(&buf).wrap_err("invalid JSON-RPC response from MCP server")?;
@@ -67,10 +78,38 @@ impl McpConnection {
     }
 }
 
+/// Read a single line with a size limit to prevent memory exhaustion.
+async fn read_line_limited(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    limit: usize,
+) -> Result<String> {
+    let mut buf = Vec::with_capacity(4096);
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            eyre::bail!("MCP server closed connection");
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..=pos]);
+            reader.consume(pos + 1);
+            break;
+        } else {
+            buf.extend_from_slice(available);
+            let len = available.len();
+            reader.consume(len);
+        }
+        if buf.len() > limit {
+            eyre::bail!("MCP response exceeds {}KB limit", limit / 1024);
+        }
+    }
+    String::from_utf8(buf).wrap_err("MCP response is not valid UTF-8")
+}
+
 impl Drop for McpConnection {
     fn drop(&mut self) {
-        // Best-effort kill of the child process
         let _ = self.child.start_kill();
+        // Reap child to avoid zombie processes
+        let _ = self.child.try_wait();
     }
 }
 
@@ -129,9 +168,13 @@ impl McpClient {
         cmd.args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit()); // Forward stderr for debugging
 
         for (k, v) in &config.env {
+            if BLOCKED_ENV_KEYS.iter().any(|blocked| k.eq_ignore_ascii_case(blocked)) {
+                warn!(key = k, "blocked dangerous MCP environment variable, skipping");
+                continue;
+            }
             cmd.env(k, v);
         }
 

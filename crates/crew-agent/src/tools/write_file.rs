@@ -60,11 +60,16 @@ impl Tool for WriteFileTool {
         let input: WriteFileInput =
             serde_json::from_value(args.clone()).wrap_err("invalid write_file tool input")?;
 
-        // Resolve path
-        let path = if PathBuf::from(&input.path).is_absolute() {
-            PathBuf::from(&input.path)
-        } else {
-            self.base_dir.join(&input.path)
+        // Resolve path (with traversal protection)
+        let path = match super::resolve_path(&self.base_dir, &input.path) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(ToolResult {
+                    output: format!("Path outside working directory: {}", input.path),
+                    success: false,
+                    ..Default::default()
+                })
+            }
         };
 
         // Create parent directories if needed

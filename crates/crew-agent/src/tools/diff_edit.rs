@@ -59,10 +59,16 @@ impl Tool for DiffEditTool {
         let input: DiffEditInput =
             serde_json::from_value(args.clone()).wrap_err("invalid diff_edit input")?;
 
-        let path = if PathBuf::from(&input.path).is_absolute() {
-            PathBuf::from(&input.path)
-        } else {
-            self.base_dir.join(&input.path)
+        // Resolve path (with traversal protection)
+        let path = match super::resolve_path(&self.base_dir, &input.path) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(ToolResult {
+                    output: format!("Path outside working directory: {}", input.path),
+                    success: false,
+                    ..Default::default()
+                })
+            }
         };
 
         if !path.exists() {
@@ -202,6 +208,25 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
     // Apply hunks in reverse order so line numbers stay valid
     let mut sorted_hunks: Vec<(usize, &Hunk)> = hunks.iter().enumerate().collect();
     sorted_hunks.sort_by(|a, b| b.1.old_start.cmp(&a.1.old_start));
+
+    // Check for overlapping hunks
+    for window in sorted_hunks.windows(2) {
+        let (_, higher) = window[0];
+        let (_, lower) = window[1];
+        let lower_end = lower.old_start
+            + lower
+                .lines
+                .iter()
+                .filter(|l| matches!(l, DiffLine::Context(_) | DiffLine::Remove(_)))
+                .count();
+        if lower_end > higher.old_start {
+            eyre::bail!(
+                "overlapping hunks at lines {} and {}",
+                lower.old_start,
+                higher.old_start
+            );
+        }
+    }
 
     for (idx, hunk) in sorted_hunks {
         let context_lines: Vec<&str> = hunk

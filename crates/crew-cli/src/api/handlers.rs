@@ -26,10 +26,20 @@ pub struct ChatResponse {
     pub output_tokens: u32,
 }
 
+/// Maximum message length (1MB).
+const MAX_MESSAGE_LEN: usize = 1_048_576;
+
 pub async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
+    if req.message.len() > MAX_MESSAGE_LEN {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
+        ));
+    }
+
     let session_key = SessionKey::new(
         "api",
         req.session_id.as_deref().unwrap_or("default"),
@@ -123,16 +133,34 @@ pub async fn list_sessions(
 }
 
 /// GET /api/sessions/:id/messages -- get session history.
+///
+/// Query params: `?limit=100&offset=0`
+#[derive(Deserialize)]
+pub struct PaginationParams {
+    #[serde(default = "default_page_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_page_limit() -> usize {
+    100
+}
+
 pub async fn session_messages(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Json<Vec<MessageInfo>> {
+    let limit = params.limit.min(500);
     let key = SessionKey::new("api", &id);
     let mut sessions = state.sessions.lock().await;
     let session = sessions.get_or_create(&key);
     let messages = session
         .get_history(1000)
         .iter()
+        .skip(params.offset)
+        .take(limit)
         .map(|m| MessageInfo {
             role: format!("{:?}", m.role),
             content: m.content.clone(),

@@ -2,6 +2,7 @@
 
 use crew_agent::{ProgressEvent, ProgressReporter};
 use tokio::sync::broadcast;
+use tracing::debug;
 
 /// Broadcasts progress events to SSE subscribers.
 pub struct SseBroadcaster {
@@ -66,6 +67,9 @@ fn event_to_json(event: &ProgressEvent) -> serde_json::Value {
         ProgressEvent::Response { iteration, .. } => {
             serde_json::json!({"type": "response", "iteration": iteration})
         }
-        _ => serde_json::json!({"type": "other"}),
+        other => {
+            debug!("unmapped SSE progress event: {other:?}");
+            serde_json::json!({"type": "other"})
+        }
     }
 }

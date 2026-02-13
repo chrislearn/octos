@@ -131,9 +131,45 @@ pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::sandbox::{NoSandbox, Sandbox};
+
+/// Resolve a user-provided path, ensuring it stays within base_dir.
+///
+/// Prevents path traversal attacks via `../` or absolute paths that escape
+/// the working directory.
+pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
+    let path = if PathBuf::from(user_path).is_absolute() {
+        PathBuf::from(user_path)
+    } else {
+        base_dir.join(user_path)
+    };
+
+    let normalized = normalize_path(&path);
+    let base_normalized = normalize_path(base_dir);
+
+    if !normalized.starts_with(&base_normalized) {
+        eyre::bail!("path outside working directory: {}", user_path);
+    }
+
+    Ok(normalized)
+}
+
+/// Normalize path by resolving `.` and `..` components without filesystem access.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
 
 impl ToolRegistry {
     /// Create a registry with built-in tools for the given working directory.

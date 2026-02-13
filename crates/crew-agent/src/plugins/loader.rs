@@ -86,11 +86,12 @@ impl PluginLoader {
                 )
             })?;
 
-        info!(
+        warn!(
             plugin = %manifest.name,
             version = %manifest.version,
             tools = manifest.tools.len(),
-            "loaded plugin"
+            executable = %executable.display(),
+            "loaded unverified plugin (no signature check)"
         );
 
         let tools = manifest

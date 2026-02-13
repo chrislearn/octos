@@ -114,6 +114,8 @@ pub struct MacosSandbox {
 impl Sandbox for MacosSandbox {
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         let cwd_str = cwd.to_string_lossy();
+        // Escape characters that could break the SBPL sandbox profile syntax
+        let cwd_escaped = cwd_str.replace('\\', "\\\\").replace('"', "\\\"");
 
         let network_rule = if self.allow_network {
             "(allow network*)"
@@ -133,7 +135,7 @@ impl Sandbox for MacosSandbox {
 (allow file-write* (subpath "/private/var/folders"))
 {network_rule}
 "#,
-            cwd = cwd_str,
+            cwd = cwd_escaped,
             network_rule = network_rule,
         );
 
@@ -151,6 +153,7 @@ impl Sandbox for MacosSandbox {
 /// Create a sandbox from config.
 pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
     if !config.enabled {
+        tracing::info!("sandbox disabled, shell commands run without isolation");
         return Box::new(NoSandbox);
     }
 

@@ -1,4 +1,7 @@
 //! Model pricing for cost estimation.
+//!
+//! Prices are approximate and may become stale. Last updated: 2025-02.
+//! Source: provider pricing pages. Update when models or prices change.
 
 /// Pricing per 1M tokens (input, output) in USD.
 #[derive(Debug, Clone, Copy)]
@@ -45,7 +48,7 @@ pub fn model_pricing(model_id: &str) -> Option<ModelPricing> {
         });
     }
 
-    // OpenAI
+    // OpenAI — NOTE: gpt-4o-mini MUST be checked before gpt-4o (substring match)
     if m.contains("gpt-4o-mini") {
         return Some(ModelPricing {
             input_per_million: 0.15,
