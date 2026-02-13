@@ -137,6 +137,8 @@ impl Tool for SpawnTool {
         if is_sync {
             // Sync mode: run subagent inline and return the result directly
             let mut tools = ToolRegistry::with_builtins(&self.working_dir);
+            // Prevent recursive spawning; filter to allowed_tools if specified
+            tools.retain(|name| name != "spawn");
             if !allowed_tools.is_empty() {
                 tools.retain(|name| allowed_tools.iter().any(|a| a == name));
             }
@@ -178,6 +180,8 @@ impl Tool for SpawnTool {
 
             tokio::spawn(async move {
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
+                // Prevent recursive spawning; filter to allowed_tools if specified
+                tools.retain(|name| name != "spawn");
                 if !allowed_tools.is_empty() {
                     tools.retain(|name| allowed_tools.iter().any(|a| a == name));
                 }

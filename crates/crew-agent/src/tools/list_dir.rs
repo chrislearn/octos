@@ -63,6 +63,10 @@ impl Tool for ListDirTool {
             }
         };
 
+        if let Some(r) = super::reject_symlink(&target).await {
+            return Ok(r);
+        }
+
         if !target.exists() {
             return Ok(ToolResult {
                 output: format!("Error: Directory not found: {}", input.path),

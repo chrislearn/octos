@@ -195,6 +195,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_glob_rejects_absolute_pattern() {
+        let dir = setup_test_dir();
+        let tool = GlobTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "/etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_glob_rejects_parent_traversal() {
+        let dir = setup_test_dir();
+        let tool = GlobTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "../../etc/*"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_rejects_absolute_file_pattern() {
+        let dir = setup_test_dir();
+        let tool = GrepTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "fn", "file_pattern": "/etc/*.conf"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_rejects_traversal() {
+        let dir = setup_test_dir();
+        let tool = ListDirTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"path": "../../.."}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("Path outside"));
+    }
+
+    #[tokio::test]
+    async fn test_web_fetch_rejects_localhost() {
+        let tool = WebFetchTool::new();
+        let result = tool
+            .execute(&serde_json::json!({"url": "http://localhost:8080/admin"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("private"));
+    }
+
+    #[tokio::test]
+    async fn test_web_fetch_rejects_private_ip() {
+        let tool = WebFetchTool::new();
+        let result = tool
+            .execute(&serde_json::json!({"url": "http://169.254.169.254/latest/meta-data"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("private"));
+    }
+
+    #[tokio::test]
     async fn test_registry_unknown_tool() {
         let dir = setup_test_dir();
         let registry = ToolRegistry::with_builtins(dir.path());

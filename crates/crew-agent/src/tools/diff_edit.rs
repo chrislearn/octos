@@ -71,6 +71,10 @@ impl Tool for DiffEditTool {
             }
         };
 
+        if let Some(r) = super::reject_symlink(&path).await {
+            return Ok(r);
+        }
+
         if !path.exists() {
             return Ok(ToolResult {
                 output: format!("File not found: {}", input.path),

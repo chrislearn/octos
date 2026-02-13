@@ -92,6 +92,19 @@ impl Tool for WebFetchTool {
             });
         }
 
+        // Block requests to private/internal hosts (SSRF protection)
+        if let Ok(url) = reqwest::Url::parse(&input.url) {
+            if let Some(host) = url.host_str() {
+                if is_private_host(host) {
+                    return Ok(ToolResult {
+                        output: "Requests to private/internal hosts are not allowed".to_string(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
         let response = match self.client.get(&input.url).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -154,6 +167,31 @@ impl Tool for WebFetchTool {
             ..Default::default()
         })
     }
+}
+
+/// Check if a hostname resolves to a private/internal address.
+fn is_private_host(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    // Localhost variants
+    if lower == "localhost" || lower == "localhost." {
+        return true;
+    }
+    // Parse as IP and check private ranges
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()           // 127.0.0.0/8
+                    || v4.is_private()     // 10/8, 172.16/12, 192.168/16
+                    || v4.is_link_local()  // 169.254/16 (AWS metadata)
+                    || v4.is_unspecified() // 0.0.0.0
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()           // ::1
+                    || v6.is_unspecified() // ::
+            }
+        };
+    }
+    false
 }
 
 fn extract_markdown(html: &str) -> String {

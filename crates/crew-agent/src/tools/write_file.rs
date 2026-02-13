@@ -72,6 +72,10 @@ impl Tool for WriteFileTool {
             }
         };
 
+        if let Some(r) = super::reject_symlink(&path).await {
+            return Ok(r);
+        }
+
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)

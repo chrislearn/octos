@@ -97,6 +97,17 @@ impl Tool for GrepTool {
         let context = input.context;
         let ignore_case = input.ignore_case;
 
+        // Reject file_pattern with absolute paths or traversal
+        if let Some(ref fp) = file_pattern {
+            if fp.starts_with('/') || fp.contains("..") {
+                return Ok(ToolResult {
+                    output: "Absolute paths and '..' are not allowed in file patterns".to_string(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
+
         // Run search in blocking task
         let result = tokio::task::spawn_blocking(move || {
             // Compile regex

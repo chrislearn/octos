@@ -71,10 +71,10 @@ impl Tool for GlobTool {
         let pattern = input.pattern.clone();
         let limit = input.limit;
 
-        // Reject absolute patterns to prevent directory traversal
-        if pattern.starts_with('/') {
+        // Reject absolute patterns and parent traversal
+        if pattern.starts_with('/') || pattern.contains("..") {
             return Ok(ToolResult {
-                output: "Absolute glob patterns are not allowed".to_string(),
+                output: "Absolute paths and '..' are not allowed in glob patterns".to_string(),
                 success: false,
                 ..Default::default()
             });

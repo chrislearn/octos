@@ -151,10 +151,10 @@ pub async fn session_messages(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
-) -> Json<Vec<MessageInfo>> {
+) -> Result<Json<Vec<MessageInfo>>, StatusCode> {
     let limit = params.limit.min(500);
     let offset = params.offset.min(10_000);
-    let fetch_count = offset.saturating_add(limit);
+    let fetch_count = offset.checked_add(limit).ok_or(StatusCode::BAD_REQUEST)?;
     let key = SessionKey::new("api", &id);
     let mut sessions = state.sessions.lock().await;
     let session = sessions.get_or_create(&key);
@@ -169,7 +169,7 @@ pub async fn session_messages(
             timestamp: m.timestamp.to_rfc3339(),
         })
         .collect();
-    Json(messages)
+    Ok(Json(messages))
 }
 
 #[derive(Serialize)]

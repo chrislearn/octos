@@ -176,6 +176,21 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
+/// Check that a path is not a symlink. Returns error message if it is.
+///
+/// Call AFTER `resolve_path` and before any filesystem read/write.
+/// Prevents symlink-based escapes where a link inside base_dir points outside.
+pub async fn reject_symlink(path: &Path) -> Option<ToolResult> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.is_symlink() => Some(ToolResult {
+            output: "Symlinks are not allowed".to_string(),
+            success: false,
+            ..Default::default()
+        }),
+        _ => None,
+    }
+}
+
 impl ToolRegistry {
     /// Create a registry with built-in tools for the given working directory.
     pub fn with_builtins(cwd: impl AsRef<Path>) -> Self {

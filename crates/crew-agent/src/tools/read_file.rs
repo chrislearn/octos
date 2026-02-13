@@ -79,6 +79,10 @@ impl Tool for ReadFileTool {
             }
         };
 
+        if let Some(r) = super::reject_symlink(&path).await {
+            return Ok(r);
+        }
+
         // Check if file exists
         if !path.exists() {
             return Ok(ToolResult {
