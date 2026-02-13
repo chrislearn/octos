@@ -164,7 +164,13 @@ fn normalize_path(path: &Path) -> PathBuf {
                 out.pop();
             }
             Component::CurDir => {}
-            c => out.push(c.as_os_str()),
+            // RootDir and Prefix reset the path (absolute path semantics)
+            Component::RootDir | Component::Prefix(_) => {
+                out.push(component.as_os_str());
+            }
+            Component::Normal(seg) => {
+                out.push(seg);
+            }
         }
     }
     out

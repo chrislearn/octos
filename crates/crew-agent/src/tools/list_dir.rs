@@ -51,7 +51,17 @@ impl Tool for ListDirTool {
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let input: Input = serde_json::from_value(args.clone())?;
-        let target = self.base_dir.join(&input.path);
+
+        let target = match super::resolve_path(&self.base_dir, &input.path) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(ToolResult {
+                    output: format!("Path outside working directory: {}", input.path),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+        };
 
         if !target.exists() {
             return Ok(ToolResult {

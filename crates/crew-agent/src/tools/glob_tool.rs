@@ -71,13 +71,18 @@ impl Tool for GlobTool {
         let pattern = input.pattern.clone();
         let limit = input.limit;
 
+        // Reject absolute patterns to prevent directory traversal
+        if pattern.starts_with('/') {
+            return Ok(ToolResult {
+                output: "Absolute glob patterns are not allowed".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Run glob in blocking task
         let result = tokio::task::spawn_blocking(move || {
-            let full_pattern = if pattern.starts_with('/') {
-                pattern
-            } else {
-                format!("{}/{}", base_dir.display(), pattern)
-            };
+            let full_pattern = format!("{}/{}", base_dir.display(), pattern);
 
             let mut files: Vec<String> = Vec::new();
 

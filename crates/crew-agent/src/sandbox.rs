@@ -116,7 +116,7 @@ impl Sandbox for MacosSandbox {
         let cwd_str = cwd.to_string_lossy();
 
         // Reject paths with control characters to prevent SBPL profile injection
-        if cwd_str.bytes().any(|b| b < 0x20) {
+        if cwd_str.bytes().any(|b| b < 0x20 || b == 0x7F) {
             tracing::warn!("cwd contains control characters, falling back to unsandboxed");
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(shell_command).current_dir(cwd);
