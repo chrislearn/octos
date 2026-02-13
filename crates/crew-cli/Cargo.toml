@@ -38,10 +38,13 @@ base64 = { workspace = true }
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+rust-embed = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [features]
 default = []
-api = ["dep:axum", "dep:tower-http", "dep:futures"]
+api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics", "dep:metrics-exporter-prometheus"]
 telegram = ["crew-bus/telegram"]
 discord = ["crew-bus/discord"]
 slack = ["crew-bus/slack"]

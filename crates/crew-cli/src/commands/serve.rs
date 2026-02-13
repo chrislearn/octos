@@ -14,7 +14,7 @@ use eyre::{Result, WrapErr};
 
 use super::Executable;
 use super::chat::create_provider;
-use crate::api::{AppState, SseBroadcaster, build_router};
+use crate::api::{AppState, SseBroadcaster, build_router, init_metrics};
 use crate::config::Config;
 
 /// Start the REST API server.
@@ -133,6 +133,7 @@ impl ServeCommand {
         ));
 
         let auth_token = self.auth_token;
+        let metrics_handle = Some(init_metrics());
 
         let state = Arc::new(AppState {
             agent: Arc::new(agent),
@@ -140,6 +141,7 @@ impl ServeCommand {
             broadcaster,
             started_at: chrono::Utc::now(),
             auth_token,
+            metrics_handle,
         });
 
         let app = build_router(state);

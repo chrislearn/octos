@@ -10,6 +10,8 @@ use tower_http::cors::CorsLayer;
 
 use super::AppState;
 use super::handlers;
+use super::metrics;
+use super::static_files;
 
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -46,7 +48,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         api
     };
 
-    api.layer(cors).with_state(state)
+    // Unauthenticated routes (metrics + static files)
+    let public = Router::new()
+        .route("/metrics", get(metrics::metrics_handler));
+
+    public
+        .merge(api)
+        .fallback(static_files::static_handler)
+        .layer(cors)
+        .with_state(state)
 }
 
 /// Constant-time byte comparison to prevent timing attacks on auth tokens.

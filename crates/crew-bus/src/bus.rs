@@ -16,6 +16,15 @@ impl AgentHandle {
         self.in_rx.recv().await
     }
 
+    /// Drain all currently buffered inbound messages without blocking.
+    pub fn try_recv_all(&mut self) -> Vec<InboundMessage> {
+        let mut msgs = Vec::new();
+        while let Ok(msg) = self.in_rx.try_recv() {
+            msgs.push(msg);
+        }
+        msgs
+    }
+
     pub async fn send_outbound(
         &self,
         msg: OutboundMessage,
@@ -120,6 +129,29 @@ mod tests {
         assert_eq!(agent.recv_inbound().await.unwrap().content, "one");
         assert_eq!(agent.recv_inbound().await.unwrap().content, "two");
         assert_eq!(agent.recv_inbound().await.unwrap().content, "three");
+    }
+
+    #[tokio::test]
+    async fn test_try_recv_all_empty() {
+        let (mut agent, _publisher) = create_bus();
+        let msgs = agent.try_recv_all();
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_try_recv_all_drains_buffered() {
+        let (mut agent, publisher) = create_bus();
+        let tx = publisher.inbound_sender();
+        tx.send(make_inbound("a")).await.unwrap();
+        tx.send(make_inbound("b")).await.unwrap();
+        tx.send(make_inbound("c")).await.unwrap();
+        let msgs = agent.try_recv_all();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].content, "a");
+        assert_eq!(msgs[1].content, "b");
+        assert_eq!(msgs[2].content, "c");
+        // Subsequent call returns empty
+        assert!(agent.try_recv_all().is_empty());
     }
 
     #[tokio::test]

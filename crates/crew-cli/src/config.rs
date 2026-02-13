@@ -117,6 +117,17 @@ impl Config {
     }
 }
 
+/// Message queue mode for handling messages arriving during active agent runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueMode {
+    /// Process queued messages one at a time (FIFO). Default behavior.
+    #[default]
+    Followup,
+    /// Concatenate queued messages from the same session into one before processing.
+    Collect,
+}
+
 /// Gateway mode configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GatewayConfig {
@@ -131,6 +142,10 @@ pub struct GatewayConfig {
     /// Custom system prompt for gateway mode.
     #[serde(default)]
     pub system_prompt: Option<String>,
+
+    /// Message queue mode: "followup" (default) or "collect".
+    #[serde(default)]
+    pub queue_mode: QueueMode,
 }
 
 /// A channel entry in gateway config.
@@ -558,6 +573,7 @@ mod tests {
                 }],
                 max_history: 50,
                 system_prompt: None,
+                queue_mode: QueueMode::default(),
             }),
             ..Default::default()
         };
@@ -621,6 +637,7 @@ mod tests {
                 channels: vec![],
                 max_history: 0,
                 system_prompt: None,
+                queue_mode: QueueMode::default(),
             }),
             ..Default::default()
         };

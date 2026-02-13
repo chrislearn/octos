@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>crew-rs</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <h2>Sessions</h2>
+        <button id="new-session" title="New session">+</button>
+      </div>
+      <ul id="session-list"></ul>
+    </aside>
+    <main id="chat">
+      <div id="messages"></div>
+      <form id="chat-form">
+        <textarea id="input" placeholder="Type a message..." rows="2"></textarea>
+        <button type="submit">Send</button>
+      </form>
+    </main>
+    <footer id="status-bar">
+      <span id="status-text">Connecting...</span>
+    </footer>
+  </div>
+  <div id="auth-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3>Authentication Required</h3>
+      <input id="auth-token" type="password" placeholder="Bearer token">
+      <button id="auth-submit">Connect</button>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

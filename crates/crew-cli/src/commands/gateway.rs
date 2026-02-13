@@ -27,7 +27,7 @@ use std::path::Path;
 
 use super::Executable;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
-use crate::config::{Config, detect_provider};
+use crate::config::{Config, QueueMode, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::cron_tool::CronTool;
 
@@ -105,6 +105,7 @@ impl GatewayCommand {
                 }],
                 max_history: 50,
                 system_prompt: None,
+                queue_mode: QueueMode::default(),
             });
 
         println!("{}: {}", "Provider".green(), provider_name);
@@ -290,6 +291,7 @@ impl GatewayCommand {
         let cron_inbound_tx = publisher.inbound_sender();
         let heartbeat_inbound_tx = publisher.inbound_sender();
         let spawn_inbound_tx = publisher.inbound_sender();
+        let collect_inbound_tx = publisher.inbound_sender();
         let out_tx = agent_handle.outbound_sender();
 
         // Initialize cron service
@@ -734,6 +736,16 @@ impl GatewayCommand {
                     if agent_handle.send_outbound(outbound).await.is_err() {
                         break;
                     }
+
+                    // Collect mode: drain queued messages, merge by session, re-process
+                    if gw_config.queue_mode == QueueMode::Collect {
+                        let queued = agent_handle.try_recv_all();
+                        if !queued.is_empty() {
+                            for merged_msg in merge_queued_by_session(queued) {
+                                let _ = collect_inbound_tx.send(merged_msg).await;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     let error_msg = OutboundMessage {
@@ -822,6 +834,36 @@ fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> Strin
         .and_then(|v| v.as_str())
         .unwrap_or(default)
         .to_string()
+}
+
+/// Merge queued inbound messages by session key.
+/// Messages from the same session are concatenated with `\n\n`.
+fn merge_queued_by_session(messages: Vec<crew_core::InboundMessage>) -> Vec<crew_core::InboundMessage> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, Vec<crew_core::InboundMessage>> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for msg in messages {
+        let key = msg.session_key().to_string();
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(msg);
+    }
+    order
+        .into_iter()
+        .filter_map(|key| {
+            let mut msgs = groups.remove(&key)?;
+            if msgs.len() == 1 {
+                return msgs.pop();
+            }
+            let mut base = msgs.remove(0);
+            for m in &msgs {
+                base.content.push_str("\n\n");
+                base.content.push_str(&m.content);
+            }
+            Some(base)
+        })
+        .collect()
 }
 
 /// Load optional bootstrap/personality files from the .crew/ directory.

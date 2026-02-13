@@ -119,6 +119,13 @@ impl ConfigWatcher {
             restart_fields.push("hooks".into());
         }
 
+        // Queue mode change requires restart (affects message processing loop)
+        let old_queue_mode = old.gateway.as_ref().map(|g| &g.queue_mode);
+        let new_queue_mode = new.gateway.as_ref().map(|g| &g.queue_mode);
+        if old_queue_mode != new_queue_mode {
+            restart_fields.push("gateway.queue_mode".into());
+        }
+
         // Hot-reloadable fields (gateway sub-fields)
         let old_gw = old.gateway.as_ref();
         let new_gw = new.gateway.as_ref();
