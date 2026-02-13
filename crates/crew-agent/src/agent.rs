@@ -548,92 +548,114 @@ impl Agent {
         &self,
         response: &ChatResponse,
     ) -> Result<(Vec<Message>, Vec<std::path::PathBuf>, TokenUsage)> {
-        let mut messages = Vec::new();
+        // Execute all tool calls concurrently via join_all.
+        // The LLM issued these calls in a single response, so they are independent.
+        let futures: Vec<_> = response
+            .tool_calls
+            .iter()
+            .map(|tool_call| async {
+                let tool_start = Instant::now();
+                debug!(tool = %tool_call.name, tool_id = %tool_call.id, "executing tool");
+
+                self.reporter.report(ProgressEvent::ToolStarted {
+                    name: tool_call.name.clone(),
+                    tool_id: tool_call.id.clone(),
+                });
+
+                let result = self
+                    .tools
+                    .execute(&tool_call.name, &tool_call.arguments)
+                    .await;
+
+                let duration = tool_start.elapsed();
+
+                let (content, file_modified, tool_tokens) = match result {
+                    Ok(tool_result) => {
+                        debug!(
+                            tool = %tool_call.name,
+                            success = tool_result.success,
+                            duration_ms = duration.as_millis() as u64,
+                            "tool completed"
+                        );
+
+                        if let Some(ref file) = tool_result.file_modified {
+                            info!(tool = %tool_call.name, file = %file.display(), "file modified");
+                            self.reporter.report(ProgressEvent::FileModified {
+                                path: file.display().to_string(),
+                            });
+                        }
+
+                        let output_preview = if tool_result.output.len() > 200 {
+                            format!("{}...", &tool_result.output[..200])
+                        } else {
+                            tool_result.output.clone()
+                        };
+
+                        self.reporter.report(ProgressEvent::ToolCompleted {
+                            name: tool_call.name.clone(),
+                            tool_id: tool_call.id.clone(),
+                            success: tool_result.success,
+                            output_preview,
+                            duration,
+                        });
+
+                        (
+                            tool_result.output,
+                            tool_result.file_modified,
+                            tool_result.tokens_used,
+                        )
+                    }
+                    Err(e) => {
+                        warn!(
+                            tool = %tool_call.name,
+                            error = %e,
+                            duration_ms = duration.as_millis() as u64,
+                            "tool failed"
+                        );
+
+                        self.reporter.report(ProgressEvent::ToolCompleted {
+                            name: tool_call.name.clone(),
+                            tool_id: tool_call.id.clone(),
+                            success: false,
+                            output_preview: e.to_string(),
+                            duration,
+                        });
+
+                        (format!("Error: {e}"), None, None)
+                    }
+                };
+
+                (
+                    Message {
+                        role: MessageRole::Tool,
+                        content,
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: Some(tool_call.id.clone()),
+                        timestamp: chrono::Utc::now(),
+                    },
+                    file_modified,
+                    tool_tokens,
+                )
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        // Aggregate results — join_all preserves input order.
+        let mut messages = Vec::with_capacity(results.len());
         let mut files_modified = Vec::new();
         let mut tokens_used = TokenUsage::default();
 
-        for tool_call in &response.tool_calls {
-            let tool_start = Instant::now();
-            debug!(tool = %tool_call.name, tool_id = %tool_call.id, "executing tool");
-
-            self.reporter.report(ProgressEvent::ToolStarted {
-                name: tool_call.name.clone(),
-                tool_id: tool_call.id.clone(),
-            });
-
-            let result = self
-                .tools
-                .execute(&tool_call.name, &tool_call.arguments)
-                .await;
-
-            let duration = tool_start.elapsed();
-
-            let content = match result {
-                Ok(tool_result) => {
-                    debug!(
-                        tool = %tool_call.name,
-                        success = tool_result.success,
-                        duration_ms = duration.as_millis() as u64,
-                        "tool completed"
-                    );
-
-                    if let Some(ref file) = tool_result.file_modified {
-                        info!(tool = %tool_call.name, file = %file.display(), "file modified");
-                        files_modified.push(file.clone());
-                        self.reporter.report(ProgressEvent::FileModified {
-                            path: file.display().to_string(),
-                        });
-                    }
-
-                    if let Some(tokens) = tool_result.tokens_used {
-                        tokens_used.input_tokens += tokens.input_tokens;
-                        tokens_used.output_tokens += tokens.output_tokens;
-                    }
-
-                    let output_preview = if tool_result.output.len() > 200 {
-                        format!("{}...", &tool_result.output[..200])
-                    } else {
-                        tool_result.output.clone()
-                    };
-
-                    self.reporter.report(ProgressEvent::ToolCompleted {
-                        name: tool_call.name.clone(),
-                        tool_id: tool_call.id.clone(),
-                        success: tool_result.success,
-                        output_preview,
-                        duration,
-                    });
-
-                    tool_result.output
-                }
-                Err(e) => {
-                    warn!(
-                        tool = %tool_call.name,
-                        error = %e,
-                        duration_ms = duration.as_millis() as u64,
-                        "tool failed"
-                    );
-
-                    self.reporter.report(ProgressEvent::ToolCompleted {
-                        name: tool_call.name.clone(),
-                        tool_id: tool_call.id.clone(),
-                        success: false,
-                        output_preview: e.to_string(),
-                        duration,
-                    });
-
-                    format!("Error: {e}")
-                }
-            };
-
-            messages.push(Message {
-                role: MessageRole::Tool,
-                content,
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: Some(tool_call.id.clone()),
-                timestamp: chrono::Utc::now(),
-            });
+        for (message, file_modified, tool_tokens) in results {
+            messages.push(message);
+            if let Some(file) = file_modified {
+                files_modified.push(file);
+            }
+            if let Some(tokens) = tool_tokens {
+                tokens_used.input_tokens += tokens.input_tokens;
+                tokens_used.output_tokens += tokens.output_tokens;
+            }
         }
 
         Ok((messages, files_modified, tokens_used))
