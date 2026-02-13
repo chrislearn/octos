@@ -22,6 +22,10 @@ pub struct SandboxConfig {
     /// Allow network access inside the sandbox.
     #[serde(default)]
     pub allow_network: bool,
+
+    /// Docker-specific settings (used when mode = "docker").
+    #[serde(default)]
+    pub docker: DockerConfig,
 }
 
 impl Default for SandboxConfig {
@@ -30,8 +34,64 @@ impl Default for SandboxConfig {
             enabled: false,
             mode: SandboxMode::Auto,
             allow_network: false,
+            docker: DockerConfig::default(),
         }
     }
+}
+
+/// Docker sandbox configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DockerConfig {
+    /// Docker image to use (default: "alpine:3.21").
+    #[serde(default = "default_docker_image")]
+    pub image: String,
+
+    /// CPU limit (e.g. "1.0").
+    #[serde(default)]
+    pub cpu_limit: Option<String>,
+
+    /// Memory limit (e.g. "512m").
+    #[serde(default)]
+    pub memory_limit: Option<String>,
+
+    /// Maximum number of processes.
+    #[serde(default)]
+    pub pids_limit: Option<u32>,
+
+    /// Workspace mount mode.
+    #[serde(default)]
+    pub mount_mode: MountMode,
+}
+
+impl Default for DockerConfig {
+    fn default() -> Self {
+        Self {
+            image: default_docker_image(),
+            cpu_limit: None,
+            memory_limit: None,
+            pids_limit: None,
+            mount_mode: MountMode::ReadWrite,
+        }
+    }
+}
+
+fn default_docker_image() -> String {
+    "alpine:3.21".to_string()
+}
+
+/// Workspace mount mode for Docker sandbox.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MountMode {
+    /// No workspace mount.
+    None,
+    /// Read-only mount.
+    #[serde(rename = "ro")]
+    ReadOnly,
+    /// Read-write mount (default).
+    #[default]
+    #[serde(rename = "rw")]
+    ReadWrite,
 }
 
 /// Which sandbox backend to use.
@@ -45,6 +105,8 @@ pub enum SandboxMode {
     Bwrap,
     /// macOS sandbox-exec.
     Macos,
+    /// Docker container isolation.
+    Docker,
     /// No sandboxing (pass-through).
     None,
 }
@@ -159,6 +221,61 @@ impl Sandbox for MacosSandbox {
     }
 }
 
+/// Docker container sandbox.
+pub struct DockerSandbox {
+    config: DockerConfig,
+    allow_network: bool,
+}
+
+impl Sandbox for DockerSandbox {
+    fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
+        let mut cmd = Command::new("docker");
+        cmd.arg("run").arg("--rm");
+
+        // Resource limits
+        if let Some(ref cpu) = self.config.cpu_limit {
+            cmd.arg("--cpus").arg(cpu);
+        }
+        if let Some(ref mem) = self.config.memory_limit {
+            cmd.arg("--memory").arg(mem);
+        }
+        if let Some(pids) = self.config.pids_limit {
+            cmd.arg("--pids-limit").arg(pids.to_string());
+        }
+
+        // Network
+        if !self.allow_network {
+            cmd.arg("--network").arg("none");
+        }
+
+        // Security hardening
+        cmd.arg("--security-opt").arg("no-new-privileges");
+        cmd.arg("--cap-drop").arg("ALL");
+
+        // Clear dangerous environment variables
+        for var in &["LD_PRELOAD", "LD_LIBRARY_PATH", "NODE_OPTIONS", "PYTHONSTARTUP"] {
+            cmd.arg("--env").arg(format!("{var}="));
+        }
+
+        // Workspace mount
+        let cwd_str = cwd.to_string_lossy();
+        match self.config.mount_mode {
+            MountMode::ReadWrite => {
+                cmd.arg("-v").arg(format!("{cwd_str}:/workspace"));
+            }
+            MountMode::ReadOnly => {
+                cmd.arg("-v").arg(format!("{cwd_str}:/workspace:ro"));
+            }
+            MountMode::None => {}
+        }
+        cmd.arg("-w").arg("/workspace");
+
+        cmd.arg(&self.config.image);
+        cmd.arg("sh").arg("-c").arg(shell_command);
+        cmd
+    }
+}
+
 /// Create a sandbox from config.
 pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
     if !config.enabled {
@@ -174,6 +291,10 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         SandboxMode::Macos => Box::new(MacosSandbox {
             allow_network: config.allow_network,
         }),
+        SandboxMode::Docker => Box::new(DockerSandbox {
+            config: config.docker.clone(),
+            allow_network: config.allow_network,
+        }),
         SandboxMode::Auto => {
             if cfg!(target_os = "linux") && which_exists("bwrap") {
                 Box::new(BwrapSandbox {
@@ -181,6 +302,11 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 })
             } else if cfg!(target_os = "macos") && which_exists("sandbox-exec") {
                 Box::new(MacosSandbox {
+                    allow_network: config.allow_network,
+                })
+            } else if which_exists("docker") {
+                Box::new(DockerSandbox {
+                    config: config.docker.clone(),
                     allow_network: config.allow_network,
                 })
             } else {
@@ -253,5 +379,118 @@ mod tests {
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert!(args.iter().any(|a| a.contains("allow network")));
+    }
+
+    #[test]
+    fn test_docker_sandbox_command() {
+        let sb = DockerSandbox {
+            config: DockerConfig::default(),
+            allow_network: false,
+        };
+        let cmd = sb.wrap_command("echo hi", Path::new("/tmp/work"));
+        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        assert_eq!(prog, "docker");
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"run".to_string()));
+        assert!(args.contains(&"--rm".to_string()));
+        assert!(args.contains(&"none".to_string())); // --network none
+        assert!(args.contains(&"no-new-privileges".to_string()));
+        assert!(args.contains(&"ALL".to_string())); // --cap-drop ALL
+        assert!(args.contains(&"alpine:3.21".to_string()));
+        assert!(args.contains(&"echo hi".to_string()));
+    }
+
+    #[test]
+    fn test_docker_sandbox_resource_limits() {
+        let sb = DockerSandbox {
+            config: DockerConfig {
+                cpu_limit: Some("1.5".into()),
+                memory_limit: Some("256m".into()),
+                pids_limit: Some(100),
+                ..DockerConfig::default()
+            },
+            allow_network: true,
+        };
+        let cmd = sb.wrap_command("ls", Path::new("/tmp"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"1.5".to_string())); // --cpus
+        assert!(args.contains(&"256m".to_string())); // --memory
+        assert!(args.contains(&"100".to_string())); // --pids-limit
+        // Network allowed — no --network none
+        assert!(!args.iter().any(|a| a == "none"));
+    }
+
+    #[test]
+    fn test_docker_sandbox_mount_modes() {
+        // Read-write (default)
+        let sb = DockerSandbox {
+            config: DockerConfig::default(),
+            allow_network: false,
+        };
+        let cmd = sb.wrap_command("ls", Path::new("/home/user/project"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"/home/user/project:/workspace".to_string()));
+
+        // Read-only
+        let sb_ro = DockerSandbox {
+            config: DockerConfig {
+                mount_mode: MountMode::ReadOnly,
+                ..DockerConfig::default()
+            },
+            allow_network: false,
+        };
+        let cmd_ro = sb_ro.wrap_command("ls", Path::new("/home/user/project"));
+        let args_ro: Vec<_> = cmd_ro
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args_ro.contains(&"/home/user/project:/workspace:ro".to_string()));
+
+        // No mount — no -v flag with :/workspace, but -w /workspace is still set
+        let sb_none = DockerSandbox {
+            config: DockerConfig {
+                mount_mode: MountMode::None,
+                ..DockerConfig::default()
+            },
+            allow_network: false,
+        };
+        let cmd_none = sb_none.wrap_command("ls", Path::new("/home/user/project"));
+        let args_none: Vec<_> = cmd_none
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(!args_none.iter().any(|a| a.contains(":/workspace")));
+    }
+
+    #[test]
+    fn test_docker_sandbox_env_sanitization() {
+        let sb = DockerSandbox {
+            config: DockerConfig::default(),
+            allow_network: false,
+        };
+        let cmd = sb.wrap_command("ls", Path::new("/tmp"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"LD_PRELOAD=".to_string()));
+        assert!(args.contains(&"LD_LIBRARY_PATH=".to_string()));
+        assert!(args.contains(&"NODE_OPTIONS=".to_string()));
+        assert!(args.contains(&"PYTHONSTARTUP=".to_string()));
     }
 }

@@ -13,6 +13,8 @@ use tracing::debug;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionMeta {
     session_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_key: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -21,6 +23,8 @@ struct SessionMeta {
 #[derive(Debug, Clone)]
 pub struct Session {
     pub key: SessionKey,
+    /// Parent session key if this session was forked.
+    pub parent_key: Option<SessionKey>,
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -31,6 +35,7 @@ impl Session {
         let now = Utc::now();
         Self {
             key,
+            parent_key: None,
             messages: vec![],
             created_at: now,
             updated_at: now,
@@ -140,6 +145,7 @@ impl SessionManager {
 
         Some(Session {
             key: key.clone(),
+            parent_key: meta.parent_key.map(SessionKey),
             messages,
             created_at: meta.created_at,
             updated_at: meta.updated_at,
@@ -159,8 +165,10 @@ impl SessionManager {
             .open(&path)?;
 
         if is_new {
+            let parent_key = self.cache.get(&key.0).and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
             let meta = SessionMeta {
                 session_key: key.0.clone(),
+                parent_key,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             };
@@ -188,6 +196,7 @@ impl SessionManager {
 
         let meta = SessionMeta {
             session_key: key.0.clone(),
+            parent_key: session.parent_key.as_ref().map(|k| k.0.clone()),
             created_at: session.created_at,
             updated_at: session.updated_at,
         };
@@ -203,6 +212,46 @@ impl SessionManager {
 
         debug!(key = %key, messages = session.messages.len(), "Rewrote session to disk");
         Ok(())
+    }
+
+    /// Fork a session: create a new session that copies the last N messages from the parent.
+    ///
+    /// The new session's channel is taken from the parent key; `new_chat_id` becomes the chat ID.
+    /// Returns the new session's key.
+    pub fn fork(
+        &mut self,
+        parent_key: &SessionKey,
+        new_chat_id: &str,
+        copy_messages: usize,
+    ) -> Result<SessionKey> {
+        let parent = self.get_or_create(parent_key);
+        let messages: Vec<Message> = parent.get_history(copy_messages).to_vec();
+        // Derive channel from parent key (format: "channel:chat_id")
+        let channel = parent_key
+            .0
+            .split(':')
+            .next()
+            .unwrap_or("cli");
+        let new_key = SessionKey::new(channel, new_chat_id);
+
+        let now = Utc::now();
+        let session = Session {
+            key: new_key.clone(),
+            parent_key: Some(parent_key.clone()),
+            messages,
+            created_at: now,
+            updated_at: now,
+        };
+        self.cache.insert(new_key.0.clone(), session);
+        self.rewrite(&new_key)?;
+
+        debug!(
+            parent = %parent_key,
+            child = %new_key,
+            copied = copy_messages,
+            "Forked session"
+        );
+        Ok(new_key)
     }
 
     /// Clear a session's history (both in-memory and on disk).
@@ -360,5 +409,47 @@ mod tests {
         assert_eq!(session2.messages.len(), 2);
         assert_eq!(session2.messages[0].content, "msg3");
         assert_eq!(session2.messages[1].content, "msg4");
+    }
+
+    #[test]
+    fn test_fork_creates_child() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let parent = SessionKey::new("telegram", "chat1");
+
+        for i in 0..5 {
+            mgr.add_message(&parent, make_message(MessageRole::User, &format!("msg{i}")))
+                .unwrap();
+        }
+
+        let child_key = mgr.fork(&parent, "chat1_fork", 3).unwrap();
+        assert_eq!(child_key, SessionKey::new("telegram", "chat1_fork"));
+
+        let child = mgr.get_or_create(&child_key);
+        assert_eq!(child.parent_key, Some(parent.clone()));
+        assert_eq!(child.messages.len(), 3);
+        assert_eq!(child.messages[0].content, "msg2");
+        assert_eq!(child.messages[2].content, "msg4");
+    }
+
+    #[test]
+    fn test_fork_persists_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("cli", "main");
+
+        {
+            let mut mgr = SessionManager::open(tmp.path()).unwrap();
+            mgr.add_message(&parent, make_message(MessageRole::User, "hello"))
+                .unwrap();
+            mgr.fork(&parent, "branch", 1).unwrap();
+        }
+
+        // Reload from disk
+        let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
+        let child_key = SessionKey::new("cli", "branch");
+        let child = mgr2.get_or_create(&child_key);
+        assert_eq!(child.parent_key, Some(parent));
+        assert_eq!(child.messages.len(), 1);
+        assert_eq!(child.messages[0].content, "hello");
     }
 }

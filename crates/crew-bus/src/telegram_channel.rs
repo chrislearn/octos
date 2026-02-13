@@ -79,6 +79,10 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
+    fn max_message_length(&self) -> usize {
+        4000
+    }
+
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         use futures::StreamExt;
         use teloxide::update_listeners::{AsUpdateStream, polling_default};

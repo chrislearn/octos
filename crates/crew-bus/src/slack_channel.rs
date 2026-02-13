@@ -143,6 +143,10 @@ impl Channel for SlackChannel {
         "slack"
     }
 
+    fn max_message_length(&self) -> usize {
+        3900
+    }
+
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         info!("Starting Slack channel (Socket Mode)");
 

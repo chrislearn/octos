@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::bus::BusPublisher;
+use crate::coalesce::{ChunkConfig, split_message};
 
 /// A message channel (CLI, Telegram, Discord, etc.).
 #[async_trait]
@@ -26,6 +27,12 @@ pub trait Channel: Send + Sync {
     /// Check if a sender is allowed to use this channel.
     fn is_allowed(&self, _sender_id: &str) -> bool {
         true
+    }
+
+    /// Maximum message length in characters for this channel.
+    /// Messages exceeding this limit are automatically split at natural boundaries.
+    fn max_message_length(&self) -> usize {
+        4000
     }
 
     /// Stop the channel gracefully.
@@ -80,8 +87,15 @@ impl ChannelManager {
         tokio::spawn(async move {
             while let Some(msg) = publisher.recv_outbound().await {
                 if let Some(channel) = channels.get(&msg.channel) {
-                    if let Err(e) = channel.send(&msg).await {
-                        error!(channel = msg.channel, "Failed to send outbound: {e}");
+                    let config = ChunkConfig { max_chars: channel.max_message_length() };
+                    let chunks = split_message(&msg.content, &config);
+                    for chunk in chunks {
+                        let mut chunk_msg = msg.clone();
+                        chunk_msg.content = chunk;
+                        if let Err(e) = channel.send(&chunk_msg).await {
+                            error!(channel = msg.channel, "Failed to send outbound: {e}");
+                            break;
+                        }
                     }
                 } else {
                     error!(

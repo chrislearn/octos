@@ -640,6 +640,29 @@ impl GatewayCommand {
             spawn_tool.set_context(&reply_channel, &reply_chat_id);
 
             let session_key = inbound.session_key();
+
+            // Handle /new command: fork the current session
+            if inbound.content.trim() == "/new" {
+                let new_id = format!("{}_{}", inbound.chat_id, chrono::Utc::now().timestamp());
+                match session_mgr.fork(&session_key, &new_id, 10) {
+                    Ok(new_key) => {
+                        let msg = OutboundMessage {
+                            channel: reply_channel.clone(),
+                            chat_id: reply_chat_id.clone(),
+                            content: format!("Session forked. New session: {new_key}"),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: serde_json::json!({}),
+                        };
+                        let _ = agent_handle.send_outbound(msg).await;
+                    }
+                    Err(e) => {
+                        warn!("session fork failed: {e}");
+                    }
+                }
+                continue;
+            }
+
             info!(
                 channel = %inbound.channel,
                 sender = %inbound.sender_id,

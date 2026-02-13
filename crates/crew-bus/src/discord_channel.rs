@@ -117,6 +117,10 @@ impl Channel for DiscordChannel {
         "discord"
     }
 
+    fn max_message_length(&self) -> usize {
+        1900
+    }
+
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         info!("Starting Discord channel (gateway)");
 
