@@ -702,15 +702,94 @@ pub struct PluginTool {
 
 ### Progress Reporting
 
+The agent emits structured events during execution via a trait-based observer pattern. Consumers (CLI, REST API) implement the trait to render progress in their own format.
+
+#### ProgressReporter Trait
+
 ```rust
 pub trait ProgressReporter: Send + Sync {
     fn report(&self, event: ProgressEvent);
 }
 ```
 
-**Events**: TaskStarted, Thinking, Response, ToolStarted, ToolCompleted (with duration), FileModified, TokenUsage, TaskCompleted, TaskInterrupted, MaxIterationsReached, TokenBudgetExceeded, StreamChunk, StreamDone, CostUpdate.
+Agent holds `reporter: Arc<dyn ProgressReporter>`. Events are fired synchronously during the execution loop (non-blocking — implementations must not block).
 
-**ConsoleReporter**: ANSI colors, streaming buffer flush on newlines, 5-line tool output preview.
+#### ProgressEvent Enum
+
+```rust
+pub enum ProgressEvent {
+    TaskStarted { task_id: String },
+    Thinking { iteration: u32 },
+    Response { content: String, iteration: u32 },
+    ToolStarted { name: String, tool_id: String },
+    ToolCompleted { name: String, tool_id: String, success: bool,
+                    output_preview: String, duration: Duration },
+    FileModified { path: String },
+    TokenUsage { input_tokens: u32, output_tokens: u32 },
+    TaskCompleted { success: bool, iterations: u32, duration: Duration },
+    TaskInterrupted { iterations: u32 },
+    MaxIterationsReached { limit: u32 },
+    TokenBudgetExceeded { used: u32, limit: u32 },
+    StreamChunk { text: String, iteration: u32 },
+    StreamDone { iteration: u32 },
+    CostUpdate { session_input_tokens: u32, session_output_tokens: u32,
+                 response_cost: Option<f64>, session_cost: Option<f64> },
+}
+```
+
+#### Implementations (3)
+
+**SilentReporter** — no-op, used as default when no reporter is configured.
+
+**ConsoleReporter** — CLI output with ANSI colors and streaming support:
+
+```rust
+pub struct ConsoleReporter {
+    use_colors: bool,
+    verbose: bool,
+    stdout: Mutex<BufWriter<Stdout>>,  // buffered for streaming chunks
+}
+```
+
+| Event | Output |
+|---|---|
+| Thinking | `\r⟳ Thinking... (iteration N)` (overwrites line, yellow) |
+| Response | `◆ first 3 lines...` (cyan, clears Thinking line) |
+| ToolStarted | `\r⚙ Running tool_name...` (overwrites line, yellow) |
+| ToolCompleted | `✓ tool_name (duration)` green or `✗ tool_name` red; verbose: 5 lines of output + `...` |
+| FileModified | `📝 Modified: path` (green) |
+| TokenUsage | `Tokens: N in, N out` (verbose only, dim) |
+| TaskCompleted | `✓ Completed N iterations, Xs` or `✗ Failed after N iterations` |
+| TaskInterrupted | `⚠ Interrupted after N iterations.` (yellow) |
+| MaxIterationsReached | `⚠ Reached max iterations limit (N).` (yellow) |
+| TokenBudgetExceeded | `⚠ Token budget exceeded (used, limit).` (yellow) |
+| StreamChunk | Write to buffered stdout; flush only on `\n` (reduces syscalls) |
+| StreamDone | Flush + newline |
+| CostUpdate | `Tokens: N in / N out \| Cost: $X.XXXX` |
+| TaskStarted | `▶ Task: id` (verbose only, dim) |
+
+**Duration formatting**: >1s → `{:.1}s`, ≤1s → `{N}ms`.
+
+**SseBroadcaster** (REST API, feature: `api`) — converts events to JSON and broadcasts via `tokio::sync::broadcast` channel:
+
+```rust
+pub struct SseBroadcaster {
+    tx: broadcast::Sender<String>,  // JSON-serialized events
+}
+```
+
+| ProgressEvent | JSON `type` field | Additional fields |
+|---|---|---|
+| ToolStarted | `"tool_start"` | `tool` |
+| ToolCompleted | `"tool_end"` | `tool`, `success` |
+| StreamChunk | `"token"` | `text` |
+| StreamDone | `"stream_end"` | — |
+| CostUpdate | `"cost_update"` | `input_tokens`, `output_tokens`, `session_cost` |
+| Thinking | `"thinking"` | `iteration` |
+| Response | `"response"` | `iteration` |
+| (other) | `"other"` | — (logged at debug level) |
+
+Subscribers receive events via `SseBroadcaster::subscribe() -> broadcast::Receiver<String>`. Send errors (no subscribers) are silently ignored.
 
 ---
 
