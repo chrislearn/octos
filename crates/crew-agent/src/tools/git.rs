@@ -282,33 +282,19 @@ fn git_diff(cwd: &std::path::Path, path: Option<&str>) -> Result<String> {
             continue;
         }
 
-        // Compare file content with blob in index/revision
+        // Compare file content with blob in index using Myers unified diff
         if let Ok(current) = std::fs::read_to_string(&file_path) {
             let blob_id = entry.id;
             if let Ok(blob) = repo.find_object(blob_id) {
                 let old_content = String::from_utf8_lossy(&blob.data);
                 if old_content.as_ref() != current.as_str() {
-                    diffs.push(format!("--- a/{entry_path}\n+++ b/{entry_path}"));
-                    // Simple line-by-line diff
-                    let old_lines: Vec<&str> = old_content.lines().collect();
-                    let new_lines: Vec<&str> = current.lines().collect();
-                    for (i, (o, n)) in old_lines.iter().zip(new_lines.iter()).enumerate() {
-                        if o != n {
-                            diffs.push(format!("@@ line {} @@", i + 1));
-                            diffs.push(format!("-{o}"));
-                            diffs.push(format!("+{n}"));
-                        }
-                    }
-                    // Handle length differences
-                    if new_lines.len() > old_lines.len() {
-                        for line in &new_lines[old_lines.len()..] {
-                            diffs.push(format!("+{line}"));
-                        }
-                    } else if old_lines.len() > new_lines.len() {
-                        for line in &old_lines[new_lines.len()..] {
-                            diffs.push(format!("-{line}"));
-                        }
-                    }
+                    let diff = similar::TextDiff::from_lines(old_content.as_ref(), &current);
+                    let unified = diff
+                        .unified_diff()
+                        .context_radius(3)
+                        .header(&format!("a/{entry_path}"), &format!("b/{entry_path}"))
+                        .to_string();
+                    diffs.push(unified);
                 }
             }
         }
@@ -409,33 +395,70 @@ fn git_show(cwd: &std::path::Path, revision: &str) -> Result<String> {
 }
 
 fn git_blame(cwd: &std::path::Path, path: &str) -> Result<String> {
-    // gix doesn't have a built-in blame yet; use git2-style line attribution
-    // For now, fall back to showing the file with commit info from log
+    // gix doesn't support blame natively; shell out to `git blame` for
+    // proper per-line commit attribution.
     let repo = gix::discover(cwd)?;
     let worktree = repo
         .workdir()
         .ok_or_else(|| eyre::eyre!("bare repository"))?;
 
     // Path already validated via resolve_path in execute().
-    // Use worktree.join() directly — the traversal check was done at the entry point.
     let file_path = worktree.join(path);
     if !file_path.exists() {
         eyre::bail!("file not found: {path}");
     }
 
-    let content = std::fs::read_to_string(&file_path)?;
-    let lines: Vec<&str> = content.lines().collect();
+    let output = std::process::Command::new("git")
+        .args(["blame", "--porcelain", path])
+        .current_dir(worktree)
+        .output()
+        .map_err(|e| eyre::eyre!("failed to run git blame: {e}"))?;
 
-    // Simple blame: show line numbers with content (blame attribution requires
-    // walking history which gix doesn't easily support yet)
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eyre::bail!("git blame failed: {}", stderr.trim());
+    }
+
+    // Parse porcelain format into structured blame lines
+    let raw = String::from_utf8_lossy(&output.stdout);
     let mut result = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        result.push(format!("{:>4} | {line}", i + 1));
+    let mut current_hash = String::new();
+    let mut current_author = String::new();
+    let mut line_num: usize = 0;
+
+    for line in raw.lines() {
+        if let Some(content) = line.strip_prefix('\t') {
+            // Content line (prefixed with tab)
+            let short_hash = if current_hash.len() >= 8 {
+                &current_hash[..8]
+            } else {
+                &current_hash
+            };
+            result.push(format!(
+                "{short_hash} ({current_author:>15}) {:>4} | {content}",
+                line_num
+            ));
+        } else if let Some(rest) = line.strip_prefix("author ") {
+            current_author = rest.to_string();
+        } else if !line.starts_with("author-")
+            && !line.starts_with("committer")
+            && !line.starts_with("summary ")
+            && !line.starts_with("filename ")
+            && !line.starts_with("previous ")
+            && !line.starts_with("boundary")
+        {
+            // Header line: <hash> <orig-line> <final-line> [<num-lines>]
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 && parts[0].len() == 40 {
+                current_hash = parts[0].to_string();
+                line_num = parts[2].parse().unwrap_or(0);
+            }
+        }
     }
 
     Ok(format!(
         "blame for {path} ({} lines):\n{}",
-        lines.len(),
+        result.len(),
         result.join("\n")
     ))
 }

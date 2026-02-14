@@ -1,7 +1,7 @@
 //! Code structure analysis tool using tree-sitter for AST parsing.
 //!
 //! Extracts functions, structs/classes, imports, and constants from source files.
-//! Supports Rust, Python, and JavaScript/TypeScript.
+//! Supports Rust, Python, JavaScript, and TypeScript.
 
 use std::path::PathBuf;
 
@@ -38,7 +38,7 @@ impl Tool for CodeStructureTool {
     }
 
     fn description(&self) -> &str {
-        "Analyze code structure: extract functions, structs/classes, imports, and constants from a source file using AST parsing. Supports Rust, Python, JavaScript."
+        "Analyze code structure: extract functions, structs/classes, imports, and constants from a source file using AST parsing. Supports Rust, Python, JavaScript, TypeScript."
     }
 
     fn tags(&self) -> &[&str] {
@@ -55,7 +55,7 @@ impl Tool for CodeStructureTool {
                 },
                 "language": {
                     "type": "string",
-                    "enum": ["rust", "python", "javascript"],
+                    "enum": ["rust", "python", "javascript", "typescript"],
                     "description": "Language (auto-detected from extension if omitted)"
                 }
             },
@@ -109,7 +109,9 @@ fn detect_language(path: &str) -> Option<&str> {
     match ext {
         "rs" => Some("rust"),
         "py" | "pyi" => Some("python"),
-        "js" | "jsx" | "ts" | "tsx" | "mjs" => Some("javascript"),
+        "js" | "jsx" | "mjs" => Some("javascript"),
+        "ts" => Some("typescript"),
+        "tsx" => Some("tsx"),
         _ => None,
     }
 }
@@ -122,6 +124,8 @@ fn parse_structure(source: &str, language: &str) -> Result<serde_json::Value> {
         "rust" => tree_sitter_rust::LANGUAGE,
         "python" => tree_sitter_python::LANGUAGE,
         "javascript" => tree_sitter_javascript::LANGUAGE,
+        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+        "tsx" => tree_sitter_typescript::LANGUAGE_TSX,
         other => eyre::bail!("unsupported language: {other}"),
     };
 
@@ -249,7 +253,7 @@ fn collect_symbols(
             }
             _ => {}
         },
-        "javascript" => match kind {
+        "javascript" | "typescript" | "tsx" => match kind {
             "function_declaration" | "method_definition" | "arrow_function" => {
                 // Arrow function name extraction: handles `const f = () => {}`
                 // via variable_declarator parent. Does not cover property
@@ -272,6 +276,28 @@ fn collect_symbols(
                 if let Some(name) = child_text(&node, "name", source) {
                     classes.push(serde_json::json!({
                         "name": name, "line": line
+                    }));
+                }
+            }
+            // TypeScript-specific: interfaces, type aliases, enums
+            "interface_declaration" => {
+                if let Some(name) = child_text(&node, "name", source) {
+                    structs.push(serde_json::json!({
+                        "name": name, "line": line, "kind": "interface"
+                    }));
+                }
+            }
+            "type_alias_declaration" => {
+                if let Some(name) = child_text(&node, "name", source) {
+                    structs.push(serde_json::json!({
+                        "name": name, "line": line, "kind": "type"
+                    }));
+                }
+            }
+            "enum_declaration" => {
+                if let Some(name) = child_text(&node, "name", source) {
+                    structs.push(serde_json::json!({
+                        "name": name, "line": line, "kind": "enum"
                     }));
                 }
             }
@@ -337,8 +363,8 @@ mod tests {
         assert_eq!(detect_language("src/main.rs"), Some("rust"));
         assert_eq!(detect_language("script.py"), Some("python"));
         assert_eq!(detect_language("app.js"), Some("javascript"));
-        assert_eq!(detect_language("app.ts"), Some("javascript"));
-        assert_eq!(detect_language("app.tsx"), Some("javascript"));
+        assert_eq!(detect_language("app.ts"), Some("typescript"));
+        assert_eq!(detect_language("app.tsx"), Some("tsx"));
         assert_eq!(detect_language("data.json"), None);
     }
 
@@ -422,6 +448,51 @@ function hello(name) {
 
         let classes = result["classes"].as_array().unwrap();
         assert!(classes.iter().any(|c| c["name"] == "Widget"));
+    }
+
+    #[test]
+    fn test_parse_typescript_interfaces_and_types() {
+        let source = r#"
+import { Component } from 'react';
+
+interface User {
+    name: string;
+    age: number;
+}
+
+type Status = 'active' | 'inactive';
+
+enum Direction {
+    Up,
+    Down,
+}
+
+class UserService {
+    getUser(id: number): User {
+        return { name: "test", age: 0 };
+    }
+}
+
+function greet(user: User): string {
+    return `Hello ${user.name}`;
+}
+"#;
+        let result = parse_structure(source, "typescript").unwrap();
+
+        let functions = result["functions"].as_array().unwrap();
+        assert!(functions.iter().any(|f| f["name"] == "greet"));
+        assert!(functions.iter().any(|f| f["name"] == "getUser"));
+
+        let structs = result["structs"].as_array().unwrap();
+        assert!(structs.iter().any(|s| s["name"] == "User" && s["kind"] == "interface"));
+        assert!(structs.iter().any(|s| s["name"] == "Status" && s["kind"] == "type"));
+        assert!(structs.iter().any(|s| s["name"] == "Direction" && s["kind"] == "enum"));
+
+        let classes = result["classes"].as_array().unwrap();
+        assert!(classes.iter().any(|c| c["name"] == "UserService"));
+
+        let imports = result["imports"].as_array().unwrap();
+        assert!(!imports.is_empty());
     }
 
     #[test]

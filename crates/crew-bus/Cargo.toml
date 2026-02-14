@@ -18,6 +18,7 @@ email = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mail
 [dependencies]
 crew-core = { workspace = true }
 tokio = { workspace = true }
+lru = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

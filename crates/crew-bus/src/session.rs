@@ -1,12 +1,12 @@
 //! Session management with JSONL persistence and LRU eviction.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use crew_core::{Message, SessionKey};
 use eyre::Result;
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -57,17 +57,14 @@ impl Session {
 /// Default maximum number of sessions kept in memory.
 const DEFAULT_MAX_SESSIONS: usize = 1000;
 
-/// A cache entry wrapping a session with LRU tracking.
-struct CachedSession {
-    session: Session,
-    last_accessed: Instant,
-}
-
-/// Manages sessions with in-memory cache, LRU eviction, and JSONL disk persistence.
+/// Manages sessions with in-memory LRU cache and JSONL disk persistence.
+///
+/// Uses `lru::LruCache` for O(1) get/put with automatic eviction of the
+/// least-recently-used session when capacity is exceeded. Evicted sessions
+/// remain on disk and are lazy-loaded on next access.
 pub struct SessionManager {
     sessions_dir: PathBuf,
-    cache: HashMap<String, CachedSession>,
-    max_sessions: usize,
+    cache: LruCache<String, Session>,
 }
 
 impl SessionManager {
@@ -76,15 +73,17 @@ impl SessionManager {
         std::fs::create_dir_all(&sessions_dir)?;
         Ok(Self {
             sessions_dir,
-            cache: HashMap::new(),
-            max_sessions: DEFAULT_MAX_SESSIONS,
+            cache: LruCache::new(
+                NonZeroUsize::new(DEFAULT_MAX_SESSIONS).expect("default > 0"),
+            ),
         })
     }
 
     /// Set the maximum number of sessions to keep in memory.
     /// Sessions evicted from memory are NOT deleted from disk.
     pub fn with_max_sessions(mut self, max: usize) -> Self {
-        self.max_sessions = max;
+        let cap = NonZeroUsize::new(max).unwrap_or(NonZeroUsize::new(1).unwrap());
+        self.cache.resize(cap);
         self
     }
 
@@ -110,24 +109,15 @@ impl SessionManager {
     /// Get or create a session. Loads from disk on first access.
     pub fn get_or_create(&mut self, key: &SessionKey) -> &mut Session {
         let key_str = key.0.clone();
-        if !self.cache.contains_key(&key_str) {
+        if !self.cache.contains(&key_str) {
             let session = self
                 .load_from_disk(key)
                 .unwrap_or_else(|| Session::new(key.clone()));
-            self.cache.insert(
-                key_str.clone(),
-                CachedSession {
-                    session,
-                    last_accessed: Instant::now(),
-                },
-            );
+            self.cache.put(key_str.clone(), session);
         }
-        let entry = self
-            .cache
+        self.cache
             .get_mut(&key_str)
-            .expect("session must exist: inserted above");
-        entry.last_accessed = Instant::now();
-        &mut entry.session
+            .expect("session must exist: inserted above")
     }
 
     /// Add a message to a session and persist it.
@@ -136,7 +126,6 @@ impl SessionManager {
         session.messages.push(message.clone());
         session.updated_at = Utc::now();
         self.append_to_disk(key, &message)?;
-        self.evict_lru();
         Ok(())
     }
 
@@ -209,8 +198,8 @@ impl SessionManager {
         if is_new {
             let parent_key = self
                 .cache
-                .get(&key.0)
-                .and_then(|e| e.session.parent_key.as_ref().map(|k| k.0.clone()));
+                .peek(&key.0)
+                .and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
             let meta = SessionMeta {
                 session_key: key.0.clone(),
                 parent_key,
@@ -229,11 +218,10 @@ impl SessionManager {
     pub fn rewrite(&self, key: &SessionKey) -> Result<()> {
         use std::io::Write;
 
-        let entry = self
+        let session = self
             .cache
-            .get(&key.0)
+            .peek(&key.0)
             .ok_or_else(|| eyre::eyre!("session not in cache: {}", key))?;
-        let session = &entry.session;
 
         let path = self.session_path(key);
         let tmp_path = path.with_extension("jsonl.tmp");
@@ -284,13 +272,7 @@ impl SessionManager {
             created_at: now,
             updated_at: now,
         };
-        self.cache.insert(
-            new_key.0.clone(),
-            CachedSession {
-                session,
-                last_accessed: Instant::now(),
-            },
-        );
+        self.cache.put(new_key.0.clone(), session);
         self.rewrite(&new_key)?;
 
         debug!(
@@ -304,7 +286,7 @@ impl SessionManager {
 
     /// Clear a session's history (both in-memory and on disk).
     pub fn clear(&mut self, key: &SessionKey) -> Result<()> {
-        self.cache.remove(&key.0);
+        self.cache.pop(&key.0);
         let path = self.session_path(key);
         if path.exists() {
             std::fs::remove_file(&path)?;
@@ -317,36 +299,9 @@ impl SessionManager {
         self.cache.len()
     }
 
-    /// Evict least-recently-used sessions from memory when over capacity.
-    /// Evicted sessions remain on disk and will be lazy-loaded on next access.
-    ///
-    /// Uses `select_nth_unstable_by` for O(n) partitioning instead of a full
-    /// O(n log n) sort, since we only need the oldest `to_remove` entries.
-    fn evict_lru(&mut self) {
-        if self.cache.len() <= self.max_sessions {
-            return;
-        }
-
-        let to_remove = self.cache.len() - self.max_sessions;
-
-        let mut entries: Vec<(String, Instant)> = self
-            .cache
-            .iter()
-            .map(|(k, e)| (k.clone(), e.last_accessed))
-            .collect();
-
-        // Partition so the oldest `to_remove` entries are at the front (O(n))
-        entries.select_nth_unstable_by(to_remove.saturating_sub(1), |a, b| a.1.cmp(&b.1));
-
-        for (key, _) in entries.into_iter().take(to_remove) {
-            self.cache.remove(&key);
-        }
-
-        debug!(
-            remaining = self.cache.len(),
-            max = self.max_sessions,
-            "evicted LRU sessions from memory"
-        );
+    /// Number of sessions the LRU cache can hold.
+    pub fn capacity(&self) -> usize {
+        self.cache.cap().get()
     }
 }
 
@@ -561,6 +516,55 @@ mod tests {
         let session = mgr.get_or_create(&k0);
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].content, "hello from oldest");
+    }
+
+    /// Integration test: concurrent session processing via multiple tasks.
+    /// Verifies that sessions created from parallel tasks don't corrupt each other
+    /// and the LRU cache correctly evicts and reloads.
+    #[tokio::test]
+    async fn test_concurrent_session_processing() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let tmp = TempDir::new().unwrap();
+        let mgr = Arc::new(Mutex::new(
+            SessionManager::open(tmp.path()).unwrap().with_max_sessions(5),
+        ));
+
+        // Spawn 10 tasks that each create a session and add messages
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let mgr = mgr.clone();
+            handles.push(tokio::spawn(async move {
+                let key = SessionKey::new("test", &format!("session-{i}"));
+                let mut mgr = mgr.lock().await;
+                mgr.add_message(&key, make_message(MessageRole::User, &format!("hello from {i}")))
+                    .unwrap();
+                mgr.add_message(
+                    &key,
+                    make_message(MessageRole::Assistant, &format!("reply to {i}")),
+                )
+                .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Cache should be capped at 5
+        let mgr = mgr.lock().await;
+        assert!(mgr.cache_len() <= 5);
+
+        // But all 10 sessions should be loadable from disk
+        drop(mgr);
+        let mut fresh = SessionManager::open(tmp.path()).unwrap();
+        for i in 0..10 {
+            let key = SessionKey::new("test", &format!("session-{i}"));
+            let session = fresh.get_or_create(&key);
+            assert_eq!(session.messages.len(), 2, "session-{i} should have 2 messages");
+            assert_eq!(session.messages[0].content, format!("hello from {i}"));
+        }
     }
 
     #[test]
