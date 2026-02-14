@@ -72,6 +72,19 @@ impl Tool for CodeStructureTool {
             return Ok(r);
         }
 
+        // Reject files too large for parsing (1 MB limit)
+        const MAX_PARSE_SIZE: u64 = 1_048_576;
+        let meta = tokio::fs::metadata(&resolved).await.map_err(|e| {
+            eyre::eyre!("failed to stat file '{}': {e}", args.path)
+        })?;
+        if meta.len() > MAX_PARSE_SIZE {
+            return Ok(ToolResult {
+                output: format!("file too large for parsing: {} bytes (max 1 MB)", meta.len()),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         let content = tokio::fs::read_to_string(&resolved).await.map_err(|e| {
             eyre::eyre!("failed to read file '{}': {e}", args.path)
         })?;

@@ -282,6 +282,15 @@ fn git_diff(cwd: &std::path::Path, path: Option<&str>) -> Result<String> {
             continue;
         }
 
+        // Skip files too large for diffing (1 MB limit)
+        const MAX_DIFF_SIZE: u64 = 1_048_576;
+        if let Ok(meta) = file_path.metadata() {
+            if meta.len() > MAX_DIFF_SIZE {
+                diffs.push(format!("skipped (file too large): {entry_path}"));
+                continue;
+            }
+        }
+
         // Compare file content with blob in index using Myers unified diff
         if let Ok(current) = std::fs::read_to_string(&file_path) {
             let blob_id = entry.id;
@@ -403,13 +412,17 @@ fn git_blame(cwd: &std::path::Path, path: &str) -> Result<String> {
         .ok_or_else(|| eyre::eyre!("bare repository"))?;
 
     // Path already validated via resolve_path in execute().
+    // Reject paths that could be interpreted as git flags.
+    if path.starts_with('-') {
+        eyre::bail!("invalid path: must not start with '-'");
+    }
     let file_path = worktree.join(path);
     if !file_path.exists() {
         eyre::bail!("file not found: {path}");
     }
 
     let output = std::process::Command::new("git")
-        .args(["blame", "--porcelain", path])
+        .args(["blame", "--porcelain", "--", path])
         .current_dir(worktree)
         .output()
         .map_err(|e| eyre::eyre!("failed to run git blame: {e}"))?;
@@ -451,7 +464,9 @@ fn git_blame(cwd: &std::path::Path, path: &str) -> Result<String> {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 3 && parts[0].len() == 40 {
                 current_hash = parts[0].to_string();
-                line_num = parts[2].parse().unwrap_or(0);
+                if let Ok(n) = parts[2].parse() {
+                    line_num = n;
+                }
             }
         }
     }

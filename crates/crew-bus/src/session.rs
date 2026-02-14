@@ -79,10 +79,10 @@ impl SessionManager {
         })
     }
 
-    /// Set the maximum number of sessions to keep in memory.
+    /// Set the maximum number of sessions to keep in memory (minimum 1).
     /// Sessions evicted from memory are NOT deleted from disk.
     pub fn with_max_sessions(mut self, max: usize) -> Self {
-        let cap = NonZeroUsize::new(max).unwrap_or(NonZeroUsize::new(1).unwrap());
+        let cap = NonZeroUsize::new(max.max(1)).expect("clamped to >= 1");
         self.cache.resize(cap);
         self
     }
