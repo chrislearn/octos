@@ -43,7 +43,7 @@ impl CronService {
         let now_ms = Utc::now().timestamp_millis();
 
         {
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             for job in &mut store.jobs {
                 if job.enabled && job.state.next_run_at_ms.is_none() {
                     job.compute_next_run(now_ms);
@@ -92,7 +92,7 @@ impl CronService {
         let result = job.clone();
 
         {
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             store.jobs.push(job);
         }
 
@@ -106,7 +106,7 @@ impl CronService {
     /// Remove a cron job by ID. Returns true if found and removed.
     pub fn remove_job(self: &std::sync::Arc<Self>, id: &str) -> bool {
         let removed = {
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             let before = store.jobs.len();
             store.jobs.retain(|j| j.id != id);
             store.jobs.len() < before
@@ -123,7 +123,7 @@ impl CronService {
 
     /// List all enabled jobs, sorted by next run time.
     pub fn list_jobs(&self) -> Vec<CronJob> {
-        let store = self.store.lock().unwrap();
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let mut jobs: Vec<_> = store.jobs.iter().filter(|j| j.enabled).cloned().collect();
         jobs.sort_by_key(|j| j.state.next_run_at_ms.unwrap_or(i64::MAX));
         jobs
@@ -131,7 +131,7 @@ impl CronService {
 
     /// List all jobs (including disabled), sorted by next run time.
     pub fn list_all_jobs(&self) -> Vec<CronJob> {
-        let store = self.store.lock().unwrap();
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let mut jobs: Vec<_> = store.jobs.clone();
         jobs.sort_by_key(|j| j.state.next_run_at_ms.unwrap_or(i64::MAX));
         jobs
@@ -141,7 +141,7 @@ impl CronService {
     pub fn enable_job(self: &std::sync::Arc<Self>, id: &str, enabled: bool) -> bool {
         let found = {
             let now_ms = Utc::now().timestamp_millis();
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
                 job.enabled = enabled;
                 if enabled {
@@ -171,7 +171,7 @@ impl CronService {
         }
 
         let earliest_ms = {
-            let store = self.store.lock().unwrap();
+            let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             store
                 .jobs
                 .iter()
@@ -216,7 +216,7 @@ impl CronService {
 
         // Collect due jobs
         let due_jobs: Vec<CronJob> = {
-            let store = self.store.lock().unwrap();
+            let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             store
                 .jobs
                 .iter()
@@ -231,7 +231,7 @@ impl CronService {
 
         // Update state
         {
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             let mut to_delete = Vec::new();
 
             for stored_job in &mut store.jobs {
@@ -278,7 +278,7 @@ impl CronService {
     }
 
     fn save_store(&self) -> Result<()> {
-        let store = self.store.lock().unwrap();
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let json =
             serde_json::to_string_pretty(&*store).wrap_err("failed to serialize cron store")?;
         std::fs::write(&self.store_path, json).wrap_err("failed to write cron store")?;

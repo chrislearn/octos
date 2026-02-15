@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use colored::Colorize;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 
 use super::Executable;
 
@@ -29,7 +29,10 @@ impl Executable for CleanCommand {
         println!("{}", "crew-rs clean".cyan().bold());
         println!();
 
-        let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+        let cwd = match self.cwd {
+            Some(p) => p,
+            None => std::env::current_dir().wrap_err("failed to get current directory")?,
+        };
         let data_dir = cwd.join(".crew");
 
         if !data_dir.exists() {

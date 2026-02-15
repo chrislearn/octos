@@ -80,7 +80,10 @@ impl GatewayCommand {
         println!("{}", "crew gateway".cyan().bold());
         println!();
 
-        let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+        let cwd = match self.cwd {
+            Some(p) => p,
+            None => std::env::current_dir().wrap_err("failed to get current directory")?,
+        };
 
         let config = if let Some(config_path) = &self.config {
             Config::from_file(config_path)?
@@ -563,7 +566,7 @@ impl GatewayCommand {
             if let Ok(()) = tokio::signal::ctrl_c().await {
                 println!();
                 println!("{}", "Shutting down gateway...".yellow());
-                shutdown_clone.store(true, Ordering::Relaxed);
+                shutdown_clone.store(true, Ordering::Release);
             }
         });
 
@@ -681,7 +684,7 @@ impl GatewayCommand {
                     inbound.chat_id,
                     chrono::Utc::now().timestamp_millis(),
                 );
-                match session_mgr.lock().await.fork(&session_key, &new_id, 10) {
+                match session_mgr.lock().await.fork(&session_key, &new_id, 10).await {
                     Ok(new_key) => {
                         let msg = OutboundMessage {
                             channel: reply_channel.clone(),
@@ -852,7 +855,7 @@ async fn process_session_message(
                     tool_call_id: None,
                     timestamp: Utc::now(),
                 };
-                let _ = mgr.add_message(session_key, user_msg);
+                let _ = mgr.add_message(session_key, user_msg).await;
 
                 let assistant_msg = Message {
                     role: MessageRole::Assistant,
@@ -862,7 +865,7 @@ async fn process_session_message(
                     tool_call_id: None,
                     timestamp: Utc::now(),
                 };
-                let _ = mgr.add_message(session_key, assistant_msg);
+                let _ = mgr.add_message(session_key, assistant_msg).await;
 
                 // Compact session if it's grown too large
                 if let Err(e) =

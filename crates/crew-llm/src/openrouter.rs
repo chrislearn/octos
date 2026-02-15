@@ -60,12 +60,7 @@ impl LlmProvider for OpenRouterProvider {
         let api_messages: Vec<ApiMessage> = messages
             .iter()
             .map(|m| {
-                let role = match m.role {
-                    crew_core::MessageRole::System => "system",
-                    crew_core::MessageRole::User => "user",
-                    crew_core::MessageRole::Assistant => "assistant",
-                    crew_core::MessageRole::Tool => "tool",
-                };
+                let role = m.role.as_str();
                 let content = build_api_content(m);
                 ApiMessage {
                     role,
@@ -176,12 +171,7 @@ impl LlmProvider for OpenRouterProvider {
         let api_messages: Vec<ApiMessage> = messages
             .iter()
             .map(|m| {
-                let role = match m.role {
-                    crew_core::MessageRole::System => "system",
-                    crew_core::MessageRole::User => "user",
-                    crew_core::MessageRole::Assistant => "assistant",
-                    crew_core::MessageRole::Tool => "tool",
-                };
+                let role = m.role.as_str();
                 ApiMessage {
                     role,
                     content: build_api_content(m),

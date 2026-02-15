@@ -71,7 +71,7 @@ bincode = "1"
 hnsw_rs = "0.3"
 
 # Git (native, feature-gated)
-gix = { version = "0.72", default-features = false, features = ["max-performance-safe", "revision", "blob-diff"] }
+gix = { version = "0.79", default-features = false, features = ["max-performance-safe", "revision", "blob-diff"] }
 
 # AST parsing (feature-gated)
 tree-sitter = "0.24"
@@ -83,8 +83,11 @@ tree-sitter-typescript = "0.23"
 # Diff
 similar = "2"
 
+# Unix-specific (O_NOFOLLOW for symlink-safe file I/O)
+libc = "0.2"
+
 # LRU cache
-lru = "0.12"
+lru = "0.16"
 
 # File search
 glob = "0.3"

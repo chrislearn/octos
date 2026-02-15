@@ -27,7 +27,10 @@ impl Executable for InitCommand {
         println!("{}", "crew-rs init".cyan().bold());
         println!();
 
-        let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+        let cwd = match self.cwd {
+            Some(p) => p,
+            None => std::env::current_dir().wrap_err("failed to get current directory")?,
+        };
 
         let config_dir = cwd.join(".crew");
         let config_path = config_dir.join("config.json");

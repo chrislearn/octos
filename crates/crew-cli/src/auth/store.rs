@@ -78,7 +78,10 @@ impl AuthStore {
 
     /// Save to disk with restrictive permissions.
     fn save(&self) -> Result<()> {
-        let dir = self.path.parent().unwrap();
+        let dir = self
+            .path
+            .parent()
+            .ok_or_else(|| eyre::eyre!("auth store path has no parent directory"))?;
         std::fs::create_dir_all(dir)?;
 
         let json = serde_json::to_string_pretty(&self.data)?;

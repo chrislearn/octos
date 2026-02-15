@@ -68,9 +68,6 @@ impl Tool for CodeStructureTool {
             .map_err(|e| eyre::eyre!("invalid arguments: {e}"))?;
 
         let resolved = super::resolve_path(&self.working_dir, &args.path)?;
-        if let Some(r) = super::reject_symlink(&resolved).await {
-            return Ok(r);
-        }
 
         // Reject files too large for parsing (1 MB limit)
         const MAX_PARSE_SIZE: u64 = 1_048_576;
@@ -85,9 +82,11 @@ impl Tool for CodeStructureTool {
             });
         }
 
-        let content = tokio::fs::read_to_string(&resolved).await.map_err(|e| {
-            eyre::eyre!("failed to read file '{}': {e}", args.path)
-        })?;
+        // Read file (O_NOFOLLOW atomically rejects symlinks)
+        let content = match super::read_no_follow(&resolved).await {
+            Ok(c) => c,
+            Err(e) => return Ok(super::file_io_error(e, &args.path)),
+        };
 
         let lang = args
             .language

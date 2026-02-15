@@ -76,10 +76,6 @@ impl Tool for WriteFileTool {
             }
         };
 
-        if let Some(r) = super::reject_symlink(&path).await {
-            return Ok(r);
-        }
-
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -87,10 +83,10 @@ impl Tool for WriteFileTool {
                 .wrap_err_with(|| format!("failed to create directories: {}", parent.display()))?;
         }
 
-        // Write file
-        tokio::fs::write(&path, &input.content)
-            .await
-            .wrap_err_with(|| format!("failed to write file: {}", path.display()))?;
+        // Write file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
+        if let Err(e) = super::write_no_follow(&path, input.content.as_bytes()).await {
+            return Ok(super::file_io_error(e, &input.path));
+        }
 
         let line_count = input.content.lines().count();
         Ok(ToolResult {

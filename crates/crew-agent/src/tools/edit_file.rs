@@ -81,23 +81,11 @@ impl Tool for EditFileTool {
             }
         };
 
-        if let Some(r) = super::reject_symlink(&path).await {
-            return Ok(r);
-        }
-
-        // Check if file exists
-        if !path.exists() {
-            return Ok(ToolResult {
-                output: format!("File not found: {}", input.path),
-                success: false,
-                ..Default::default()
-            });
-        }
-
-        // Read current content
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .wrap_err_with(|| format!("failed to read file: {}", path.display()))?;
+        // Read current content (O_NOFOLLOW atomically rejects symlinks)
+        let content = match super::read_no_follow(&path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(super::file_io_error(e, &input.path)),
+        };
 
         // Check if old_string exists
         let count = content.matches(&input.old_string).count();
@@ -127,10 +115,10 @@ impl Tool for EditFileTool {
         // Perform replacement
         let new_content = content.replacen(&input.old_string, &input.new_string, 1);
 
-        // Write back
-        tokio::fs::write(&path, &new_content)
-            .await
-            .wrap_err_with(|| format!("failed to write file: {}", path.display()))?;
+        // Write back (O_NOFOLLOW)
+        if let Err(e) = super::write_no_follow(&path, new_content.as_bytes()).await {
+            return Ok(super::file_io_error(e, &input.path));
+        }
 
         Ok(ToolResult {
             output: format!("Successfully edited {}", input.path),

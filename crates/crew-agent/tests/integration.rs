@@ -200,7 +200,7 @@ async fn test_agent_token_budget() {
         .await
         .unwrap();
     // 500+500 = 1000 tokens after first iteration, exceeds 800 budget
-    assert_eq!(resp.content, "Token budget exceeded.");
+    assert_eq!(resp.content, "Token budget exceeded (1000 of 800).");
 }
 
 #[tokio::test]

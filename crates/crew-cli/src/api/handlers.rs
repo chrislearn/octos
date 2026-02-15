@@ -65,7 +65,7 @@ pub async fn chat(
             tool_call_id: None,
             timestamp: chrono::Utc::now(),
         };
-        let _ = sessions.add_message(&session_key, user_msg);
+        let _ = sessions.add_message(&session_key, user_msg).await;
         let assistant_msg = Message {
             role: MessageRole::Assistant,
             content: response.content.clone(),
@@ -74,7 +74,7 @@ pub async fn chat(
             tool_call_id: None,
             timestamp: chrono::Utc::now(),
         };
-        let _ = sessions.add_message(&session_key, assistant_msg);
+        let _ = sessions.add_message(&session_key, assistant_msg).await;
     }
 
     Ok(Json(ChatResponse {
@@ -159,7 +159,7 @@ pub async fn session_messages(
         .skip(offset)
         .take(limit)
         .map(|m| MessageInfo {
-            role: format!("{:?}", m.role),
+            role: m.role.to_string(),
             content: m.content.clone(),
             timestamp: m.timestamp.to_rfc3339(),
         })

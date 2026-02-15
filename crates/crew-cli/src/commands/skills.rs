@@ -37,7 +37,10 @@ pub enum SkillsSubcommand {
 
 impl Executable for SkillsCommand {
     fn execute(self) -> Result<()> {
-        let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+        let cwd = match self.cwd {
+            Some(p) => p,
+            None => std::env::current_dir().wrap_err("failed to get current directory")?,
+        };
         let skills_dir = cwd.join(".crew").join("skills");
 
         match self.subcommand {

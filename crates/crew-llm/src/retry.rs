@@ -114,8 +114,6 @@ impl LlmProvider for RetryProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let mut last_error = None;
-
         for attempt in 0..=self.config.max_retries {
             match self.inner.chat(messages, tools, config).await {
                 Ok(response) => {
@@ -135,17 +133,16 @@ impl LlmProvider for RetryProvider {
                             "retryable error, backing off"
                         );
                         tokio::time::sleep(delay).await;
-                        last_error = Some(e);
                     } else {
-                        // Non-retryable error or max retries exceeded
                         return Err(e);
                     }
                 }
             }
         }
 
-        // Should only get here if we exhausted retries
-        Err(last_error.unwrap_or_else(|| eyre::eyre!("unknown error after retries")))
+        // Structurally unreachable: every iteration returns Ok or the final
+        // attempt returns Err directly. Kept as a defensive fallback.
+        eyre::bail!("retry loop exited unexpectedly")
     }
 
     async fn chat_stream(
@@ -154,8 +151,6 @@ impl LlmProvider for RetryProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let mut last_error = None;
-
         for attempt in 0..=self.config.max_retries {
             match self.inner.chat_stream(messages, tools, config).await {
                 Ok(stream) => {
@@ -175,7 +170,6 @@ impl LlmProvider for RetryProvider {
                             "retryable stream error, backing off"
                         );
                         tokio::time::sleep(delay).await;
-                        last_error = Some(e);
                     } else {
                         return Err(e);
                     }
@@ -183,7 +177,8 @@ impl LlmProvider for RetryProvider {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| eyre::eyre!("unknown error after retries")))
+        // Structurally unreachable: see chat() above.
+        eyre::bail!("retry loop exited unexpectedly")
     }
 
     fn model_id(&self) -> &str {

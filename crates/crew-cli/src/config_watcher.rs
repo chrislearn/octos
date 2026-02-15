@@ -73,6 +73,12 @@ impl ConfigWatcher {
             None => return,
         };
 
+        // Validate before applying
+        let warnings = new_config.validate();
+        for w in &warnings {
+            warn!("config reload validation: {w}");
+        }
+
         self.diff_and_emit(&new_config);
         self.last_config = new_config;
     }

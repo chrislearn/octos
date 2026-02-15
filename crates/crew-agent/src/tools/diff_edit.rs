@@ -75,21 +75,11 @@ impl Tool for DiffEditTool {
             }
         };
 
-        if let Some(r) = super::reject_symlink(&path).await {
-            return Ok(r);
-        }
-
-        if !path.exists() {
-            return Ok(ToolResult {
-                output: format!("File not found: {}", input.path),
-                success: false,
-                ..Default::default()
-            });
-        }
-
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .wrap_err_with(|| format!("failed to read: {}", path.display()))?;
+        // Read file (O_NOFOLLOW atomically rejects symlinks)
+        let content = match super::read_no_follow(&path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(super::file_io_error(e, &input.path)),
+        };
 
         let hunks = match parse_unified_diff(&input.diff) {
             Ok(h) => h,
@@ -121,9 +111,9 @@ impl Tool for DiffEditTool {
             }
         };
 
-        tokio::fs::write(&path, &new_content)
-            .await
-            .wrap_err_with(|| format!("failed to write: {}", path.display()))?;
+        if let Err(e) = super::write_no_follow(&path, new_content.as_bytes()).await {
+            return Ok(super::file_io_error(e, &input.path));
+        }
 
         Ok(ToolResult {
             output: format!("Applied {} hunk(s) to {}", hunks.len(), input.path),

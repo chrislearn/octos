@@ -75,7 +75,10 @@ impl Executable for ChatCommand {
 
 impl ChatCommand {
     async fn run_async(self) -> Result<()> {
-        let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+        let cwd = match self.cwd {
+            Some(p) => p,
+            None => std::env::current_dir().wrap_err("failed to get current directory")?,
+        };
 
         // Load config
         let config = if let Some(config_path) = &self.config {
@@ -169,7 +172,7 @@ impl ChatCommand {
         let shutdown_clone = shutdown.clone();
         tokio::spawn(async move {
             if let Ok(()) = tokio::signal::ctrl_c().await {
-                shutdown_clone.store(true, Ordering::Relaxed);
+                shutdown_clone.store(true, Ordering::Release);
             }
         });
 

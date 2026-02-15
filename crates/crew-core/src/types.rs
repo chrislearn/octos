@@ -75,6 +75,24 @@ pub enum MessageRole {
     Tool,
 }
 
+impl MessageRole {
+    /// Return the lowercase string representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+impl std::fmt::Display for MessageRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -186,6 +204,15 @@ mod tests {
         let json = serde_json::to_string(&key).unwrap();
         let parsed: SessionKey = serde_json::from_str(&json).unwrap();
         assert_eq!(key, parsed);
+    }
+
+    #[test]
+    fn test_message_role_as_str_and_display() {
+        assert_eq!(MessageRole::System.as_str(), "system");
+        assert_eq!(MessageRole::User.as_str(), "user");
+        assert_eq!(MessageRole::Assistant.as_str(), "assistant");
+        assert_eq!(MessageRole::Tool.as_str(), "tool");
+        assert_eq!(MessageRole::User.to_string(), "user");
     }
 
     #[test]

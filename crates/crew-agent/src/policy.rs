@@ -62,18 +62,25 @@ impl Default for SafePolicy {
     }
 }
 
+/// Collapse consecutive whitespace into single spaces and trim.
+fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl CommandPolicy for SafePolicy {
     fn check(&self, command: &str, _cwd: &std::path::Path) -> Decision {
+        let normalized = normalize_whitespace(command);
+
         // Check deny patterns first
         for pattern in &self.deny_patterns {
-            if command.contains(pattern) {
+            if normalized.contains(pattern.as_str()) {
                 return Decision::Deny;
             }
         }
 
         // Check ask patterns
         for pattern in &self.ask_patterns {
-            if command.contains(pattern) {
+            if normalized.contains(pattern.as_str()) {
                 return Decision::Ask;
             }
         }
@@ -112,6 +119,24 @@ mod tests {
         );
         assert_eq!(
             policy.check("git push --force origin main", Path::new("/tmp")),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn test_safe_policy_whitespace_bypass() {
+        let policy = SafePolicy::default();
+        // Double-space and tab variants must still be caught
+        assert_eq!(
+            policy.check("rm  -rf  /", Path::new("/tmp")),
+            Decision::Deny
+        );
+        assert_eq!(
+            policy.check("rm\t-rf\t/", Path::new("/tmp")),
+            Decision::Deny
+        );
+        assert_eq!(
+            policy.check("git  push  --force origin main", Path::new("/tmp")),
             Decision::Ask
         );
     }

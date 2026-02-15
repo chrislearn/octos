@@ -10,8 +10,18 @@ use serde::{Deserialize, Serialize};
 ///
 /// Episodes are stored in the episodic memory for future retrieval,
 /// allowing agents to learn from past experiences.
+/// Current schema version for Episode serialization.
+const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    CURRENT_SCHEMA_VERSION
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
+    /// Schema version for forward-compatible deserialization.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     /// Unique episode ID.
     pub id: String,
     /// The task this episode summarizes.
@@ -42,6 +52,7 @@ impl Episode {
         outcome: EpisodeOutcome,
     ) -> Self {
         Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
             id: uuid::Uuid::now_v7().to_string(),
             task_id,
             agent_id,

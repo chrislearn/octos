@@ -73,7 +73,10 @@ pub enum CronSubcommand {
 
 impl Executable for CronCommand {
     fn execute(self) -> Result<()> {
-        let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+        let cwd = match self.cwd {
+            Some(p) => p,
+            None => std::env::current_dir().wrap_err("failed to get current directory")?,
+        };
         let store_path = cwd.join(".crew").join("cron.json");
 
         match self.subcommand {

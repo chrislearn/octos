@@ -100,7 +100,7 @@ impl Tool for WebFetchTool {
         if let Ok(url) = reqwest::Url::parse(&input.url) {
             if let Some(host) = url.host_str() {
                 // Check hostname string first (catches literal IPs and "localhost")
-                if is_private_host(host) {
+                if super::ssrf::is_private_host(host) {
                     return Ok(ToolResult {
                         output: "Requests to private/internal hosts are not allowed".to_string(),
                         success: false,
@@ -112,7 +112,7 @@ impl Tool for WebFetchTool {
                 let port = url.port_or_known_default().unwrap_or(443);
                 if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
                     for addr in addrs {
-                        if is_private_ip(&addr.ip()) {
+                        if super::ssrf::is_private_ip(&addr.ip()) {
                             return Ok(ToolResult {
                                 output: "Requests to private/internal hosts are not allowed (DNS resolved to private IP)".to_string(),
                                 success: false,
@@ -185,49 +185,6 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// Check if a hostname is private/internal (string check + IP parse).
-fn is_private_host(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower == "localhost." {
-        return true;
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return is_private_ip(&ip);
-    }
-    false
-}
-
-/// Check if an IP address is in a private/internal range.
-fn is_private_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()           // 127.0.0.0/8
-                || v4.is_private()     // 10/8, 172.16/12, 192.168/16
-                || v4.is_link_local()  // 169.254/16 (AWS metadata)
-                || v4.is_unspecified() // 0.0.0.0
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()           // ::1
-                || v6.is_unspecified() // ::
-                || v6.is_multicast()   // ff00::/8
-                // ULA fc00::/7
-                || matches!(v6.segments()[0], 0xfc00..=0xfdff)
-                // Link-local fe80::/10
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                // Site-local fec0::/10 (deprecated RFC 3879, still routable)
-                || (v6.segments()[0] & 0xffc0) == 0xfec0
-                // IPv4-mapped ::ffff:x.x.x.x
-                || v6.to_ipv4_mapped().is_some_and(|v4| {
-                    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-                })
-                // IPv4-compatible ::x.x.x.x (deprecated RFC 4291)
-                || v6.to_ipv4().is_some_and(|v4| {
-                    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-                })
-        }
-    }
-}
-
 fn extract_markdown(html: &str) -> String {
     htmd::convert(html).unwrap_or_else(|_| extract_text(html))
 }
@@ -291,48 +248,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_private_host_localhost() {
-        assert!(is_private_host("localhost"));
-        assert!(is_private_host("LOCALHOST"));
-        assert!(is_private_host("localhost."));
-    }
-
-    #[test]
-    fn test_private_host_ipv4() {
-        assert!(is_private_host("127.0.0.1"));
-        assert!(is_private_host("10.0.0.1"));
-        assert!(is_private_host("172.16.0.1"));
-        assert!(is_private_host("192.168.1.1"));
-        assert!(is_private_host("169.254.169.254"));
-        assert!(is_private_host("0.0.0.0"));
-    }
-
-    #[test]
-    fn test_private_host_ipv6() {
-        assert!(is_private_host("::1")); // loopback
-        assert!(is_private_host("::")); // unspecified
-        assert!(is_private_host("fc00::1")); // ULA
-        assert!(is_private_host("fd12:3456::1")); // ULA
-        assert!(is_private_host("fe80::1")); // link-local
-        assert!(is_private_host("::ffff:127.0.0.1")); // IPv4-mapped loopback
-        assert!(is_private_host("::ffff:192.168.1.1")); // IPv4-mapped private
-        assert!(is_private_host("ff02::1")); // multicast
-        assert!(is_private_host("fec0::1")); // site-local (deprecated)
-        assert!(is_private_host("::192.168.1.1")); // IPv4-compatible (deprecated)
-    }
-
-    #[test]
-    fn test_private_ip_check() {
-        use std::net::IpAddr;
-        assert!(is_private_ip(&"127.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"10.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"192.168.1.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::1".parse::<IpAddr>().unwrap()));
-        assert!(!is_private_ip(&"8.8.8.8".parse::<IpAddr>().unwrap()));
-        assert!(!is_private_ip(&"1.1.1.1".parse::<IpAddr>().unwrap()));
-    }
-
     #[tokio::test]
     async fn test_dns_rebind_localhost() {
         // "localhost" should be caught by hostname check before DNS
@@ -343,14 +258,6 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.output.contains("private"));
-    }
-
-    #[test]
-    fn test_public_host_allowed() {
-        assert!(!is_private_host("8.8.8.8"));
-        assert!(!is_private_host("1.1.1.1"));
-        assert!(!is_private_host("example.com"));
-        assert!(!is_private_host("2001:4860:4860::8888"));
     }
 
     #[test]

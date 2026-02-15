@@ -270,6 +270,35 @@ struct McpToolSpec {
     connection: Arc<Mutex<McpConnection>>,
 }
 
+/// Maximum nesting depth for MCP tool input schemas.
+const MAX_SCHEMA_DEPTH: usize = 10;
+/// Maximum serialized size of an MCP tool input schema (64 KB).
+const MAX_SCHEMA_SIZE: usize = 65_536;
+
+/// Validate an MCP-provided input schema for reasonable complexity.
+fn validate_schema(schema: &serde_json::Value) -> bool {
+    fn depth(v: &serde_json::Value, level: usize) -> usize {
+        if level > MAX_SCHEMA_DEPTH {
+            return level;
+        }
+        match v {
+            serde_json::Value::Object(map) => {
+                map.values().map(|child| depth(child, level + 1)).max().unwrap_or(level)
+            }
+            serde_json::Value::Array(arr) => {
+                arr.iter().map(|child| depth(child, level + 1)).max().unwrap_or(level)
+            }
+            _ => level,
+        }
+    }
+    let d = depth(schema, 0);
+    if d > MAX_SCHEMA_DEPTH {
+        return false;
+    }
+    let size = serde_json::to_string(schema).map(|s| s.len()).unwrap_or(MAX_SCHEMA_SIZE + 1);
+    size <= MAX_SCHEMA_SIZE
+}
+
 impl McpClient {
     /// Start all configured MCP servers and discover their tools.
     pub async fn start(configs: &[McpServerConfig]) -> Result<Self> {
@@ -293,12 +322,21 @@ impl McpClient {
                         "MCP server started"
                     );
                     for tool in server_tools {
+                        let schema = tool
+                            .input_schema
+                            .unwrap_or(serde_json::json!({"type": "object"}));
+                        if !validate_schema(&schema) {
+                            warn!(
+                                server = server_name,
+                                tool = tool.name,
+                                "MCP tool schema exceeds depth/size limits, skipping"
+                            );
+                            continue;
+                        }
                         tools.push(McpToolSpec {
                             name: tool.name,
                             description: tool.description.unwrap_or_default(),
-                            input_schema: tool
-                                .input_schema
-                                .unwrap_or(serde_json::json!({"type": "object"})),
+                            input_schema: schema,
                             connection: conn.clone(),
                         });
                     }

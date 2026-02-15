@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 use colored::Colorize;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 
 use super::Executable;
 use crate::config::Config;
@@ -34,7 +34,10 @@ pub enum ChannelsSubcommand {
 
 impl Executable for ChannelsCommand {
     fn execute(self) -> Result<()> {
-        let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+        let cwd = match self.cwd {
+            Some(p) => p,
+            None => std::env::current_dir().wrap_err("failed to get current directory")?,
+        };
 
         match self.subcommand {
             ChannelsSubcommand::Status => cmd_status(&cwd),

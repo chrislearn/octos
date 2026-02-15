@@ -52,6 +52,8 @@ pub struct ToolRegistry {
     /// Context-based tag filter: only tools with matching tags appear in specs().
     /// Tools with empty tags always pass.
     context_filter: Option<Vec<String>>,
+    /// Cached specs output, invalidated on registry mutations.
+    cached_specs: std::sync::Mutex<Option<Vec<ToolSpec>>>,
 }
 
 impl Default for ToolRegistry {
@@ -67,22 +69,32 @@ impl ToolRegistry {
             tools: HashMap::new(),
             provider_policy: None,
             context_filter: None,
+            cached_specs: std::sync::Mutex::new(None),
         }
     }
 
     /// Register a tool.
     pub fn register(&mut self, tool: impl Tool + 'static) {
         self.tools.insert(tool.name().to_string(), Arc::new(tool));
+        self.invalidate_cache();
     }
 
     /// Register a tool from an existing Arc (for keeping a separate reference).
     pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);
+        self.invalidate_cache();
     }
 
     /// Get tool specifications for the LLM, filtered by provider policy if set.
+    /// Results are cached and invalidated when the registry is mutated.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools
+        let mut cache = self.cached_specs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref specs) = *cache {
+            return specs.clone();
+        }
+
+        let specs: Vec<ToolSpec> = self
+            .tools
             .values()
             .filter(|t| {
                 self.provider_policy
@@ -104,7 +116,10 @@ impl ToolRegistry {
                 description: t.description().to_string(),
                 input_schema: t.input_schema(),
             })
-            .collect()
+            .collect();
+
+        *cache = Some(specs.clone());
+        specs
     }
 
     /// Number of registered tools.
@@ -120,6 +135,7 @@ impl ToolRegistry {
     /// Retain only tools whose names satisfy the predicate.
     pub fn retain(&mut self, f: impl Fn(&str) -> bool) {
         self.tools.retain(|name, _| f(name));
+        self.invalidate_cache();
     }
 
     /// Remove tools not permitted by the given policy.
@@ -139,6 +155,7 @@ impl ToolRegistry {
             return;
         }
         self.provider_policy = Some(policy);
+        self.invalidate_cache();
     }
 
     /// Return the current provider policy (if any), so callers like SpawnTool
@@ -154,6 +171,13 @@ impl ToolRegistry {
             return;
         }
         self.context_filter = Some(tags);
+        self.invalidate_cache();
+    }
+
+    /// Clear the cached specs (called by mutation methods).
+    fn invalidate_cache(&mut self) {
+        // &mut self guarantees exclusive access, so get_mut() bypasses the mutex.
+        *self.cached_specs.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Execute a tool by name.
@@ -193,6 +217,9 @@ impl ToolRegistry {
 // Tool policy
 pub mod policy;
 pub use policy::ToolPolicy;
+
+// Shared SSRF protection
+pub mod ssrf;
 
 // Built-in tools
 pub mod diff_edit;
@@ -250,7 +277,10 @@ fn estimate_json_size(value: &serde_json::Value) -> usize {
         serde_json::Value::Null => 4,
         serde_json::Value::Bool(b) => if *b { 4 } else { 5 },
         serde_json::Value::Number(n) => n.to_string().len(),
-        serde_json::Value::String(s) => s.len() + 2, // quotes
+        serde_json::Value::String(s) => {
+            let escapes = s.bytes().filter(|&b| matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t')).count();
+            s.len() + escapes + 2 // content + escape overheads + quotes
+        }
         serde_json::Value::Array(arr) => {
             2 + arr.iter().map(estimate_json_size).sum::<usize>() + arr.len().saturating_sub(1) // commas
         }
@@ -306,6 +336,10 @@ fn normalize_path(path: &Path) -> PathBuf {
 ///
 /// Call AFTER `resolve_path` and before any filesystem read/write.
 /// Prevents symlink-based escapes where a link inside base_dir points outside.
+///
+/// NOTE: For file read/write operations, prefer `read_no_follow` / `write_no_follow`
+/// which atomically reject symlinks via O_NOFOLLOW (no TOCTOU race).
+/// This function is still useful for directory operations (e.g. list_dir).
 pub async fn reject_symlink(path: &Path) -> Option<ToolResult> {
     match tokio::fs::symlink_metadata(path).await {
         Ok(meta) if meta.is_symlink() => Some(ToolResult {
@@ -314,6 +348,106 @@ pub async fn reject_symlink(path: &Path) -> Option<ToolResult> {
             ..Default::default()
         }),
         _ => None,
+    }
+}
+
+/// Check if an I/O error indicates a symlink was rejected (ELOOP from O_NOFOLLOW).
+pub fn is_symlink_error(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-Unix fallback: detect our synthetic error from read/write_no_follow
+        e.kind() == std::io::ErrorKind::PermissionDenied
+    }
+}
+
+/// Read file contents, atomically rejecting symlinks via O_NOFOLLOW on Unix.
+///
+/// Eliminates the TOCTOU race between `reject_symlink` and `tokio::fs::read_to_string`.
+pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        {
+            if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "symlink rejected",
+                ));
+            }
+        }
+        let mut file = opts.open(&path)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+/// Write content to a file, atomically rejecting symlinks via O_NOFOLLOW on Unix.
+///
+/// Eliminates the TOCTOU race between `reject_symlink` and `tokio::fs::write`.
+pub async fn write_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let path = path.to_owned();
+    let content = content.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        {
+            if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "symlink rejected",
+                ));
+            }
+        }
+        let mut file = opts.open(&path)?;
+        file.write_all(&content)?;
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+/// Convert a file I/O error to a ToolResult, handling symlink and not-found cases.
+pub fn file_io_error(e: std::io::Error, display_path: &str) -> ToolResult {
+    if is_symlink_error(&e) {
+        ToolResult {
+            output: "Symlinks are not allowed".to_string(),
+            success: false,
+            ..Default::default()
+        }
+    } else if e.kind() == std::io::ErrorKind::NotFound {
+        ToolResult {
+            output: format!("File not found: {display_path}"),
+            success: false,
+            ..Default::default()
+        }
+    } else {
+        ToolResult {
+            output: format!("Failed to access {display_path}: {e}"),
+            success: false,
+            ..Default::default()
+        }
     }
 }
 
@@ -344,6 +478,83 @@ impl ToolRegistry {
         #[cfg(feature = "ast")]
         registry.register(CodeStructureTool::new(cwd));
         registry
+    }
+}
+
+#[cfg(test)]
+mod nofollow_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_read_no_follow_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, "hello").unwrap();
+
+        let content = read_no_follow(&file).await.unwrap();
+        assert_eq!(content, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_read_no_follow_not_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("nonexistent.txt");
+
+        let err = read_no_follow(&file).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_no_follow_rejects_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "secret").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_no_follow(&link).await.unwrap_err();
+        assert!(is_symlink_error(&err), "expected ELOOP, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_write_no_follow_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("out.txt");
+
+        write_no_follow(&file, b"written").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "written");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_no_follow_rejects_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "original").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = write_no_follow(&link, b"evil").await.unwrap_err();
+        assert!(is_symlink_error(&err), "expected ELOOP, got: {err}");
+        // Target must not be modified
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+    }
+
+    #[test]
+    fn test_file_io_error_symlink() {
+        let err = std::io::Error::from_raw_os_error(libc::ELOOP);
+        let result = file_io_error(err, "test.txt");
+        assert!(!result.success);
+        assert!(result.output.contains("Symlinks"));
+    }
+
+    #[test]
+    fn test_file_io_error_not_found() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let result = file_io_error(err, "missing.txt");
+        assert!(!result.success);
+        assert!(result.output.contains("File not found"));
     }
 }
 

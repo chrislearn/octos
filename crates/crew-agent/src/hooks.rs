@@ -74,6 +74,89 @@ pub struct HookPayload {
     pub output_tokens: Option<u32>,
 }
 
+impl HookPayload {
+    /// Payload for a before-LLM-call hook.
+    pub fn before_llm(model: &str, message_count: usize, iteration: u32) -> Self {
+        Self {
+            event: HookEvent::BeforeLlmCall,
+            message_count: Some(message_count),
+            model: Some(model.to_string()),
+            iteration: Some(iteration),
+            ..Self::empty(HookEvent::BeforeLlmCall)
+        }
+    }
+
+    /// Payload for an after-LLM-call hook.
+    pub fn after_llm(
+        model: &str,
+        iteration: u32,
+        stop_reason: &str,
+        has_tool_calls: bool,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) -> Self {
+        Self {
+            event: HookEvent::AfterLlmCall,
+            model: Some(model.to_string()),
+            iteration: Some(iteration),
+            stop_reason: Some(stop_reason.to_string()),
+            has_tool_calls: Some(has_tool_calls),
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            ..Self::empty(HookEvent::AfterLlmCall)
+        }
+    }
+
+    /// Payload for a before-tool-call hook.
+    pub fn before_tool(name: &str, arguments: serde_json::Value, tool_id: &str) -> Self {
+        Self {
+            event: HookEvent::BeforeToolCall,
+            tool_name: Some(name.to_string()),
+            arguments: Some(arguments),
+            tool_id: Some(tool_id.to_string()),
+            ..Self::empty(HookEvent::BeforeToolCall)
+        }
+    }
+
+    /// Payload for an after-tool-call hook.
+    pub fn after_tool(
+        name: &str,
+        tool_id: &str,
+        result: String,
+        success: bool,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            event: HookEvent::AfterToolCall,
+            tool_name: Some(name.to_string()),
+            tool_id: Some(tool_id.to_string()),
+            result: Some(result),
+            success: Some(success),
+            duration_ms: Some(duration_ms),
+            ..Self::empty(HookEvent::AfterToolCall)
+        }
+    }
+
+    fn empty(event: HookEvent) -> Self {
+        Self {
+            event,
+            tool_name: None,
+            arguments: None,
+            tool_id: None,
+            result: None,
+            success: None,
+            duration_ms: None,
+            message_count: None,
+            model: None,
+            iteration: None,
+            stop_reason: None,
+            has_tool_calls: None,
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+}
+
 /// Result of running hooks for an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookResult {
@@ -315,28 +398,36 @@ mod tests {
 
     #[test]
     fn test_payload_serialization() {
-        let payload = HookPayload {
-            event: HookEvent::BeforeToolCall,
-            tool_name: Some("shell".into()),
-            arguments: Some(serde_json::json!({"command": "ls"})),
-            tool_id: Some("call_1".into()),
-            result: None,
-            success: None,
-            duration_ms: None,
-            message_count: None,
-            model: None,
-            iteration: Some(3),
-            stop_reason: None,
-            has_tool_calls: None,
-            input_tokens: None,
-            output_tokens: None,
-        };
+        let payload = HookPayload::before_tool(
+            "shell",
+            serde_json::json!({"command": "ls"}),
+            "call_1",
+        );
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("\"event\":\"before_tool_call\""));
         assert!(json.contains("\"tool_name\":\"shell\""));
-        assert!(json.contains("\"iteration\":3"));
         assert!(!json.contains("\"result\""));
         assert!(!json.contains("\"success\""));
+    }
+
+    #[test]
+    fn test_payload_constructors() {
+        let before_llm = HookPayload::before_llm("gpt-4", 10, 3);
+        assert_eq!(before_llm.event, HookEvent::BeforeLlmCall);
+        assert_eq!(before_llm.model.as_deref(), Some("gpt-4"));
+        assert_eq!(before_llm.message_count, Some(10));
+        assert_eq!(before_llm.iteration, Some(3));
+        assert!(before_llm.tool_name.is_none());
+
+        let after_llm = HookPayload::after_llm("gpt-4", 3, "EndTurn", false, 100, 50);
+        assert_eq!(after_llm.event, HookEvent::AfterLlmCall);
+        assert_eq!(after_llm.input_tokens, Some(100));
+        assert_eq!(after_llm.has_tool_calls, Some(false));
+
+        let after_tool = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 42);
+        assert_eq!(after_tool.event, HookEvent::AfterToolCall);
+        assert_eq!(after_tool.success, Some(true));
+        assert_eq!(after_tool.duration_ms, Some(42));
     }
 
     #[test]
@@ -386,22 +477,7 @@ mod tests {
     #[tokio::test]
     async fn test_executor_no_hooks() {
         let executor = HookExecutor::new(vec![]);
-        let payload = HookPayload {
-            event: HookEvent::BeforeToolCall,
-            tool_name: Some("shell".into()),
-            arguments: None,
-            tool_id: None,
-            result: None,
-            success: None,
-            duration_ms: None,
-            message_count: None,
-            model: None,
-            iteration: None,
-            stop_reason: None,
-            has_tool_calls: None,
-            input_tokens: None,
-            output_tokens: None,
-        };
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1");
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert_eq!(result, HookResult::Allow);
     }
@@ -414,22 +490,7 @@ mod tests {
             timeout_ms: 5000,
             tool_filter: vec![],
         }]);
-        let payload = HookPayload {
-            event: HookEvent::BeforeToolCall,
-            tool_name: Some("shell".into()),
-            arguments: None,
-            tool_id: None,
-            result: None,
-            success: None,
-            duration_ms: None,
-            message_count: None,
-            model: None,
-            iteration: None,
-            stop_reason: None,
-            has_tool_calls: None,
-            input_tokens: None,
-            output_tokens: None,
-        };
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1");
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert_eq!(result, HookResult::Allow);
     }
@@ -443,22 +504,7 @@ mod tests {
             timeout_ms: 5000,
             tool_filter: vec![],
         }]);
-        let payload = HookPayload {
-            event: HookEvent::BeforeToolCall,
-            tool_name: Some("shell".into()),
-            arguments: None,
-            tool_id: None,
-            result: None,
-            success: None,
-            duration_ms: None,
-            message_count: None,
-            model: None,
-            iteration: None,
-            stop_reason: None,
-            has_tool_calls: None,
-            input_tokens: None,
-            output_tokens: None,
-        };
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1");
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert!(matches!(result, HookResult::Deny(_)));
     }
@@ -471,22 +517,7 @@ mod tests {
             timeout_ms: 5000,
             tool_filter: vec!["write_file".into()],
         }]);
-        let payload = HookPayload {
-            event: HookEvent::BeforeToolCall,
-            tool_name: Some("read_file".into()),
-            arguments: None,
-            tool_id: None,
-            result: None,
-            success: None,
-            duration_ms: None,
-            message_count: None,
-            model: None,
-            iteration: None,
-            stop_reason: None,
-            has_tool_calls: None,
-            input_tokens: None,
-            output_tokens: None,
-        };
+        let payload = HookPayload::before_tool("read_file", serde_json::json!({}), "tc1");
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert_eq!(result, HookResult::Allow);
     }
@@ -499,23 +530,75 @@ mod tests {
             timeout_ms: 5000,
             tool_filter: vec![],
         }]);
-        let payload = HookPayload {
-            event: HookEvent::BeforeToolCall,
-            tool_name: Some("shell".into()),
-            arguments: None,
-            tool_id: None,
-            result: None,
-            success: None,
-            duration_ms: None,
-            message_count: None,
-            model: None,
-            iteration: None,
-            stop_reason: None,
-            has_tool_calls: None,
-            input_tokens: None,
-            output_tokens: None,
-        };
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1");
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert_eq!(result, HookResult::Allow);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_below_threshold_still_runs() {
+        // After-tool hook that exits with code 2 (error, not deny)
+        let executor = HookExecutor::with_threshold(
+            vec![HookConfig {
+                event: HookEvent::AfterToolCall,
+                command: vec!["sh".into(), "-c".into(), "exit 2".into()],
+                timeout_ms: 5000,
+                tool_filter: vec![],
+            }],
+            3,
+        );
+        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10);
+
+        // First two failures: hook still runs (returns Error, not Allow)
+        let r1 = executor.run(HookEvent::AfterToolCall, &payload).await;
+        assert!(matches!(r1, HookResult::Error(_)));
+        let r2 = executor.run(HookEvent::AfterToolCall, &payload).await;
+        assert!(matches!(r2, HookResult::Error(_)));
+        assert_eq!(executor.failures[0].load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_at_threshold_disables() {
+        let executor = HookExecutor::with_threshold(
+            vec![HookConfig {
+                event: HookEvent::AfterToolCall,
+                command: vec!["sh".into(), "-c".into(), "exit 2".into()],
+                timeout_ms: 5000,
+                tool_filter: vec![],
+            }],
+            3,
+        );
+        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10);
+
+        // Trigger 3 failures to hit threshold
+        for _ in 0..3 {
+            executor.run(HookEvent::AfterToolCall, &payload).await;
+        }
+
+        // Fourth call: hook is disabled (skipped), returns Allow
+        let r = executor.run(HookEvent::AfterToolCall, &payload).await;
+        assert_eq!(r, HookResult::Allow);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_resets_on_success() {
+        let executor = HookExecutor::with_threshold(
+            vec![HookConfig {
+                event: HookEvent::AfterToolCall,
+                command: vec!["true".into()],
+                timeout_ms: 5000,
+                tool_filter: vec![],
+            }],
+            3,
+        );
+
+        // Simulate 2 prior failures
+        executor.failures[0].store(2, Ordering::Relaxed);
+
+        // Success resets counter
+        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10);
+        let r = executor.run(HookEvent::AfterToolCall, &payload).await;
+        assert_eq!(r, HookResult::Allow);
+        assert_eq!(executor.failures[0].load(Ordering::Relaxed), 0);
     }
 }

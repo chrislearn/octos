@@ -119,9 +119,12 @@ impl Tool for ShellTool {
             Decision::Allow => {}
         }
 
+        // Clamp timeout to [1, 600] seconds to prevent abuse
+        const MIN_TIMEOUT: u64 = 1;
+        const MAX_TIMEOUT: u64 = 600;
         let timeout_duration = input
             .timeout_secs
-            .map(Duration::from_secs)
+            .map(|s| Duration::from_secs(s.clamp(MIN_TIMEOUT, MAX_TIMEOUT)))
             .unwrap_or(self.timeout);
 
         // Execute command (through sandbox)
@@ -184,5 +187,49 @@ impl Tool for ShellTool {
                 ..Default::default()
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_timeout_clamped_to_max() {
+        let tool = ShellTool::new("/tmp");
+        let result = tool
+            .execute(&serde_json::json!({
+                "command": "echo hello",
+                "timeout_secs": 999999
+            }))
+            .await
+            .unwrap();
+        // Should complete (clamped to 600s, not hang)
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_zero_clamped_to_min() {
+        let tool = ShellTool::new("/tmp");
+        // timeout_secs: 0 would be clamped to 1 second
+        let result = tool
+            .execute(&serde_json::json!({
+                "command": "echo fast",
+                "timeout_secs": 0
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn test_denied_command() {
+        let tool = ShellTool::new("/tmp");
+        let result = tool
+            .execute(&serde_json::json!({"command": "rm -rf /"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("denied"));
     }
 }

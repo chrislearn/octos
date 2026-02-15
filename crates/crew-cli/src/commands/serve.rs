@@ -24,6 +24,11 @@ pub struct ServeCommand {
     #[arg(short, long, default_value = "8080")]
     pub port: u16,
 
+    /// Host address to bind to. Defaults to localhost for security.
+    /// Use 0.0.0.0 to accept connections from all interfaces.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
     /// Working directory (defaults to current directory).
     #[arg(short, long)]
     pub cwd: Option<PathBuf>,
@@ -61,7 +66,10 @@ impl Executable for ServeCommand {
 
 impl ServeCommand {
     async fn run_async(self) -> Result<()> {
-        let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+        let cwd = match self.cwd {
+            Some(p) => p,
+            None => std::env::current_dir().wrap_err("failed to get current directory")?,
+        };
 
         let config = if let Some(config_path) = &self.config {
             Config::from_file(config_path)?
@@ -145,7 +153,7 @@ impl ServeCommand {
         });
 
         let app = build_router(state);
-        let addr = format!("0.0.0.0:{}", self.port);
+        let addr = format!("{}:{}", self.host, self.port);
 
         println!("{}", "crew-rs API server".cyan().bold());
         println!("{}: http://{}", "Listening".green(), addr);

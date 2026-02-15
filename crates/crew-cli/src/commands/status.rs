@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use colored::Colorize;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 
 use super::Executable;
 use crate::config::Config;
@@ -19,7 +19,10 @@ pub struct StatusCommand {
 
 impl Executable for StatusCommand {
     fn execute(self) -> Result<()> {
-        let cwd = self.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+        let cwd = match self.cwd {
+            Some(p) => p,
+            None => std::env::current_dir().wrap_err("failed to get current directory")?,
+        };
         show_system_status(&cwd)
     }
 }

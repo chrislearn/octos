@@ -83,23 +83,11 @@ impl Tool for ReadFileTool {
             }
         };
 
-        if let Some(r) = super::reject_symlink(&path).await {
-            return Ok(r);
-        }
-
-        // Check if file exists
-        if !path.exists() {
-            return Ok(ToolResult {
-                output: format!("File not found: {}", input.path),
-                success: false,
-                ..Default::default()
-            });
-        }
-
-        // Read file
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .wrap_err_with(|| format!("failed to read file: {}", path.display()))?;
+        // Read file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
+        let content = match super::read_no_follow(&path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(super::file_io_error(e, &input.path)),
+        };
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();

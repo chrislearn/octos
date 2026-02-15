@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crew_core::{AgentId, Message, MessageRole, Task, TaskResult, TokenUsage};
 use crew_llm::{
     ChatConfig, ChatResponse, ChatStream, EmbeddingProvider, LlmProvider, StopReason, StreamEvent,
+    ToolSpec,
 };
 use crew_memory::{Episode, EpisodeOutcome, EpisodeStore};
 use eyre::Result;
@@ -49,6 +50,29 @@ pub struct ConversationResponse {
     pub token_usage: TokenUsage,
     pub files_modified: Vec<PathBuf>,
     pub streamed: bool,
+}
+
+/// Reason why the agent loop stopped due to budget constraints.
+enum BudgetStop {
+    Shutdown,
+    MaxIterations,
+    MaxTokens { used: u32, limit: u32 },
+    WallClockTimeout { limit: Duration },
+}
+
+impl BudgetStop {
+    fn message(&self) -> String {
+        match self {
+            Self::Shutdown => "Interrupted.".into(),
+            Self::MaxIterations => "Reached max iterations.".into(),
+            Self::MaxTokens { used, limit } => {
+                format!("Token budget exceeded ({used} of {limit}).")
+            }
+            Self::WallClockTimeout { limit } => {
+                format!("Wall-clock timeout ({:.0}s limit).", limit.as_secs_f64())
+            }
+        }
+    }
 }
 
 /// An agent that can execute tasks.
@@ -134,7 +158,10 @@ impl Agent {
         *self
             .system_prompt
             .write()
-            .expect("system prompt lock poisoned") = prompt;
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            }) = prompt;
         self
     }
 
@@ -143,7 +170,10 @@ impl Agent {
         *self
             .system_prompt
             .write()
-            .expect("system prompt lock poisoned") = prompt;
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            }) = prompt;
     }
 
     /// The LLM model ID in use.
@@ -169,7 +199,10 @@ impl Agent {
             content: self
                 .system_prompt
                 .read()
-                .expect("system prompt lock poisoned")
+                .unwrap_or_else(|e| {
+                    tracing::warn!("system prompt lock was poisoned, recovering");
+                    e.into_inner()
+                })
                 .clone(),
             media: vec![],
             tool_calls: None,
@@ -195,107 +228,23 @@ impl Agent {
         let start = Instant::now();
 
         loop {
-            if self.shutdown.load(Ordering::Relaxed) {
+            if let Some(stop) = self.check_budget(iteration, start, &total_usage) {
                 return Ok(ConversationResponse {
-                    content: "Interrupted.".into(),
+                    content: stop.message(),
                     token_usage: total_usage,
                     files_modified,
                     streamed: false,
                 });
-            }
-
-            if iteration >= self.config.max_iterations {
-                return Ok(ConversationResponse {
-                    content: "Reached max iterations.".into(),
-                    token_usage: total_usage,
-                    files_modified,
-                    streamed: false,
-                });
-            }
-
-            if let Some(timeout) = self.config.max_timeout {
-                if start.elapsed() > timeout {
-                    return Ok(ConversationResponse {
-                        content: format!(
-                            "Wall-clock timeout ({:.0}s limit).",
-                            timeout.as_secs_f64()
-                        ),
-                        token_usage: total_usage,
-                        files_modified,
-                        streamed: false,
-                    });
-                }
-            }
-
-            if let Some(max_tokens) = self.config.max_tokens {
-                let used = total_usage.input_tokens + total_usage.output_tokens;
-                if used >= max_tokens {
-                    return Ok(ConversationResponse {
-                        content: "Token budget exceeded.".into(),
-                        token_usage: total_usage,
-                        files_modified,
-                        streamed: false,
-                    });
-                }
             }
 
             iteration += 1;
             let tools_spec = self.tools.specs();
             self.trim_to_context_window(&mut messages);
 
-            // Before-LLM hook
-            if let Some(ref hooks) = self.hooks {
-                let payload = HookPayload {
-                    event: HookEvent::BeforeLlmCall,
-                    tool_name: None,
-                    arguments: None,
-                    tool_id: None,
-                    result: None,
-                    success: None,
-                    duration_ms: None,
-                    message_count: Some(messages.len()),
-                    model: Some(self.llm.model_id().to_string()),
-                    iteration: Some(iteration),
-                    stop_reason: None,
-                    has_tool_calls: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                };
-                if let HookResult::Deny(reason) =
-                    hooks.run(HookEvent::BeforeLlmCall, &payload).await
-                {
-                    eyre::bail!("LLM call denied by hook: {reason}");
-                }
-            }
-
-            let stream = self
-                .llm
-                .chat_stream(&messages, &tools_spec, &config)
-                .await?;
-            let (response, streamed) = self.consume_stream(stream, iteration).await?;
+            let (response, streamed) =
+                self.call_llm_with_hooks(&messages, &tools_spec, &config, iteration).await?;
             total_usage.input_tokens += response.usage.input_tokens;
             total_usage.output_tokens += response.usage.output_tokens;
-
-            // After-LLM hook
-            if let Some(ref hooks) = self.hooks {
-                let payload = HookPayload {
-                    event: HookEvent::AfterLlmCall,
-                    tool_name: None,
-                    arguments: None,
-                    tool_id: None,
-                    result: None,
-                    success: None,
-                    duration_ms: None,
-                    message_count: None,
-                    model: Some(self.llm.model_id().to_string()),
-                    iteration: Some(iteration),
-                    stop_reason: Some(format!("{:?}", response.stop_reason)),
-                    has_tool_calls: Some(!response.tool_calls.is_empty()),
-                    input_tokens: Some(response.usage.input_tokens),
-                    output_tokens: Some(response.usage.output_tokens),
-                };
-                let _ = hooks.run(HookEvent::AfterLlmCall, &payload).await;
-            }
 
             match response.stop_reason {
                 StopReason::EndTurn | StopReason::StopSequence => {
@@ -308,13 +257,13 @@ impl Agent {
                     });
                 }
                 StopReason::ToolUse => {
-                    messages.push(self.response_to_message(&response));
-                    let (tool_messages, tool_files, tool_tokens) =
-                        self.execute_tools(&response).await?;
-                    messages.extend(tool_messages);
-                    files_modified.extend(tool_files);
-                    total_usage.input_tokens += tool_tokens.input_tokens;
-                    total_usage.output_tokens += tool_tokens.output_tokens;
+                    self.handle_tool_use(
+                        &response,
+                        &mut messages,
+                        &mut files_modified,
+                        &mut total_usage,
+                    )
+                    .await?;
                 }
                 StopReason::MaxTokens => {
                     self.emit_cost_update(&total_usage, &response.usage);
@@ -351,83 +300,15 @@ impl Agent {
             let config = ChatConfig::default();
 
             loop {
-                if self.shutdown.load(Ordering::Relaxed) {
-                    info!(iteration, "shutdown signal received");
-                    self.reporter.report(ProgressEvent::TaskInterrupted {
-                        iterations: iteration,
-                    });
+                if let Some(stop) = self.check_budget(iteration, task_start, &total_usage) {
+                    self.report_budget_stop(&stop, iteration);
                     return Ok(TaskResult {
                         success: false,
-                        output: "Task interrupted.".to_string(),
+                        output: stop.message(),
                         files_modified,
                         subtasks: Vec::new(),
                         token_usage: total_usage,
                     });
-                }
-
-                if iteration >= self.config.max_iterations {
-                    warn!(
-                        iteration,
-                        max = self.config.max_iterations,
-                        "hit max iterations limit"
-                    );
-                    self.reporter.report(ProgressEvent::MaxIterationsReached {
-                        limit: self.config.max_iterations,
-                    });
-                    return Ok(TaskResult {
-                        success: false,
-                        output: format!("Task stopped after {} iterations (limit).", iteration),
-                        files_modified,
-                        subtasks: Vec::new(),
-                        token_usage: total_usage,
-                    });
-                }
-
-                if let Some(max_tokens) = self.config.max_tokens {
-                    let used = total_usage.input_tokens + total_usage.output_tokens;
-                    if used >= max_tokens {
-                        warn!(used, max = max_tokens, "hit token budget limit");
-                        self.reporter.report(ProgressEvent::TokenBudgetExceeded {
-                            used,
-                            limit: max_tokens,
-                        });
-                        return Ok(TaskResult {
-                            success: false,
-                            output: format!(
-                                "Task stopped after {} tokens (budget: {}).",
-                                used, max_tokens
-                            ),
-                            files_modified,
-                            subtasks: Vec::new(),
-                            token_usage: total_usage,
-                        });
-                    }
-                }
-
-                if let Some(timeout) = self.config.max_timeout {
-                    if task_start.elapsed() > timeout {
-                        warn!(
-                            elapsed_s = task_start.elapsed().as_secs(),
-                            limit_s = timeout.as_secs(),
-                            "hit wall-clock timeout"
-                        );
-                        self.reporter
-                            .report(ProgressEvent::WallClockTimeoutReached {
-                                elapsed: task_start.elapsed(),
-                                limit: timeout,
-                            });
-                        return Ok(TaskResult {
-                            success: false,
-                            output: format!(
-                                "Task stopped after {:.0}s (wall-clock timeout: {:.0}s).",
-                                task_start.elapsed().as_secs_f64(),
-                                timeout.as_secs_f64()
-                            ),
-                            files_modified,
-                            subtasks: Vec::new(),
-                            token_usage: total_usage,
-                        });
-                    }
                 }
 
                 iteration += 1;
@@ -437,59 +318,10 @@ impl Agent {
                 let tools_spec = self.tools.specs();
                 self.trim_to_context_window(&mut messages);
 
-                // Before-LLM hook
-                if let Some(ref hooks) = self.hooks {
-                    let payload = HookPayload {
-                        event: HookEvent::BeforeLlmCall,
-                        tool_name: None,
-                        arguments: None,
-                        tool_id: None,
-                        result: None,
-                        success: None,
-                        duration_ms: None,
-                        message_count: Some(messages.len()),
-                        model: Some(self.llm.model_id().to_string()),
-                        iteration: Some(iteration),
-                        stop_reason: None,
-                        has_tool_calls: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                    };
-                    if let HookResult::Deny(reason) =
-                        hooks.run(HookEvent::BeforeLlmCall, &payload).await
-                    {
-                        eyre::bail!("LLM call denied by hook: {reason}");
-                    }
-                }
-
-                let stream = self
-                    .llm
-                    .chat_stream(&messages, &tools_spec, &config)
-                    .await?;
-                let (response, _streamed) = self.consume_stream(stream, iteration).await?;
+                let (response, _streamed) =
+                    self.call_llm_with_hooks(&messages, &tools_spec, &config, iteration).await?;
                 total_usage.input_tokens += response.usage.input_tokens;
                 total_usage.output_tokens += response.usage.output_tokens;
-
-                // After-LLM hook
-                if let Some(ref hooks) = self.hooks {
-                    let payload = HookPayload {
-                        event: HookEvent::AfterLlmCall,
-                        tool_name: None,
-                        arguments: None,
-                        tool_id: None,
-                        result: None,
-                        success: None,
-                        duration_ms: None,
-                        message_count: None,
-                        model: Some(self.llm.model_id().to_string()),
-                        iteration: Some(iteration),
-                        stop_reason: Some(format!("{:?}", response.stop_reason)),
-                        has_tool_calls: Some(!response.tool_calls.is_empty()),
-                        input_tokens: Some(response.usage.input_tokens),
-                        output_tokens: Some(response.usage.output_tokens),
-                    };
-                    let _ = hooks.run(HookEvent::AfterLlmCall, &payload).await;
-                }
 
                 debug!(
                     iteration,
@@ -528,13 +360,22 @@ impl Agent {
                                 let summary_text = summary_truncated;
                                 let episode_id = ep_id;
                                 tokio::spawn(async move {
-                                    if let Ok(vecs) = embedder.embed(&[&summary_text]).await {
-                                        if let Some(vec) = vecs.into_iter().next() {
-                                            if let Err(e) =
-                                                memory.store_embedding(&episode_id, vec).await
-                                            {
-                                                warn!(error = %e, "failed to store embedding");
+                                    match embedder.embed(&[&summary_text]).await {
+                                        Ok(vecs) => {
+                                            if let Some(vec) = vecs.into_iter().next() {
+                                                if let Err(e) =
+                                                    memory.store_embedding(&episode_id, vec).await
+                                                {
+                                                    warn!(error = %e, "failed to store embedding");
+                                                }
                                             }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                episode_id = %episode_id,
+                                                "failed to generate embedding for episode"
+                                            );
                                         }
                                     }
                                 });
@@ -559,15 +400,13 @@ impl Agent {
                         return Ok(self.build_result(&response, total_usage, files_modified));
                     }
                     StopReason::ToolUse => {
-                        messages.push(self.response_to_message(&response));
-                        let (tool_messages, tool_files, tool_tokens) =
-                            self.execute_tools(&response).await?;
-                        for msg in tool_messages {
-                            messages.push(msg);
-                        }
-                        files_modified.extend(tool_files);
-                        total_usage.input_tokens += tool_tokens.input_tokens;
-                        total_usage.output_tokens += tool_tokens.output_tokens;
+                        self.handle_tool_use(
+                            &response,
+                            &mut messages,
+                            &mut files_modified,
+                            &mut total_usage,
+                        )
+                        .await?;
                     }
                     StopReason::MaxTokens => {
                         self.emit_cost_update(&total_usage, &response.usage);
@@ -591,7 +430,10 @@ impl Agent {
             content: self
                 .system_prompt
                 .read()
-                .expect("system prompt lock poisoned")
+                .unwrap_or_else(|e| {
+                    tracing::warn!("system prompt lock was poisoned, recovering");
+                    e.into_inner()
+                })
                 .clone(),
             media: vec![],
             tool_calls: None,
@@ -728,22 +570,11 @@ impl Agent {
 
                 // Before-tool hook: may deny execution
                 if let Some(ref hooks) = self.hooks {
-                    let payload = HookPayload {
-                        event: HookEvent::BeforeToolCall,
-                        tool_name: Some(tool_call.name.clone()),
-                        arguments: Some(tool_call.arguments.clone()),
-                        tool_id: Some(tool_call.id.clone()),
-                        result: None,
-                        success: None,
-                        duration_ms: None,
-                        message_count: None,
-                        model: None,
-                        iteration: None,
-                        stop_reason: None,
-                        has_tool_calls: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                    };
+                    let payload = HookPayload::before_tool(
+                        &tool_call.name,
+                        tool_call.arguments.clone(),
+                        &tool_call.id,
+                    );
                     if let HookResult::Deny(reason) =
                         hooks.run(HookEvent::BeforeToolCall, &payload).await
                     {
@@ -831,22 +662,13 @@ impl Agent {
 
                 // After-tool hook (fire-and-forget)
                 if let Some(ref hooks) = self.hooks {
-                    let payload = HookPayload {
-                        event: HookEvent::AfterToolCall,
-                        tool_name: Some(tool_call.name.clone()),
-                        arguments: None,
-                        tool_id: Some(tool_call.id.clone()),
-                        result: Some(crew_core::truncated_utf8(&content, 500, "...")),
-                        success: Some(tool_success),
-                        duration_ms: Some(duration.as_millis() as u64),
-                        message_count: None,
-                        model: None,
-                        iteration: None,
-                        stop_reason: None,
-                        has_tool_calls: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                    };
+                    let payload = HookPayload::after_tool(
+                        &tool_call.name,
+                        &tool_call.id,
+                        crew_core::truncated_utf8(&content, 500, "..."),
+                        tool_success,
+                        duration.as_millis() as u64,
+                    );
                     let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
                 }
 
@@ -994,7 +816,7 @@ impl Agent {
     /// to cancel long-running operations on Ctrl+C.
     async fn wait_for_shutdown(&self) {
         loop {
-            if self.shutdown.load(Ordering::Relaxed) {
+            if self.shutdown.load(Ordering::Acquire) {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1133,6 +955,126 @@ impl Agent {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
             },
+        }
+    }
+
+    /// Check whether the agent loop should stop due to budget constraints.
+    fn check_budget(
+        &self,
+        iteration: u32,
+        start: Instant,
+        total_usage: &TokenUsage,
+    ) -> Option<BudgetStop> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Some(BudgetStop::Shutdown);
+        }
+        if iteration >= self.config.max_iterations {
+            return Some(BudgetStop::MaxIterations);
+        }
+        if let Some(timeout) = self.config.max_timeout {
+            if start.elapsed() > timeout {
+                return Some(BudgetStop::WallClockTimeout { limit: timeout });
+            }
+        }
+        if let Some(max_tokens) = self.config.max_tokens {
+            let used = total_usage.input_tokens + total_usage.output_tokens;
+            if used >= max_tokens {
+                return Some(BudgetStop::MaxTokens { used, limit: max_tokens });
+            }
+        }
+        None
+    }
+
+    /// Call the LLM with before/after lifecycle hooks.
+    async fn call_llm_with_hooks(
+        &self,
+        messages: &[Message],
+        tools_spec: &[ToolSpec],
+        config: &ChatConfig,
+        iteration: u32,
+    ) -> Result<(ChatResponse, bool)> {
+        if let Some(ref hooks) = self.hooks {
+            let payload =
+                HookPayload::before_llm(self.llm.model_id(), messages.len(), iteration);
+            if let HookResult::Deny(reason) =
+                hooks.run(HookEvent::BeforeLlmCall, &payload).await
+            {
+                eyre::bail!("LLM call denied by hook: {reason}");
+            }
+        }
+
+        let stream = self.llm.chat_stream(messages, tools_spec, config).await?;
+        let (response, streamed) = self.consume_stream(stream, iteration).await?;
+
+        if let Some(ref hooks) = self.hooks {
+            let payload = HookPayload::after_llm(
+                self.llm.model_id(),
+                iteration,
+                &format!("{:?}", response.stop_reason),
+                !response.tool_calls.is_empty(),
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+            );
+            let _ = hooks.run(HookEvent::AfterLlmCall, &payload).await;
+        }
+
+        Ok((response, streamed))
+    }
+
+    /// Execute tool calls from an LLM response and accumulate results.
+    async fn handle_tool_use(
+        &self,
+        response: &ChatResponse,
+        messages: &mut Vec<Message>,
+        files_modified: &mut Vec<PathBuf>,
+        total_usage: &mut TokenUsage,
+    ) -> Result<()> {
+        messages.push(self.response_to_message(response));
+        let (tool_messages, tool_files, tool_tokens) = self.execute_tools(response).await?;
+        messages.extend(tool_messages);
+        files_modified.extend(tool_files);
+        total_usage.input_tokens += tool_tokens.input_tokens;
+        total_usage.output_tokens += tool_tokens.output_tokens;
+        Ok(())
+    }
+
+    /// Log and report a budget stop event (used by `run_task`).
+    fn report_budget_stop(&self, stop: &BudgetStop, iteration: u32) {
+        match stop {
+            BudgetStop::Shutdown => {
+                info!(iteration, "shutdown signal received");
+                self.reporter.report(ProgressEvent::TaskInterrupted {
+                    iterations: iteration,
+                });
+            }
+            BudgetStop::MaxIterations => {
+                warn!(
+                    iteration,
+                    max = self.config.max_iterations,
+                    "hit max iterations limit"
+                );
+                self.reporter.report(ProgressEvent::MaxIterationsReached {
+                    limit: self.config.max_iterations,
+                });
+            }
+            BudgetStop::MaxTokens { used, limit } => {
+                warn!(used, max = limit, "hit token budget limit");
+                self.reporter.report(ProgressEvent::TokenBudgetExceeded {
+                    used: *used,
+                    limit: *limit,
+                });
+            }
+            BudgetStop::WallClockTimeout { limit } => {
+                warn!(
+                    limit_s = limit.as_secs(),
+                    "hit wall-clock timeout"
+                );
+                self.reporter
+                    .report(ProgressEvent::WallClockTimeoutReached {
+                        elapsed: *limit,
+                        limit: *limit,
+                    });
+            }
         }
     }
 }

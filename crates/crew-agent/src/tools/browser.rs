@@ -29,43 +29,7 @@ const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_OUTPUT_CHARS: usize = 50_000;
 
-// --- SSRF protection (mirrored from web_fetch.rs) ---
-
-fn is_private_host(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower == "localhost." {
-        return true;
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return is_private_ip(&ip);
-    }
-    false
-}
-
-fn is_private_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || matches!(v6.segments()[0], 0xfc00..=0xfdff)
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || (v6.segments()[0] & 0xffc0) == 0xfec0
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified())
-                || v6
-                    .to_ipv4()
-                    .is_some_and(|v4| v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified())
-        }
-    }
-}
+use super::ssrf::{is_private_host, is_private_ip};
 
 async fn check_ssrf(url: &str) -> Option<String> {
     let parsed = match reqwest::Url::parse(url) {

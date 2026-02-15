@@ -8,11 +8,21 @@ use crew_core::{Message, SessionKey};
 use eyre::Result;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// Current schema version for session JSONL files.
+const CURRENT_SESSION_SCHEMA: u32 = 1;
+
+fn default_session_schema() -> u32 {
+    CURRENT_SESSION_SCHEMA
+}
 
 /// Metadata stored as the first line of each JSONL session file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionMeta {
+    /// Schema version for forward-compatible deserialization.
+    #[serde(default = "default_session_schema")]
+    schema_version: u32,
     session_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_key: Option<String>,
@@ -57,6 +67,9 @@ impl Session {
 /// Default maximum number of sessions kept in memory.
 const DEFAULT_MAX_SESSIONS: usize = 1000;
 
+/// Maximum session file size we'll load (10 MB). Prevents OOM on corrupted/adversarial files.
+const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Manages sessions with in-memory LRU cache and JSONL disk persistence.
 ///
 /// Uses `lru::LruCache` for O(1) get/put with automatic eviction of the
@@ -95,9 +108,18 @@ impl SessionManager {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
                     if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
-                        let count = std::fs::read_to_string(&path)
-                            .map(|c| c.lines().count())
-                            .unwrap_or(0);
+                        // Skip oversized files to avoid OOM in listing
+                        let too_large = path
+                            .metadata()
+                            .map(|m| m.len() > MAX_SESSION_FILE_SIZE)
+                            .unwrap_or(false);
+                        let count = if too_large {
+                            0
+                        } else {
+                            std::fs::read_to_string(&path)
+                                .map(|c| c.lines().count())
+                                .unwrap_or(0)
+                        };
                         result.push((name.to_string(), count));
                     }
                 }
@@ -121,11 +143,11 @@ impl SessionManager {
     }
 
     /// Add a message to a session and persist it.
-    pub fn add_message(&mut self, key: &SessionKey, message: Message) -> Result<()> {
+    pub async fn add_message(&mut self, key: &SessionKey, message: Message) -> Result<()> {
         let session = self.get_or_create(key);
         session.messages.push(message.clone());
         session.updated_at = Utc::now();
-        self.append_to_disk(key, &message)?;
+        self.append_to_disk(key, &message).await?;
         Ok(())
     }
 
@@ -139,11 +161,16 @@ impl SessionManager {
     /// Truncates encoded name to 200 chars to stay within the 255-byte
     /// filesystem filename limit (reserving space for ".jsonl" suffix).
     fn session_path(&self, key: &SessionKey) -> PathBuf {
-        // Max encoded name length: 200 chars + ".jsonl" (6) = 206, well within 255
-        const MAX_NAME_LEN: usize = 200;
+        // Max encoded name length: 200 chars + ".jsonl" (6) = 206, well within 255.
+        // When truncation occurs, append a hash suffix to avoid collisions between
+        // keys that differ only past the truncation point.
+        const HASH_SUFFIX_LEN: usize = 17; // "_{hash:016X}"
+        const MAX_NAME_LEN: usize = 200 - HASH_SUFFIX_LEN;
         let mut safe_name = String::new();
+        let mut truncated = false;
         for byte in key.0.as_bytes() {
             if safe_name.len() >= MAX_NAME_LEN {
+                truncated = true;
                 break;
             }
             if byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_' {
@@ -153,12 +180,34 @@ impl SessionManager {
                 safe_name.push_str(&format!("%{byte:02X}"));
             }
         }
+        if truncated {
+            // Append 8-char hex hash of full key to prevent collisions
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.0.hash(&mut hasher);
+            let hash = hasher.finish();
+            safe_name.push_str(&format!("_{hash:016X}"));
+        }
         self.sessions_dir.join(format!("{safe_name}.jsonl"))
     }
 
     /// Load a session from its JSONL file.
     fn load_from_disk(&self, key: &SessionKey) -> Option<Session> {
         let path = self.session_path(key);
+
+        // Guard against oversized files to prevent OOM
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > MAX_SESSION_FILE_SIZE {
+                warn!(
+                    key = %key,
+                    size = meta.len(),
+                    limit = MAX_SESSION_FILE_SIZE,
+                    "session file too large, skipping"
+                );
+                return None;
+            }
+        }
+
         let content = std::fs::read_to_string(&path).ok()?;
         let mut lines = content.lines();
 
@@ -184,67 +233,90 @@ impl SessionManager {
     }
 
     /// Append a message to the JSONL file. Creates the file with metadata if new.
-    fn append_to_disk(&self, key: &SessionKey, message: &Message) -> Result<()> {
-        use std::io::Write;
-
+    /// Uses spawn_blocking to avoid blocking the async runtime.
+    async fn append_to_disk(&self, key: &SessionKey, message: &Message) -> Result<()> {
         let path = self.session_path(key);
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
 
-        // Check file size after open to avoid TOCTOU race with exists() check
-        let is_new = file.metadata()?.len() == 0;
-        if is_new {
-            let parent_key = self
-                .cache
-                .peek(&key.0)
-                .and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
-            let meta = SessionMeta {
-                session_key: key.0.clone(),
-                parent_key,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            };
-            writeln!(file, "{}", serde_json::to_string(&meta)?)?;
-        }
+        // Prepare metadata outside spawn_blocking (needs cache access)
+        let parent_key = self
+            .cache
+            .peek(&key.0)
+            .and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
+        let key_str = key.0.clone();
+        let msg_json = serde_json::to_string(message)?;
 
-        writeln!(file, "{}", serde_json::to_string(message)?)?;
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+
+            // Check file size after open to avoid TOCTOU race with exists() check
+            let is_new = file.metadata()?.len() == 0;
+            if is_new {
+                let meta = SessionMeta {
+                    schema_version: CURRENT_SESSION_SCHEMA,
+                    session_key: key_str,
+                    parent_key,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                };
+                writeln!(file, "{}", serde_json::to_string(&meta)?)?;
+            }
+
+            writeln!(file, "{}", msg_json)?;
+            Ok::<_, eyre::Report>(())
+        })
+        .await
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+
         Ok(())
     }
 
     /// Rewrite a session's JSONL file from the in-memory state.
     /// Uses atomic write-then-rename to avoid corruption on crash.
-    pub fn rewrite(&self, key: &SessionKey) -> Result<()> {
-        use std::io::Write;
-
+    /// Uses spawn_blocking to avoid blocking the async runtime.
+    pub async fn rewrite(&self, key: &SessionKey) -> Result<()> {
         let session = self
             .cache
             .peek(&key.0)
             .ok_or_else(|| eyre::eyre!("session not in cache: {}", key))?;
 
-        let path = self.session_path(key);
-        let tmp_path = path.with_extension("jsonl.tmp");
-
-        let mut file = std::fs::File::create(&tmp_path)?;
-
+        // Build the full content string synchronously (no I/O)
         let meta = SessionMeta {
+            schema_version: CURRENT_SESSION_SCHEMA,
             session_key: key.0.clone(),
             parent_key: session.parent_key.as_ref().map(|k| k.0.clone()),
             created_at: session.created_at,
             updated_at: session.updated_at,
         };
-        writeln!(file, "{}", serde_json::to_string(&meta)?)?;
-
+        let mut content = serde_json::to_string(&meta)?;
+        content.push('\n');
         for msg in &session.messages {
-            writeln!(file, "{}", serde_json::to_string(msg)?)?;
+            content.push_str(&serde_json::to_string(msg)?);
+            content.push('\n');
         }
-        file.flush()?;
 
-        // Atomic rename (on same filesystem)
-        std::fs::rename(&tmp_path, &path)?;
+        let msg_count = session.messages.len();
+        let path = self.session_path(key);
+        let key_display = key.to_string();
 
-        debug!(key = %key, messages = session.messages.len(), "Rewrote session to disk");
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let tmp_path = path.with_extension("jsonl.tmp");
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.flush()?;
+            // Atomic rename (on same filesystem)
+            std::fs::rename(&tmp_path, &path)?;
+            Ok::<_, eyre::Report>(())
+        })
+        .await
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+
+        debug!(key = %key_display, messages = msg_count, "Rewrote session to disk");
         Ok(())
     }
 
@@ -252,7 +324,7 @@ impl SessionManager {
     ///
     /// The new session's channel is taken from the parent key; `new_chat_id` becomes the chat ID.
     /// Returns the new session's key.
-    pub fn fork(
+    pub async fn fork(
         &mut self,
         parent_key: &SessionKey,
         new_chat_id: &str,
@@ -273,7 +345,7 @@ impl SessionManager {
             updated_at: now,
         };
         self.cache.put(new_key.0.clone(), session);
-        self.rewrite(&new_key)?;
+        self.rewrite(&new_key).await?;
 
         debug!(
             parent = %parent_key,
@@ -285,11 +357,11 @@ impl SessionManager {
     }
 
     /// Clear a session's history (both in-memory and on disk).
-    pub fn clear(&mut self, key: &SessionKey) -> Result<()> {
+    pub async fn clear(&mut self, key: &SessionKey) -> Result<()> {
         self.cache.pop(&key.0);
         let path = self.session_path(key);
         if path.exists() {
-            std::fs::remove_file(&path)?;
+            tokio::fs::remove_file(&path).await?;
         }
         Ok(())
     }
@@ -345,8 +417,8 @@ mod tests {
         assert_eq!(history.len(), 2);
     }
 
-    #[test]
-    fn test_session_manager_create_and_retrieve() {
+    #[tokio::test]
+    async fn test_session_manager_create_and_retrieve() {
         let tmp = TempDir::new().unwrap();
         let mut mgr = SessionManager::open(tmp.path()).unwrap();
         let key = SessionKey::new("cli", "default");
@@ -355,16 +427,18 @@ mod tests {
         assert_eq!(session.messages.len(), 0);
 
         mgr.add_message(&key, make_message(MessageRole::User, "hello"))
+            .await
             .unwrap();
         mgr.add_message(&key, make_message(MessageRole::Assistant, "hi"))
+            .await
             .unwrap();
 
         let session = mgr.get_or_create(&key);
         assert_eq!(session.messages.len(), 2);
     }
 
-    #[test]
-    fn test_session_manager_persistence() {
+    #[tokio::test]
+    async fn test_session_manager_persistence() {
         let tmp = TempDir::new().unwrap();
         let key = SessionKey::new("cli", "persist");
 
@@ -372,8 +446,10 @@ mod tests {
         {
             let mut mgr = SessionManager::open(tmp.path()).unwrap();
             mgr.add_message(&key, make_message(MessageRole::User, "saved"))
+                .await
                 .unwrap();
             mgr.add_message(&key, make_message(MessageRole::Assistant, "reply"))
+                .await
                 .unwrap();
         }
 
@@ -387,25 +463,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_session_manager_clear() {
+    #[tokio::test]
+    async fn test_session_manager_clear() {
         let tmp = TempDir::new().unwrap();
         let key = SessionKey::new("cli", "clear-me");
         let mut mgr = SessionManager::open(tmp.path()).unwrap();
 
         mgr.add_message(&key, make_message(MessageRole::User, "temp"))
+            .await
             .unwrap();
         assert_eq!(mgr.get_or_create(&key).messages.len(), 1);
 
-        mgr.clear(&key).unwrap();
+        mgr.clear(&key).await.unwrap();
 
         // After clear, should be empty
         let session = mgr.get_or_create(&key);
         assert_eq!(session.messages.len(), 0);
     }
 
-    #[test]
-    fn test_concurrent_sessions() {
+    #[tokio::test]
+    async fn test_concurrent_sessions() {
         let tmp = TempDir::new().unwrap();
         let mut mgr = SessionManager::open(tmp.path()).unwrap();
 
@@ -413,8 +490,10 @@ mod tests {
         let k2 = SessionKey::new("telegram", "chat2");
 
         mgr.add_message(&k1, make_message(MessageRole::User, "from chat1"))
+            .await
             .unwrap();
         mgr.add_message(&k2, make_message(MessageRole::User, "from chat2"))
+            .await
             .unwrap();
 
         assert_eq!(mgr.get_or_create(&k1).messages.len(), 1);
@@ -423,8 +502,8 @@ mod tests {
         assert_eq!(mgr.get_or_create(&k2).messages[0].content, "from chat2");
     }
 
-    #[test]
-    fn test_session_rewrite() {
+    #[tokio::test]
+    async fn test_session_rewrite() {
         let tmp = TempDir::new().unwrap();
         let key = SessionKey::new("cli", "rewrite");
         let mut mgr = SessionManager::open(tmp.path()).unwrap();
@@ -432,6 +511,7 @@ mod tests {
         // Add 5 messages
         for i in 0..5 {
             mgr.add_message(&key, make_message(MessageRole::User, &format!("msg{i}")))
+                .await
                 .unwrap();
         }
 
@@ -441,7 +521,7 @@ mod tests {
         assert_eq!(session.messages.len(), 2);
 
         // Rewrite to disk
-        mgr.rewrite(&key).unwrap();
+        mgr.rewrite(&key).await.unwrap();
 
         // Load fresh from disk — should have only 2 messages
         let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
@@ -451,18 +531,19 @@ mod tests {
         assert_eq!(session2.messages[1].content, "msg4");
     }
 
-    #[test]
-    fn test_fork_creates_child() {
+    #[tokio::test]
+    async fn test_fork_creates_child() {
         let tmp = TempDir::new().unwrap();
         let mut mgr = SessionManager::open(tmp.path()).unwrap();
         let parent = SessionKey::new("telegram", "chat1");
 
         for i in 0..5 {
             mgr.add_message(&parent, make_message(MessageRole::User, &format!("msg{i}")))
+                .await
                 .unwrap();
         }
 
-        let child_key = mgr.fork(&parent, "chat1_fork", 3).unwrap();
+        let child_key = mgr.fork(&parent, "chat1_fork", 3).await.unwrap();
         assert_eq!(child_key, SessionKey::new("telegram", "chat1_fork"));
 
         let child = mgr.get_or_create(&child_key);
@@ -472,8 +553,8 @@ mod tests {
         assert_eq!(child.messages[2].content, "msg4");
     }
 
-    #[test]
-    fn test_eviction_keeps_max_sessions() {
+    #[tokio::test]
+    async fn test_eviction_keeps_max_sessions() {
         let tmp = TempDir::new().unwrap();
         let mut mgr = SessionManager::open(tmp.path()).unwrap().with_max_sessions(3);
 
@@ -481,32 +562,36 @@ mod tests {
         for i in 0..5 {
             let key = SessionKey::new("cli", &format!("s{i}"));
             mgr.add_message(&key, make_message(MessageRole::User, &format!("msg{i}")))
+                .await
                 .unwrap();
             // Small delay so last_accessed ordering is deterministic
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
         // Should have at most 3 in memory
         assert_eq!(mgr.cache_len(), 3);
     }
 
-    #[test]
-    fn test_evicted_session_reloads_from_disk() {
+    #[tokio::test]
+    async fn test_evicted_session_reloads_from_disk() {
         let tmp = TempDir::new().unwrap();
         let mut mgr = SessionManager::open(tmp.path()).unwrap().with_max_sessions(2);
 
         let k0 = SessionKey::new("cli", "oldest");
         mgr.add_message(&k0, make_message(MessageRole::User, "hello from oldest"))
+            .await
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
         let k1 = SessionKey::new("cli", "middle");
         mgr.add_message(&k1, make_message(MessageRole::User, "hello from middle"))
+            .await
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
         let k2 = SessionKey::new("cli", "newest");
         mgr.add_message(&k2, make_message(MessageRole::User, "hello from newest"))
+            .await
             .unwrap();
 
         // k0 should have been evicted from memory
@@ -546,11 +631,13 @@ mod tests {
                 let key = SessionKey::new("test", &format!("session-{i}"));
                 let mut mgr = mgr.lock().await;
                 mgr.add_message(&key, make_message(MessageRole::User, &format!("hello from {i}")))
+                    .await
                     .unwrap();
                 mgr.add_message(
                     &key,
                     make_message(MessageRole::Assistant, &format!("reply to {i}")),
                 )
+                .await
                 .unwrap();
             }));
         }
@@ -574,16 +661,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_fork_persists_to_disk() {
+    #[tokio::test]
+    async fn test_fork_persists_to_disk() {
         let tmp = TempDir::new().unwrap();
         let parent = SessionKey::new("cli", "main");
 
         {
             let mut mgr = SessionManager::open(tmp.path()).unwrap();
             mgr.add_message(&parent, make_message(MessageRole::User, "hello"))
+                .await
                 .unwrap();
-            mgr.fork(&parent, "branch", 1).unwrap();
+            mgr.fork(&parent, "branch", 1).await.unwrap();
         }
 
         // Reload from disk
@@ -593,5 +681,55 @@ mod tests {
         assert_eq!(child.parent_key, Some(parent));
         assert_eq!(child.messages.len(), 1);
         assert_eq!(child.messages[0].content, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_oversized_file() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("cli", "huge");
+
+        // Write a normal message so the file exists
+        mgr.add_message(&key, make_message(MessageRole::User, "seed"))
+            .await
+            .unwrap();
+
+        // Evict from cache so next access must load from disk
+        mgr.cache.pop(&key.0);
+
+        // Overwrite the file with junk exceeding the size limit
+        let path = mgr.session_path(&key);
+        let junk = "x".repeat((MAX_SESSION_FILE_SIZE as usize) + 1);
+        std::fs::write(&path, junk).unwrap();
+
+        // load_from_disk should return None for oversized file
+        assert!(mgr.load_from_disk(&key).is_none());
+    }
+
+    #[test]
+    fn test_truncated_session_keys_no_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::open(tmp.path()).unwrap();
+
+        // Create two keys that share the same 200-char prefix but differ after
+        let prefix = "a".repeat(200);
+        let key1 = SessionKey(format!("{prefix}_suffix1"));
+        let key2 = SessionKey(format!("{prefix}_suffix2"));
+
+        let path1 = mgr.session_path(&key1);
+        let path2 = mgr.session_path(&key2);
+        assert_ne!(path1, path2, "truncated keys with different suffixes must produce different paths");
+    }
+
+    #[test]
+    fn test_short_key_no_hash_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::open(tmp.path()).unwrap();
+
+        let key = SessionKey::new("cli", "short");
+        let path = mgr.session_path(&key);
+        let name = path.file_stem().unwrap().to_str().unwrap();
+        // Short keys should not have hash suffix (no underscore + hex)
+        assert!(!name.contains('_') || name.len() < 200);
     }
 }

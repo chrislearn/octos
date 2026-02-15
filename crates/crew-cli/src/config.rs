@@ -226,11 +226,14 @@ impl Config {
         // Expand environment variables in config values
         config.expand_env_vars();
 
-        // Write back if migration changed something
+        // Log if migration changed something (don't silently rewrite user's config)
         if migrated {
-            if let Ok(json) = serde_json::to_string_pretty(&config) {
-                let _ = std::fs::write(path, json);
-            }
+            tracing::info!(
+                path = %path.display(),
+                version = CURRENT_CONFIG_VERSION,
+                "Config file needs migration to version {}. Run `crew init` to update.",
+                CURRENT_CONFIG_VERSION
+            );
         }
 
         Ok(config)
@@ -303,9 +306,9 @@ impl Config {
         })
     }
 
-    /// Validate the configuration.
+    /// Validate the configuration, returning any warnings.
     #[allow(clippy::manual_map)]
-    pub fn validate(&self) -> Result<Vec<String>> {
+    pub fn validate(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
         // Check provider is valid
@@ -388,7 +391,7 @@ impl Config {
             warnings.push(format!("{} environment variable not set", env_var));
         }
 
-        Ok(warnings)
+        warnings
     }
 }
 
@@ -558,7 +561,7 @@ mod tests {
             provider: Some("invalid".to_string()),
             ..Default::default()
         };
-        let warnings = config.validate().unwrap();
+        let warnings = config.validate();
         assert!(warnings.iter().any(|w| w.contains("Unknown provider")));
     }
 
@@ -569,7 +572,7 @@ mod tests {
             model: Some("gpt-4o".to_string()),
             ..Default::default()
         };
-        let warnings = config.validate().unwrap();
+        let warnings = config.validate();
         assert!(warnings.iter().any(|w| w.contains("may not be valid")));
     }
 
@@ -579,7 +582,7 @@ mod tests {
             base_url: Some("not a url".to_string()),
             ..Default::default()
         };
-        let warnings = config.validate().unwrap();
+        let warnings = config.validate();
         assert!(warnings.iter().any(|w| w.contains("not a valid URL")));
     }
 
@@ -600,7 +603,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let warnings = config.validate().unwrap();
+        let warnings = config.validate();
         assert!(warnings.iter().any(|w| w.contains("Unknown channel type")));
     }
 
@@ -666,7 +669,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let warnings = config.validate().unwrap();
+        let warnings = config.validate();
         assert!(warnings.iter().any(|w| w.contains("out of range")));
     }
 }

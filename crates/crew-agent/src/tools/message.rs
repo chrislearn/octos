@@ -26,8 +26,8 @@ impl MessageTool {
 
     /// Update the default channel/chat_id context (called per inbound message).
     pub fn set_context(&self, channel: &str, chat_id: &str) {
-        *self.default_channel.lock().unwrap() = channel.to_string();
-        *self.default_chat_id.lock().unwrap() = chat_id.to_string();
+        *self.default_channel.lock().unwrap_or_else(|e| e.into_inner()) = channel.to_string();
+        *self.default_chat_id.lock().unwrap_or_else(|e| e.into_inner()) = chat_id.to_string();
     }
 }
 
@@ -81,10 +81,10 @@ impl Tool for MessageTool {
 
         let channel = input
             .channel
-            .unwrap_or_else(|| self.default_channel.lock().unwrap().clone());
+            .unwrap_or_else(|| self.default_channel.lock().unwrap_or_else(|e| e.into_inner()).clone());
         let chat_id = input
             .chat_id
-            .unwrap_or_else(|| self.default_chat_id.lock().unwrap().clone());
+            .unwrap_or_else(|| self.default_chat_id.lock().unwrap_or_else(|e| e.into_inner()).clone());
 
         if channel.is_empty() || chat_id.is_empty() {
             return Ok(ToolResult {

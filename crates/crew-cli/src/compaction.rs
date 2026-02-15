@@ -64,12 +64,7 @@ pub async fn maybe_compact_with_config(
     let transcript: Vec<serde_json::Value> = session.messages[..to_summarize]
         .iter()
         .map(|msg| {
-            let role = match msg.role {
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-                MessageRole::System => "system",
-                MessageRole::Tool => "tool",
-            };
+            let role = msg.role.as_str();
             serde_json::json!({ "role": role, "content": msg.content })
         })
         .collect();
@@ -125,7 +120,7 @@ pub async fn maybe_compact_with_config(
     session.updated_at = Utc::now();
 
     // Rewrite the JSONL file
-    session_mgr.rewrite(key)?;
+    session_mgr.rewrite(key).await?;
 
     debug!(
         session = %key,

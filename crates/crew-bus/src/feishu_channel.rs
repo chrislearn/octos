@@ -129,7 +129,7 @@ impl FeishuChannel {
 
     /// Check if a message ID has been seen; add if not. Trims when over capacity.
     fn dedup_check(&self, msg_id: &str) -> bool {
-        let mut seen = self.seen_ids.lock().unwrap();
+        let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
         if seen.contains(msg_id) {
             return true;
         }

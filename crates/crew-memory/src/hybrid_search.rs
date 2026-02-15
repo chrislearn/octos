@@ -24,10 +24,29 @@ pub struct HybridIndex {
     has_embedding: Vec<bool>,
     /// Expected vector dimension.
     dimension: usize,
+    /// Weight for vector similarity in hybrid scoring (0.0-1.0).
+    vector_weight: f32,
+    /// Weight for BM25 text relevance in hybrid scoring (0.0-1.0).
+    bm25_weight: f32,
 }
 
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
+
+/// Default weight for vector similarity in hybrid scoring.
+const DEFAULT_VECTOR_WEIGHT: f32 = 0.7;
+/// Default weight for BM25 text relevance in hybrid scoring.
+const DEFAULT_BM25_WEIGHT: f32 = 0.3;
+
+/// HNSW index parameters.
+/// max_nb_connection: max edges per node in the graph (higher = more accurate, more memory).
+const HNSW_MAX_NB_CONNECTION: usize = 16;
+/// HNSW capacity: pre-allocated slots for documents.
+const HNSW_CAPACITY: usize = 10_000;
+/// HNSW ef_construction: search width during index build (higher = slower build, better recall).
+const HNSW_EF_CONSTRUCTION: usize = 200;
+/// HNSW max_layer: maximum graph layers.
+const HNSW_MAX_LAYER: usize = 16;
 
 impl HybridIndex {
     /// Create a new hybrid index with the given vector dimension.
@@ -42,7 +61,16 @@ impl HybridIndex {
             hnsw: None,
             has_embedding: Vec::new(),
             dimension,
+            vector_weight: DEFAULT_VECTOR_WEIGHT,
+            bm25_weight: DEFAULT_BM25_WEIGHT,
         }
+    }
+
+    /// Set custom hybrid scoring weights. Weights should sum to 1.0.
+    pub fn with_weights(mut self, vector_weight: f32, bm25_weight: f32) -> Self {
+        self.vector_weight = vector_weight;
+        self.bm25_weight = bm25_weight;
+        self
     }
 
     /// Insert a document with optional embedding.
@@ -75,12 +103,12 @@ impl HybridIndex {
 
         // Insert embedding into HNSW if provided and dimension matches
         let valid_emb = embedding.filter(|e| e.len() == self.dimension);
-        self.has_embedding.push(valid_emb.is_some());
-        if let Some(emb) = valid_emb {
-            let normalized = l2_normalize(emb);
+        let normalized = valid_emb.and_then(l2_normalize);
+        self.has_embedding.push(normalized.is_some());
+        if let Some(normalized) = normalized {
             let hnsw = self
                 .hnsw
-                .get_or_insert_with(|| Hnsw::new(16, 10000, 16, 200, DistCosine));
+                .get_or_insert_with(|| Hnsw::new(HNSW_MAX_NB_CONNECTION, HNSW_CAPACITY, HNSW_MAX_LAYER, HNSW_EF_CONSTRUCTION, DistCosine));
             hnsw.insert((&normalized, doc_idx));
         }
     }
@@ -100,11 +128,13 @@ impl HybridIndex {
             return true; // already has one
         }
 
+        let Some(normalized) = l2_normalize(embedding) else {
+            return false; // zero vector cannot be indexed
+        };
         self.has_embedding[doc_idx] = true;
-        let normalized = l2_normalize(embedding);
         let hnsw = self
             .hnsw
-            .get_or_insert_with(|| Hnsw::new(16, 10000, 16, 200, DistCosine));
+            .get_or_insert_with(|| Hnsw::new(HNSW_MAX_NB_CONNECTION, HNSW_CAPACITY, HNSW_MAX_LAYER, HNSW_EF_CONSTRUCTION, DistCosine));
         hnsw.insert((&normalized, doc_idx));
         true
     }
@@ -126,11 +156,12 @@ impl HybridIndex {
         let bm25_scores = self.bm25_score(query_text, fetch_count);
 
         // Vector scores (skip if dimension mismatches)
-        let valid_query_emb = query_embedding.filter(|e| e.len() == self.dimension);
-        let vector_scores: HashMap<usize, f32> = match (valid_query_emb, &self.hnsw) {
-            (Some(emb), Some(hnsw)) => {
-                let normalized = l2_normalize(emb);
-                let neighbors = hnsw.search(&normalized, fetch_count, 30);
+        let valid_query_emb = query_embedding
+            .filter(|e| e.len() == self.dimension)
+            .and_then(l2_normalize);
+        let vector_scores: HashMap<usize, f32> = match (&valid_query_emb, &self.hnsw) {
+            (Some(normalized), Some(hnsw)) => {
+                let neighbors = hnsw.search(normalized, fetch_count, 30);
                 let mut scores: HashMap<usize, f32> = HashMap::new();
                 for n in neighbors {
                     // DistCosine returns 1 - cos_sim, so similarity = 1 - distance
@@ -147,12 +178,11 @@ impl HybridIndex {
         let mut combined: HashMap<usize, f32> = HashMap::new();
 
         if has_vectors {
-            // Hybrid: 0.7 * vector + 0.3 * bm25
             for (&idx, &score) in &vector_scores {
-                *combined.entry(idx).or_default() += 0.7 * score;
+                *combined.entry(idx).or_default() += self.vector_weight * score;
             }
             for (&idx, &score) in &bm25_scores {
-                *combined.entry(idx).or_default() += 0.3 * score;
+                *combined.entry(idx).or_default() += self.bm25_weight * score;
             }
         } else {
             // BM25 only
@@ -192,9 +222,9 @@ impl HybridIndex {
             }
         }
 
-        // Normalize to [0, 1]
+        // Normalize to [0, 1]. Use epsilon to avoid amplifying noise from near-zero scores.
         let max_score = scores.values().copied().fold(0.0f64, f64::max);
-        if max_score <= 0.0 {
+        if max_score < 1e-10 {
             return HashMap::new();
         }
 
@@ -219,12 +249,13 @@ fn tokenize(text: &str) -> Vec<String> {
 }
 
 /// L2-normalize a vector (required for cosine distance).
-fn l2_normalize(v: &[f32]) -> Vec<f32> {
+/// Returns `None` for zero/near-zero vectors that cannot be meaningfully normalized.
+fn l2_normalize(v: &[f32]) -> Option<Vec<f32>> {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm == 0.0 {
-        return v.to_vec();
+    if norm < f32::EPSILON {
+        return None;
     }
-    v.iter().map(|x| x / norm).collect()
+    Some(v.iter().map(|x| x / norm).collect())
 }
 
 #[cfg(test)]
@@ -247,7 +278,7 @@ mod tests {
     #[test]
     fn test_l2_normalize() {
         let v = vec![3.0, 4.0];
-        let n = l2_normalize(&v);
+        let n = l2_normalize(&v).unwrap();
         assert!((n[0] - 0.6).abs() < 1e-6);
         assert!((n[1] - 0.8).abs() < 1e-6);
     }
@@ -255,8 +286,18 @@ mod tests {
     #[test]
     fn test_l2_normalize_zero() {
         let v = vec![0.0, 0.0];
-        let n = l2_normalize(&v);
-        assert_eq!(n, vec![0.0, 0.0]);
+        assert!(l2_normalize(&v).is_none());
+    }
+
+    #[test]
+    fn test_zero_vector_not_indexed() {
+        let mut index = HybridIndex::new(2);
+        index.insert("ep1", "hello world", Some(&[0.0, 0.0]));
+        // Zero vector should not be marked as having an embedding
+        assert!(!index.has_embedding[0]);
+        // add_embedding with zero vector should return false
+        index.insert("ep2", "test doc", None);
+        assert!(!index.add_embedding("ep2", &[0.0, 0.0]));
     }
 
     #[test]
@@ -294,7 +335,7 @@ mod tests {
         // Query embedding is close to ep2/ep3
         let results = index.search("rust programming", Some(&[0.0, 1.0, 0.0, 0.0]), 3);
         assert_eq!(results.len(), 3);
-        // With 0.7 * vector + 0.3 * bm25, ep3 should rank well (has "rust" + close embedding)
+        // With default weights (0.7 vector + 0.3 bm25), ep3 should rank well (has "rust" + close embedding)
     }
 
     #[test]

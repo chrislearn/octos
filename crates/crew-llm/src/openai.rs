@@ -58,12 +58,7 @@ impl OpenAIProvider {
         let openai_messages: Vec<OpenAIMessage> = messages
             .iter()
             .map(|m| {
-                let role = match m.role {
-                    crew_core::MessageRole::System => "system",
-                    crew_core::MessageRole::User => "user",
-                    crew_core::MessageRole::Assistant => "assistant",
-                    crew_core::MessageRole::Tool => "tool",
-                };
+                let role = m.role.as_str();
                 OpenAIMessage {
                     role,
                     content: build_openai_content(m),
