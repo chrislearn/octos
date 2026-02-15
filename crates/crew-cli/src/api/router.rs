@@ -49,8 +49,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     };
 
     // Unauthenticated routes (metrics + static files)
-    let public = Router::new()
-        .route("/metrics", get(metrics::metrics_handler));
+    let public = Router::new().route("/metrics", get(metrics::metrics_handler));
 
     public
         .merge(api)

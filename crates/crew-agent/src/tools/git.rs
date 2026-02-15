@@ -231,7 +231,11 @@ fn git_status(cwd: &std::path::Path) -> Result<String> {
                     .records
                     .iter()
                     .filter(|r| r.mode.is_blob())
-                    .filter_map(|r| std::str::from_utf8(r.filepath.as_ref()).ok().map(String::from))
+                    .filter_map(|r| {
+                        std::str::from_utf8(r.filepath.as_ref())
+                            .ok()
+                            .map(String::from)
+                    })
                     .collect();
                 // Files in index but not in HEAD tree = staged new files
                 for path in index_paths.difference(&tree_paths) {
@@ -353,7 +357,10 @@ fn git_log(cwd: &std::path::Path, count: usize) -> Result<String> {
         }));
 
         // Move to first parent
-        current = commit.parent_ids().next().and_then(|pid| pid.object().ok().map(|o| o.into_commit()));
+        current = commit
+            .parent_ids()
+            .next()
+            .and_then(|pid| pid.object().ok().map(|o| o.into_commit()));
     }
 
     Ok(serde_json::to_string_pretty(&commits)?)
@@ -556,10 +563,12 @@ mod tests {
         assert!(result.success);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&result.output).unwrap();
         assert!(!parsed.is_empty());
-        assert!(parsed[0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("initial commit"));
+        assert!(
+            parsed[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("initial commit")
+        );
     }
 
     #[tokio::test]
@@ -574,10 +583,12 @@ mod tests {
 
         assert!(result.success);
         let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-        assert!(parsed["message"]
-            .as_str()
-            .unwrap()
-            .contains("initial commit"));
+        assert!(
+            parsed["message"]
+                .as_str()
+                .unwrap()
+                .contains("initial commit")
+        );
     }
 
     #[tokio::test]

@@ -14,10 +14,7 @@ use super::AppState;
 struct Assets;
 
 /// Fallback handler: serves embedded static files, falls back to index.html for SPA routing.
-pub async fn static_handler(
-    State(_state): State<Arc<AppState>>,
-    uri: Uri,
-) -> Response {
+pub async fn static_handler(State(_state): State<Arc<AppState>>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 

@@ -684,7 +684,12 @@ impl GatewayCommand {
                     inbound.chat_id,
                     chrono::Utc::now().timestamp_millis(),
                 );
-                match session_mgr.lock().await.fork(&session_key, &new_id, 10).await {
+                match session_mgr
+                    .lock()
+                    .await
+                    .fork(&session_key, &new_id, 10)
+                    .await
+                {
                     Ok(new_key) => {
                         let msg = OutboundMessage {
                             channel: reply_channel.clone(),
@@ -973,7 +978,9 @@ fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> Strin
 /// Messages from the same session are concatenated with `\n\n`.
 /// Used by Collect queue mode (reserved for future concurrent collect support).
 #[allow(dead_code)]
-fn merge_queued_by_session(messages: Vec<crew_core::InboundMessage>) -> Vec<crew_core::InboundMessage> {
+fn merge_queued_by_session(
+    messages: Vec<crew_core::InboundMessage>,
+) -> Vec<crew_core::InboundMessage> {
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<String, Vec<crew_core::InboundMessage>> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();

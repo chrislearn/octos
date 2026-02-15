@@ -86,9 +86,7 @@ impl SessionManager {
         std::fs::create_dir_all(&sessions_dir)?;
         Ok(Self {
             sessions_dir,
-            cache: LruCache::new(
-                NonZeroUsize::new(DEFAULT_MAX_SESSIONS).expect("default > 0"),
-            ),
+            cache: LruCache::new(NonZeroUsize::new(DEFAULT_MAX_SESSIONS).expect("default > 0")),
         })
     }
 
@@ -556,7 +554,9 @@ mod tests {
     #[tokio::test]
     async fn test_eviction_keeps_max_sessions() {
         let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap().with_max_sessions(3);
+        let mut mgr = SessionManager::open(tmp.path())
+            .unwrap()
+            .with_max_sessions(3);
 
         // Create 5 sessions
         for i in 0..5 {
@@ -575,7 +575,9 @@ mod tests {
     #[tokio::test]
     async fn test_evicted_session_reloads_from_disk() {
         let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap().with_max_sessions(2);
+        let mut mgr = SessionManager::open(tmp.path())
+            .unwrap()
+            .with_max_sessions(2);
 
         let k0 = SessionKey::new("cli", "oldest");
         mgr.add_message(&k0, make_message(MessageRole::User, "hello from oldest"))
@@ -606,7 +608,9 @@ mod tests {
     #[test]
     fn test_with_max_sessions_clamps_zero() {
         let tmp = TempDir::new().unwrap();
-        let mgr = SessionManager::open(tmp.path()).unwrap().with_max_sessions(0);
+        let mgr = SessionManager::open(tmp.path())
+            .unwrap()
+            .with_max_sessions(0);
         assert_eq!(mgr.capacity(), 1);
     }
 
@@ -620,7 +624,9 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let mgr = Arc::new(Mutex::new(
-            SessionManager::open(tmp.path()).unwrap().with_max_sessions(5),
+            SessionManager::open(tmp.path())
+                .unwrap()
+                .with_max_sessions(5),
         ));
 
         // Spawn 10 tasks that each create a session and add messages
@@ -630,9 +636,12 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let key = SessionKey::new("test", &format!("session-{i}"));
                 let mut mgr = mgr.lock().await;
-                mgr.add_message(&key, make_message(MessageRole::User, &format!("hello from {i}")))
-                    .await
-                    .unwrap();
+                mgr.add_message(
+                    &key,
+                    make_message(MessageRole::User, &format!("hello from {i}")),
+                )
+                .await
+                .unwrap();
                 mgr.add_message(
                     &key,
                     make_message(MessageRole::Assistant, &format!("reply to {i}")),
@@ -656,7 +665,11 @@ mod tests {
         for i in 0..10 {
             let key = SessionKey::new("test", &format!("session-{i}"));
             let session = fresh.get_or_create(&key);
-            assert_eq!(session.messages.len(), 2, "session-{i} should have 2 messages");
+            assert_eq!(
+                session.messages.len(),
+                2,
+                "session-{i} should have 2 messages"
+            );
             assert_eq!(session.messages[0].content, format!("hello from {i}"));
         }
     }
@@ -718,7 +731,10 @@ mod tests {
 
         let path1 = mgr.session_path(&key1);
         let path2 = mgr.session_path(&key2);
-        assert_ne!(path1, path2, "truncated keys with different suffixes must produce different paths");
+        assert_ne!(
+            path1, path2,
+            "truncated keys with different suffixes must produce different paths"
+        );
     }
 
     #[test]

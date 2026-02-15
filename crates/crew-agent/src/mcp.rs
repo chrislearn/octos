@@ -282,12 +282,16 @@ fn validate_schema(schema: &serde_json::Value) -> bool {
             return level;
         }
         match v {
-            serde_json::Value::Object(map) => {
-                map.values().map(|child| depth(child, level + 1)).max().unwrap_or(level)
-            }
-            serde_json::Value::Array(arr) => {
-                arr.iter().map(|child| depth(child, level + 1)).max().unwrap_or(level)
-            }
+            serde_json::Value::Object(map) => map
+                .values()
+                .map(|child| depth(child, level + 1))
+                .max()
+                .unwrap_or(level),
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .map(|child| depth(child, level + 1))
+                .max()
+                .unwrap_or(level),
             _ => level,
         }
     }
@@ -295,7 +299,9 @@ fn validate_schema(schema: &serde_json::Value) -> bool {
     if d > MAX_SCHEMA_DEPTH {
         return false;
     }
-    let size = serde_json::to_string(schema).map(|s| s.len()).unwrap_or(MAX_SCHEMA_SIZE + 1);
+    let size = serde_json::to_string(schema)
+        .map(|s| s.len())
+        .unwrap_or(MAX_SCHEMA_SIZE + 1);
     size <= MAX_SCHEMA_SIZE
 }
 

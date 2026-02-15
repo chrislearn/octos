@@ -102,14 +102,12 @@ impl ToolRegistry {
                     .is_none_or(|p| p.is_allowed_with_tags(t.name(), t.tags()))
             })
             .filter(|t| {
-                self.context_filter
-                    .as_ref()
-                    .is_none_or(|tags| {
-                        // Tools with no tags pass through; tools with tags must match
-                        let tool_tags = t.tags();
-                        tool_tags.is_empty()
-                            || tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
-                    })
+                self.context_filter.as_ref().is_none_or(|tags| {
+                    // Tools with no tags pass through; tools with tags must match
+                    let tool_tags = t.tags();
+                    tool_tags.is_empty()
+                        || tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
+                })
             })
             .map(|t| ToolSpec {
                 name: t.name().to_string(),
@@ -177,7 +175,10 @@ impl ToolRegistry {
     /// Clear the cached specs (called by mutation methods).
     fn invalidate_cache(&mut self) {
         // &mut self guarantees exclusive access, so get_mut() bypasses the mutex.
-        *self.cached_specs.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .cached_specs
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Execute a tool by name.
@@ -275,17 +276,29 @@ use crate::sandbox::{NoSandbox, Sandbox};
 fn estimate_json_size(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Null => 4,
-        serde_json::Value::Bool(b) => if *b { 4 } else { 5 },
+        serde_json::Value::Bool(b) => {
+            if *b {
+                4
+            } else {
+                5
+            }
+        }
         serde_json::Value::Number(n) => n.to_string().len(),
         serde_json::Value::String(s) => {
-            let escapes = s.bytes().filter(|&b| matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t')).count();
+            let escapes = s
+                .bytes()
+                .filter(|&b| matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t'))
+                .count();
             s.len() + escapes + 2 // content + escape overheads + quotes
         }
         serde_json::Value::Array(arr) => {
             2 + arr.iter().map(estimate_json_size).sum::<usize>() + arr.len().saturating_sub(1) // commas
         }
         serde_json::Value::Object(obj) => {
-            2 + obj.iter().map(|(k, v)| k.len() + 3 + estimate_json_size(v)).sum::<usize>()
+            2 + obj
+                .iter()
+                .map(|(k, v)| k.len() + 3 + estimate_json_size(v))
+                .sum::<usize>()
                 + obj.len().saturating_sub(1) // commas
         }
     }

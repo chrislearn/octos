@@ -53,7 +53,8 @@ impl SpawnTool {
 
     /// Update the origin context for result delivery (called per inbound message).
     pub fn set_context(&self, channel: &str, chat_id: &str) {
-        *self.origin.lock().unwrap_or_else(|e| e.into_inner()) = (channel.to_string(), chat_id.to_string());
+        *self.origin.lock().unwrap_or_else(|e| e.into_inner()) =
+            (channel.to_string(), chat_id.to_string());
     }
 }
 
@@ -190,7 +191,11 @@ impl Tool for SpawnTool {
             }
         } else {
             // Background mode: fire-and-forget
-            let (origin_channel, origin_chat_id) = self.origin.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let (origin_channel, origin_chat_id) = self
+                .origin
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let llm = self.llm.clone();
             let memory = self.memory.clone();
             let working_dir = self.working_dir.clone();

@@ -172,10 +172,7 @@ impl BrowserSession {
             "--disable-extensions",
             "--disable-background-networking",
         ]);
-        cmd.arg(format!(
-            "--user-data-dir={}",
-            temp_dir.path().display()
-        ));
+        cmd.arg(format!("--user-data-dir={}", temp_dir.path().display()));
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
@@ -185,12 +182,15 @@ impl BrowserSession {
             cmd.env_remove(var);
         }
 
-        let mut child = cmd.spawn().wrap_err_with(|| {
-            format!("failed to launch Chrome at {}", binary.display())
-        })?;
+        let mut child = cmd
+            .spawn()
+            .wrap_err_with(|| format!("failed to launch Chrome at {}", binary.display()))?;
 
         // Parse DevTools WS URL from stderr
-        let stderr = child.stderr.take().ok_or_else(|| eyre::eyre!("no stderr"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| eyre::eyre!("no stderr"))?;
         let reader = tokio::io::BufReader::new(stderr);
         let mut lines = reader.lines();
 
@@ -204,7 +204,12 @@ impl BrowserSession {
             bail!("Chrome exited without printing DevTools URL")
         })
         .await
-        .map_err(|_| eyre::eyre!("Chrome startup timeout ({}s)", CHROME_STARTUP_TIMEOUT.as_secs()))??;
+        .map_err(|_| {
+            eyre::eyre!(
+                "Chrome startup timeout ({}s)",
+                CHROME_STARTUP_TIMEOUT.as_secs()
+            )
+        })??;
 
         // Drain stderr in background to prevent pipe buffer fill blocking Chrome
         let stderr_inner = lines.into_inner().into_inner();
@@ -438,7 +443,14 @@ impl Tool for BrowserTool {
 
         // Validate action before launching Chrome
         const VALID_ACTIONS: &[&str] = &[
-            "navigate", "get_text", "get_html", "click", "type", "screenshot", "evaluate", "close",
+            "navigate",
+            "get_text",
+            "get_html",
+            "click",
+            "type",
+            "screenshot",
+            "evaluate",
+            "close",
         ];
         if !VALID_ACTIONS.contains(&input.action.as_str()) {
             return Ok(ToolResult {
@@ -502,7 +514,9 @@ impl Tool for BrowserTool {
                 let scheme = parsed_url.scheme();
                 if scheme != "http" && scheme != "https" {
                     return Ok(ToolResult {
-                        output: format!("Only http:// and https:// URLs are allowed, got {scheme}://"),
+                        output: format!(
+                            "Only http:// and https:// URLs are allowed, got {scheme}://"
+                        ),
                         success: false,
                         ..Default::default()
                     });
@@ -651,10 +665,7 @@ impl Tool for BrowserTool {
                     .client
                     .send("Page.captureScreenshot", json!({ "format": "png" }))
                     .await?;
-                let data_b64 = result
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let data_b64 = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
                 if data_b64.is_empty() {
                     return Ok(ToolResult {
                         output: "Failed to capture screenshot".to_string(),
@@ -671,9 +682,12 @@ impl Tool for BrowserTool {
                     .tempfile()
                     .wrap_err("failed to create screenshot temp file")?;
                 let path = tmp.path().to_path_buf();
-                tokio::fs::write(&path, &bytes).await.wrap_err("failed to write screenshot")?;
+                tokio::fs::write(&path, &bytes)
+                    .await
+                    .wrap_err("failed to write screenshot")?;
                 // Keep the file on disk (don't auto-delete on drop)
-                tmp.keep().map_err(|e| eyre::eyre!("failed to persist screenshot: {}", e.error))?;
+                tmp.keep()
+                    .map_err(|e| eyre::eyre!("failed to persist screenshot: {}", e.error))?;
                 Ok(ToolResult {
                     output: format!("Screenshot saved to {}", path.display()),
                     success: true,
@@ -778,10 +792,7 @@ mod tests {
     #[tokio::test]
     async fn test_close_without_session() {
         let tool = BrowserTool::new();
-        let result = tool
-            .execute(&json!({ "action": "close" }))
-            .await
-            .unwrap();
+        let result = tool.execute(&json!({ "action": "close" })).await.unwrap();
         assert!(result.success);
     }
 

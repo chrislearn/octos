@@ -155,25 +155,19 @@ impl Agent {
 
     /// Override the system prompt (e.g. for gateway mode).
     pub fn with_system_prompt(self, prompt: String) -> Self {
-        *self
-            .system_prompt
-            .write()
-            .unwrap_or_else(|e| {
-                tracing::warn!("system prompt lock was poisoned, recovering");
-                e.into_inner()
-            }) = prompt;
+        *self.system_prompt.write().unwrap_or_else(|e| {
+            tracing::warn!("system prompt lock was poisoned, recovering");
+            e.into_inner()
+        }) = prompt;
         self
     }
 
     /// Update the system prompt at runtime (hot-reload).
     pub fn set_system_prompt(&self, prompt: String) {
-        *self
-            .system_prompt
-            .write()
-            .unwrap_or_else(|e| {
-                tracing::warn!("system prompt lock was poisoned, recovering");
-                e.into_inner()
-            }) = prompt;
+        *self.system_prompt.write().unwrap_or_else(|e| {
+            tracing::warn!("system prompt lock was poisoned, recovering");
+            e.into_inner()
+        }) = prompt;
     }
 
     /// The LLM model ID in use.
@@ -241,8 +235,9 @@ impl Agent {
             let tools_spec = self.tools.specs();
             self.trim_to_context_window(&mut messages);
 
-            let (response, streamed) =
-                self.call_llm_with_hooks(&messages, &tools_spec, &config, iteration).await?;
+            let (response, streamed) = self
+                .call_llm_with_hooks(&messages, &tools_spec, &config, iteration)
+                .await?;
             total_usage.input_tokens += response.usage.input_tokens;
             total_usage.output_tokens += response.usage.output_tokens;
 
@@ -318,8 +313,9 @@ impl Agent {
                 let tools_spec = self.tools.specs();
                 self.trim_to_context_window(&mut messages);
 
-                let (response, _streamed) =
-                    self.call_llm_with_hooks(&messages, &tools_spec, &config, iteration).await?;
+                let (response, _streamed) = self
+                    .call_llm_with_hooks(&messages, &tools_spec, &config, iteration)
+                    .await?;
                 total_usage.input_tokens += response.usage.input_tokens;
                 total_usage.output_tokens += response.usage.output_tokens;
 
@@ -336,8 +332,7 @@ impl Agent {
                     StopReason::EndTurn | StopReason::StopSequence => {
                         if self.config.save_episodes {
                             let summary = response.content.clone().unwrap_or_default();
-                            let summary_truncated =
-                                crew_core::truncated_utf8(&summary, 500, "...");
+                            let summary_truncated = crew_core::truncated_utf8(&summary, 500, "...");
 
                             let mut episode = Episode::new(
                                 task.id.clone(),
@@ -979,7 +974,10 @@ impl Agent {
         if let Some(max_tokens) = self.config.max_tokens {
             let used = total_usage.input_tokens + total_usage.output_tokens;
             if used >= max_tokens {
-                return Some(BudgetStop::MaxTokens { used, limit: max_tokens });
+                return Some(BudgetStop::MaxTokens {
+                    used,
+                    limit: max_tokens,
+                });
             }
         }
         None
@@ -994,11 +992,8 @@ impl Agent {
         iteration: u32,
     ) -> Result<(ChatResponse, bool)> {
         if let Some(ref hooks) = self.hooks {
-            let payload =
-                HookPayload::before_llm(self.llm.model_id(), messages.len(), iteration);
-            if let HookResult::Deny(reason) =
-                hooks.run(HookEvent::BeforeLlmCall, &payload).await
-            {
+            let payload = HookPayload::before_llm(self.llm.model_id(), messages.len(), iteration);
+            if let HookResult::Deny(reason) = hooks.run(HookEvent::BeforeLlmCall, &payload).await {
                 eyre::bail!("LLM call denied by hook: {reason}");
             }
         }
@@ -1065,10 +1060,7 @@ impl Agent {
                 });
             }
             BudgetStop::WallClockTimeout { limit } => {
-                warn!(
-                    limit_s = limit.as_secs(),
-                    "hit wall-clock timeout"
-                );
+                warn!(limit_s = limit.as_secs(), "hit wall-clock timeout");
                 self.reporter
                     .report(ProgressEvent::WallClockTimeoutReached {
                         elapsed: *limit,

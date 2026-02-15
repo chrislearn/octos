@@ -71,12 +71,15 @@ impl Tool for CodeStructureTool {
 
         // Reject files too large for parsing (1 MB limit)
         const MAX_PARSE_SIZE: u64 = 1_048_576;
-        let meta = tokio::fs::metadata(&resolved).await.map_err(|e| {
-            eyre::eyre!("failed to stat file '{}': {e}", args.path)
-        })?;
+        let meta = tokio::fs::metadata(&resolved)
+            .await
+            .map_err(|e| eyre::eyre!("failed to stat file '{}': {e}", args.path))?;
         if meta.len() > MAX_PARSE_SIZE {
             return Ok(ToolResult {
-                output: format!("file too large for parsing: {} bytes (max 1 MB)", meta.len()),
+                output: format!(
+                    "file too large for parsing: {} bytes (max 1 MB)",
+                    meta.len()
+                ),
                 success: false,
                 ..Default::default()
             });
@@ -232,8 +235,8 @@ fn collect_symbols(
                 }
             }
             "impl_item" => {
-                if let Some(name) = child_by_kind(&node, "type_identifier")
-                    .and_then(|n| node_text(&n, source))
+                if let Some(name) =
+                    child_by_kind(&node, "type_identifier").and_then(|n| node_text(&n, source))
                 {
                     structs.push(serde_json::json!({
                         "name": name, "line": line, "kind": "impl"
@@ -326,7 +329,9 @@ fn collect_symbols(
     // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_symbols(child, source, language, functions, structs, imports, classes, constants);
+        collect_symbols(
+            child, source, language, functions, structs, imports, classes, constants,
+        );
     }
 }
 
@@ -496,9 +501,21 @@ function greet(user: User): string {
         assert!(functions.iter().any(|f| f["name"] == "getUser"));
 
         let structs = result["structs"].as_array().unwrap();
-        assert!(structs.iter().any(|s| s["name"] == "User" && s["kind"] == "interface"));
-        assert!(structs.iter().any(|s| s["name"] == "Status" && s["kind"] == "type"));
-        assert!(structs.iter().any(|s| s["name"] == "Direction" && s["kind"] == "enum"));
+        assert!(
+            structs
+                .iter()
+                .any(|s| s["name"] == "User" && s["kind"] == "interface")
+        );
+        assert!(
+            structs
+                .iter()
+                .any(|s| s["name"] == "Status" && s["kind"] == "type")
+        );
+        assert!(
+            structs
+                .iter()
+                .any(|s| s["name"] == "Direction" && s["kind"] == "enum")
+        );
 
         let classes = result["classes"].as_array().unwrap();
         assert!(classes.iter().any(|c| c["name"] == "UserService"));

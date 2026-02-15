@@ -398,11 +398,8 @@ mod tests {
 
     #[test]
     fn test_payload_serialization() {
-        let payload = HookPayload::before_tool(
-            "shell",
-            serde_json::json!({"command": "ls"}),
-            "call_1",
-        );
+        let payload =
+            HookPayload::before_tool("shell", serde_json::json!({"command": "ls"}), "call_1");
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("\"event\":\"before_tool_call\""));
         assert!(json.contains("\"tool_name\":\"shell\""));

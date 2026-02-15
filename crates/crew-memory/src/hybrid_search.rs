@@ -106,9 +106,15 @@ impl HybridIndex {
         let normalized = valid_emb.and_then(l2_normalize);
         self.has_embedding.push(normalized.is_some());
         if let Some(normalized) = normalized {
-            let hnsw = self
-                .hnsw
-                .get_or_insert_with(|| Hnsw::new(HNSW_MAX_NB_CONNECTION, HNSW_CAPACITY, HNSW_MAX_LAYER, HNSW_EF_CONSTRUCTION, DistCosine));
+            let hnsw = self.hnsw.get_or_insert_with(|| {
+                Hnsw::new(
+                    HNSW_MAX_NB_CONNECTION,
+                    HNSW_CAPACITY,
+                    HNSW_MAX_LAYER,
+                    HNSW_EF_CONSTRUCTION,
+                    DistCosine,
+                )
+            });
             hnsw.insert((&normalized, doc_idx));
         }
     }
@@ -132,9 +138,15 @@ impl HybridIndex {
             return false; // zero vector cannot be indexed
         };
         self.has_embedding[doc_idx] = true;
-        let hnsw = self
-            .hnsw
-            .get_or_insert_with(|| Hnsw::new(HNSW_MAX_NB_CONNECTION, HNSW_CAPACITY, HNSW_MAX_LAYER, HNSW_EF_CONSTRUCTION, DistCosine));
+        let hnsw = self.hnsw.get_or_insert_with(|| {
+            Hnsw::new(
+                HNSW_MAX_NB_CONNECTION,
+                HNSW_CAPACITY,
+                HNSW_MAX_LAYER,
+                HNSW_EF_CONSTRUCTION,
+                DistCosine,
+            )
+        });
         hnsw.insert((&normalized, doc_idx));
         true
     }
