@@ -74,7 +74,7 @@ impl OpenAIProvider {
                 });
                 OpenAIMessage {
                     role,
-                    content: build_openai_content(m),
+                    content: build_openai_content(m, &self.model),
                     reasoning_content: m.reasoning_content.as_deref(),
                     tool_call_id: m.tool_call_id.as_deref(),
                     tool_calls,
@@ -349,11 +349,37 @@ fn merge_system_messages(messages: Vec<OpenAIMessage<'_>>) -> Vec<OpenAIMessage<
     result
 }
 
-fn build_openai_content(msg: &Message) -> Option<OpenAIContent> {
-    let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
+/// Check if a model is known to lack vision/multimodal support.
+fn model_lacks_vision(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.starts_with("deepseek")
+        || m.starts_with("minimax")
+        || m.contains("codestral")
+        || m.starts_with("mistral")
+        || m.starts_with("yi-")
+}
+
+fn build_openai_content(msg: &Message, model: &str) -> Option<OpenAIContent> {
+    let images: Vec<_> = if model_lacks_vision(model) {
+        vec![]
+    } else {
+        msg.media.iter().filter(|p| vision::is_image(p)).collect()
+    };
 
     if images.is_empty() {
-        if msg.content.is_empty() {
+        // If media was stripped due to model not supporting vision, note it in text
+        let media_note = if model_lacks_vision(model) && msg.media.iter().any(|p| vision::is_image(p)) {
+            let filenames: Vec<_> = msg.media.iter().map(|p| {
+                std::path::Path::new(p).file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.clone())
+            }).collect();
+            Some(format!("[attached media: {}]", filenames.join(", ")))
+        } else {
+            None
+        };
+
+        if msg.content.is_empty() && media_note.is_none() {
             // Tool messages require a content string (OpenAI spec).
             // User messages must not be empty (many providers reject them).
             // Assistant messages can have null content when tool_calls are present;
@@ -364,7 +390,12 @@ fn build_openai_content(msg: &Message) -> Option<OpenAIContent> {
                 _ => None,
             };
         }
-        return Some(OpenAIContent::Text(msg.content.clone()));
+        let text = match media_note {
+            Some(note) if msg.content.is_empty() => note,
+            Some(note) => format!("{}\n{note}", msg.content),
+            None => msg.content.clone(),
+        };
+        return Some(OpenAIContent::Text(text));
     }
 
     let mut parts = Vec::new();

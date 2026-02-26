@@ -439,6 +439,7 @@ impl GatewayCommand {
                         &url,
                         entry.allowed_senders.clone(),
                         shutdown.clone(),
+                        media_dir.clone(),
                     )));
                 }
                 #[cfg(feature = "email")]
@@ -833,6 +834,17 @@ async fn process_session_message(
         let session = mgr.get_or_create(session_key);
         session.get_history(max_history).to_vec()
     };
+
+    // Send a quick acknowledgment so the user knows we're working on it
+    let ack = OutboundMessage {
+        channel: reply_channel.to_string(),
+        chat_id: reply_chat_id.to_string(),
+        content: "Thinking...".to_string(),
+        reply_to: None,
+        media: vec![],
+        metadata: serde_json::json!({}),
+    };
+    let _ = out_tx.send(ack).await;
 
     // Process message through agent (potentially long LLM call, no lock held)
     let response = agent

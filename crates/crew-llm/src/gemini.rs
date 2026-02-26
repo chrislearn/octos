@@ -128,9 +128,11 @@ impl LlmProvider for GeminiProvider {
                 GeminiPart::Text { text } => {
                     content = Some(text);
                 }
-                GeminiPart::FunctionCall { function_call } => {
-                    let metadata = function_call
-                        .thought_signature
+                GeminiPart::FunctionCall {
+                    function_call,
+                    thought_signature,
+                } => {
+                    let metadata = thought_signature
                         .map(|sig| serde_json::json!({ "thought_signature": sig }));
                     tool_calls.push(crew_core::ToolCall {
                         id: format!("call_{}", tool_calls.len()),
@@ -285,6 +287,14 @@ enum GeminiPart {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: GeminiFunctionCall,
+        /// Gemini thinking models require this signature to be echoed back.
+        /// This is at the part level, NOT inside the functionCall object.
+        #[serde(
+            rename = "thoughtSignature",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         #[serde(rename = "functionResponse")]
@@ -351,8 +361,8 @@ fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<St
                             function_call: GeminiFunctionCall {
                                 name: tc.name.clone(),
                                 args: tc.arguments.clone(),
-                                thought_signature,
                             },
+                            thought_signature,
                         });
                     }
                 }
@@ -432,13 +442,6 @@ fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
 struct GeminiFunctionCall {
     name: String,
     args: serde_json::Value,
-    /// Gemini thinking models require this signature to be echoed back.
-    #[serde(
-        rename = "thoughtSignature",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    thought_signature: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -516,7 +519,8 @@ fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -
                             .cloned()
                             .unwrap_or(serde_json::Value::Object(Default::default()));
                         // Capture thought_signature for Gemini thinking models.
-                        let thought_sig = fc
+                        // thoughtSignature is at the part level, not inside functionCall.
+                        let thought_sig = part
                             .get("thoughtSignature")
                             .and_then(|v| v.as_str())
                             .map(|s| serde_json::json!({ "thought_signature": s }));

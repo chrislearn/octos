@@ -1,6 +1,7 @@
 //! WhatsApp channel via Node.js bridge (Baileys) over WebSocket.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -9,15 +10,34 @@ use chrono::Utc;
 use crew_core::{InboundMessage, OutboundMessage};
 use eyre::Result;
 use futures::{SinkExt, StreamExt};
+use reqwest::Client;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
 
 use crate::channel::Channel;
+use crate::media::download_media;
 
 /// Default bridge URL for the Node.js WhatsApp bridge.
 const DEFAULT_BRIDGE_URL: &str = "ws://localhost:3001";
+
+/// Map a MIME type to a file extension.
+fn ext_from_mimetype(mime: &str) -> String {
+    match mime {
+        "image/jpeg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "audio/ogg" | "audio/ogg; codecs=opus" => ".ogg",
+        "audio/mpeg" => ".mp3",
+        "audio/mp4" => ".m4a",
+        "video/mp4" => ".mp4",
+        "application/pdf" => ".pdf",
+        _ => "",
+    }
+    .to_string()
+}
 
 pub struct WhatsAppChannel {
     bridge_url: String,
@@ -25,6 +45,8 @@ pub struct WhatsAppChannel {
     shutdown: Arc<AtomicBool>,
     /// Write half of the WebSocket for sending messages.
     ws_tx: Arc<tokio::sync::Mutex<Option<WsSink>>>,
+    media_dir: PathBuf,
+    http: Client,
 }
 
 type WsSink = futures::stream::SplitSink<
@@ -33,7 +55,12 @@ type WsSink = futures::stream::SplitSink<
 >;
 
 impl WhatsAppChannel {
-    pub fn new(bridge_url: &str, allowed_senders: Vec<String>, shutdown: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        bridge_url: &str,
+        allowed_senders: Vec<String>,
+        shutdown: Arc<AtomicBool>,
+        media_dir: PathBuf,
+    ) -> Self {
         let url = if bridge_url.is_empty() {
             DEFAULT_BRIDGE_URL.to_string()
         } else {
@@ -44,6 +71,8 @@ impl WhatsAppChannel {
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            media_dir,
+            http: Client::new(),
         }
     }
 
@@ -123,7 +152,74 @@ impl Channel for WhatsAppChannel {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
 
-                        if sender.is_empty() || content.is_empty() {
+                        // Download media attachments from bridge
+                        let mut media = Vec::new();
+                        if let Some(media_arr) = msg.get("media").and_then(|v| v.as_array()) {
+                            for item in media_arr {
+                                let url = item
+                                    .get("url")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let mimetype = item
+                                    .get("mimetype")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let filename = item
+                                    .get("filename")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+
+                                if url.is_empty() {
+                                    continue;
+                                }
+
+                                let ext = if !filename.is_empty() {
+                                    std::path::Path::new(filename)
+                                        .extension()
+                                        .map(|e| format!(".{}", e.to_string_lossy()))
+                                        .unwrap_or_default()
+                                } else {
+                                    ext_from_mimetype(mimetype)
+                                };
+                                let dl_name = format!("wa_{}{}", Utc::now().timestamp_millis(), ext);
+
+                                match download_media(&self.http, url, &[], &self.media_dir, &dl_name)
+                                    .await
+                                {
+                                    Ok(path) => media.push(path.display().to_string()),
+                                    Err(e) => warn!("failed to download WhatsApp media: {e}"),
+                                }
+                            }
+                        }
+                        // Also handle single mediaUrl field
+                        if media.is_empty() {
+                            if let Some(url) = msg.get("mediaUrl").and_then(|v| v.as_str()) {
+                                if !url.is_empty() {
+                                    let mimetype = msg
+                                        .get("mimetype")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let ext = ext_from_mimetype(mimetype);
+                                    let dl_name =
+                                        format!("wa_{}{}", Utc::now().timestamp_millis(), ext);
+
+                                    match download_media(
+                                        &self.http,
+                                        url,
+                                        &[],
+                                        &self.media_dir,
+                                        &dl_name,
+                                    )
+                                    .await
+                                    {
+                                        Ok(path) => media.push(path.display().to_string()),
+                                        Err(e) => warn!("failed to download WhatsApp media: {e}"),
+                                    }
+                                }
+                            }
+                        }
+
+                        if sender.is_empty() || (content.is_empty() && media.is_empty()) {
                             continue;
                         }
 
@@ -146,7 +242,7 @@ impl Channel for WhatsAppChannel {
                             chat_id,
                             content: content.to_string(),
                             timestamp: Utc::now(),
-                            media: vec![],
+                            media,
                             metadata: serde_json::json!({
                                 "whatsapp": {
                                     "is_group": is_group,
@@ -246,6 +342,8 @@ mod tests {
             allowed_senders: allowed.into_iter().map(String::from).collect(),
             shutdown: Arc::new(AtomicBool::new(false)),
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            media_dir: PathBuf::from("/tmp/test-wa-media"),
+            http: Client::new(),
         }
     }
 
@@ -290,5 +388,56 @@ mod tests {
         assert_eq!(msg["sender"], "1234567890@s.whatsapp.net");
         assert_eq!(msg["content"], "Hello");
         assert_eq!(msg["isGroup"], false);
+    }
+
+    #[test]
+    fn test_bridge_media_message_parsing() {
+        let json = r#"{
+            "type": "message",
+            "sender": "1234567890@s.whatsapp.net",
+            "content": "Check this photo",
+            "isGroup": false,
+            "media": [
+                {"url": "https://example.com/photo.jpg", "mimetype": "image/jpeg", "filename": ""},
+                {"url": "https://example.com/doc.pdf", "mimetype": "application/pdf", "filename": "report.pdf"}
+            ]
+        }"#;
+        let msg: serde_json::Value = serde_json::from_str(json).unwrap();
+        let media = msg.get("media").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(media.len(), 2);
+        assert_eq!(media[0]["mimetype"], "image/jpeg");
+        assert_eq!(media[1]["filename"], "report.pdf");
+    }
+
+    #[test]
+    fn test_bridge_single_media_url() {
+        let json = r#"{
+            "type": "message",
+            "sender": "1234567890@s.whatsapp.net",
+            "content": "",
+            "isGroup": false,
+            "mediaUrl": "https://example.com/voice.ogg",
+            "mimetype": "audio/ogg"
+        }"#;
+        let msg: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            msg.get("mediaUrl").and_then(|v| v.as_str()).unwrap(),
+            "https://example.com/voice.ogg"
+        );
+        assert_eq!(
+            msg.get("mimetype").and_then(|v| v.as_str()).unwrap(),
+            "audio/ogg"
+        );
+    }
+
+    #[test]
+    fn test_ext_from_mimetype() {
+        assert_eq!(ext_from_mimetype("image/jpeg"), ".jpg");
+        assert_eq!(ext_from_mimetype("image/png"), ".png");
+        assert_eq!(ext_from_mimetype("audio/ogg"), ".ogg");
+        assert_eq!(ext_from_mimetype("audio/ogg; codecs=opus"), ".ogg");
+        assert_eq!(ext_from_mimetype("video/mp4"), ".mp4");
+        assert_eq!(ext_from_mimetype("application/pdf"), ".pdf");
+        assert_eq!(ext_from_mimetype("application/unknown"), "");
     }
 }
