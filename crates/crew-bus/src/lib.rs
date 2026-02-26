@@ -21,6 +21,8 @@ pub mod feishu_channel;
 pub mod slack_channel;
 #[cfg(feature = "telegram")]
 pub mod telegram_channel;
+#[cfg(feature = "twilio")]
+pub mod twilio_channel;
 #[cfg(feature = "whatsapp")]
 pub mod whatsapp_channel;
 
@@ -42,5 +44,7 @@ pub use feishu_channel::FeishuChannel;
 pub use slack_channel::SlackChannel;
 #[cfg(feature = "telegram")]
 pub use telegram_channel::TelegramChannel;
+#[cfg(feature = "twilio")]
+pub use twilio_channel::TwilioChannel;
 #[cfg(feature = "whatsapp")]
 pub use whatsapp_channel::WhatsAppChannel;

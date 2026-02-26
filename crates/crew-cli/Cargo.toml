@@ -41,16 +41,19 @@ futures = { workspace = true, optional = true }
 rust-embed = { workspace = true, optional = true }
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
+lettre = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
 [features]
 default = []
-api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics", "dep:metrics-exporter-prometheus"]
+api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand"]
 telegram = ["crew-bus/telegram"]
 discord = ["crew-bus/discord"]
 slack = ["crew-bus/slack"]
 whatsapp = ["crew-bus/whatsapp"]
 email = ["crew-bus/email"]
 feishu = ["crew-bus/feishu"]
+twilio = ["crew-bus/twilio"]
 git = ["crew-agent/git"]
 ast = ["crew-agent/ast"]
 

@@ -532,6 +532,32 @@ impl GatewayCommand {
                         .with_verification_token(verification_token),
                     ));
                 }
+                #[cfg(feature = "twilio")]
+                "twilio" => {
+                    let sid_env =
+                        settings_str(&entry.settings, "account_sid_env", "TWILIO_ACCOUNT_SID");
+                    let token_env =
+                        settings_str(&entry.settings, "auth_token_env", "TWILIO_AUTH_TOKEN");
+                    let from_number = settings_str(&entry.settings, "from_number", "");
+                    let account_sid = std::env::var(&sid_env)
+                        .wrap_err_with(|| format!("{sid_env} environment variable not set"))?;
+                    let auth_token = std::env::var(&token_env)
+                        .wrap_err_with(|| format!("{token_env} environment variable not set"))?;
+                    let webhook_port: u16 = entry
+                        .settings
+                        .get("webhook_port")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(8090) as u16;
+                    channel_mgr.register(Arc::new(crew_bus::TwilioChannel::new(
+                        &account_sid,
+                        &auth_token,
+                        &from_number,
+                        entry.allowed_senders.clone(),
+                        shutdown.clone(),
+                        media_dir.clone(),
+                        webhook_port,
+                    )));
+                }
                 other => {
                     println!(
                         "{}: channel '{}' not supported, skipping",
@@ -1037,7 +1063,8 @@ async fn build_system_prompt(
     feature = "slack",
     feature = "whatsapp",
     feature = "email",
-    feature = "feishu"
+    feature = "feishu",
+    feature = "twilio"
 ))]
 fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> String {
     settings
