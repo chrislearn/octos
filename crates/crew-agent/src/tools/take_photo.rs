@@ -42,6 +42,8 @@ impl TakePhotoTool {
 #[derive(Deserialize)]
 struct Input {
     #[serde(default)]
+    confirmed: Option<bool>,
+    #[serde(default)]
     caption: Option<String>,
     #[serde(default)]
     send: Option<bool>,
@@ -62,7 +64,9 @@ impl Tool for TakePhotoTool {
     fn description(&self) -> &str {
         "Capture a photo from the device camera (e.g. MacBook FaceTime camera). \
          By default the photo is sent to the current chat. Set send=false to only \
-         capture and return the file path without sending."
+         capture and return the file path without sending. \
+         IMPORTANT: You MUST ask the user for permission before taking a photo. \
+         Only call this tool with confirmed=true after the user explicitly agrees."
     }
 
     fn tags(&self) -> &[&str] {
@@ -73,6 +77,10 @@ impl Tool for TakePhotoTool {
         serde_json::json!({
             "type": "object",
             "properties": {
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Must be true. You MUST ask the user for permission first and only set this to true after they agree."
+                },
                 "caption": {
                     "type": "string",
                     "description": "Optional caption for the photo when sending"
@@ -100,6 +108,18 @@ impl Tool for TakePhotoTool {
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid take_photo tool input")?;
+
+        // Require explicit confirmation before accessing the camera
+        if !input.confirmed.unwrap_or(false) {
+            return Ok(ToolResult {
+                output: "Permission required: You must ask the user for permission before \
+                         taking a photo. Ask them first, then call this tool again with \
+                         confirmed=true after they agree."
+                    .to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
 
         let device = input.device.unwrap_or_else(|| "0".to_string());
         let send = input.send.unwrap_or(true);
@@ -229,7 +249,7 @@ mod tests {
         tool.set_context("telegram", "12345");
 
         let result = tool
-            .execute(&serde_json::json!({"send": false}))
+            .execute(&serde_json::json!({"send": false, "confirmed": true}))
             .await
             .unwrap();
 
@@ -244,10 +264,17 @@ mod tests {
         let tool = TakePhotoTool::new(tx);
         // No context set, send=true (default)
 
+        // Without confirmed=true, should require permission
         let result = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("Permission required"));
 
+        // With confirmed=true but no target channel
+        let result = tool
+            .execute(&serde_json::json!({"confirmed": true}))
+            .await
+            .unwrap();
         // Either ffmpeg fails (no camera in CI) or succeeds but can't send (no target)
-        // Either way, should not panic
         assert!(!result.output.is_empty());
     }
 }
