@@ -12,9 +12,13 @@ pub mod config;
 pub mod config_watcher;
 pub mod cron_tool;
 #[cfg(feature = "api")]
+pub mod otp;
+#[cfg(feature = "api")]
 pub mod process_manager;
 #[cfg(feature = "api")]
 pub mod profiles;
+#[cfg(feature = "api")]
+pub mod user_store;
 
 use commands::{Args, Executable};
 

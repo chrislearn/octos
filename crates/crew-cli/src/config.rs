@@ -74,6 +74,12 @@ pub struct Config {
     /// Each entry registers a provider under a short key that the LLM can reference.
     #[serde(default)]
     pub sub_providers: Vec<SubProviderConfig>,
+
+    /// Dashboard user authentication configuration (email OTP).
+    /// When set, enables multi-user login via email verification codes.
+    #[cfg(feature = "api")]
+    #[serde(default)]
+    pub dashboard_auth: Option<crate::otp::DashboardAuthConfig>,
 }
 
 /// A fallback model for the provider failover chain.

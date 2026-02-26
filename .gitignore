@@ -24,3 +24,10 @@ node_modules/
 .env.local
 .envrc
 .crew/
+
+# Agent research output
+*.md
+!README.md
+!CLAUDE.md
+!CHANGELOG.md
+!docs/**/*.md

@@ -138,6 +138,30 @@ impl ServeCommand {
             profile_store.clone(),
         ));
 
+        // Initialize user store and auth manager for multi-user support
+        let user_store = Arc::new(
+            crate::user_store::UserStore::open(&data_dir).wrap_err("failed to open user store")?,
+        );
+        let auth_manager = {
+            let auth_config = config.dashboard_auth.clone();
+            Some(Arc::new(crate::otp::AuthManager::new(
+                auth_config,
+                user_store.clone(),
+            )))
+        };
+
+        // Spawn auth cleanup task if auth manager is active
+        if let Some(ref am) = auth_manager {
+            let am_clone = am.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                loop {
+                    interval.tick().await;
+                    am_clone.cleanup().await;
+                }
+            });
+        }
+
         let state = Arc::new(AppState {
             agent,
             sessions,
@@ -147,6 +171,8 @@ impl ServeCommand {
             metrics_handle,
             profile_store: Some(profile_store.clone()),
             process_manager: Some(process_manager.clone()),
+            user_store: Some(user_store),
+            auth_manager,
         });
 
         // Auto-start enabled profiles

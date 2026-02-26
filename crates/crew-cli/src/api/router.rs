@@ -11,9 +11,21 @@ use tower_http::cors::CorsLayer;
 
 use super::AppState;
 use super::admin;
+use super::auth_handlers;
 use super::handlers;
 use super::metrics;
 use super::static_files;
+use super::user_admin;
+use crate::user_store::UserRole;
+
+/// Authentication identity extracted by the auth middleware.
+#[derive(Clone, Debug)]
+pub enum AuthIdentity {
+    /// Admin token — full access to all endpoints.
+    Admin,
+    /// Authenticated user session.
+    User { id: String, role: UserRole },
+}
 
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -30,9 +42,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
 
-    // TODO: add rate limiting middleware for production deployments
+    // Public auth endpoints (no auth required)
+    let auth_api = Router::new()
+        .route("/api/auth/send-code", post(auth_handlers::send_code))
+        .route("/api/auth/verify", post(auth_handlers::verify))
+        .route("/api/auth/logout", post(auth_handlers::logout));
 
-    let api = Router::new()
+    // Chat + status API (existing)
+    let chat_api = Router::new()
         .route("/api/chat", post(handlers::chat))
         .route("/api/chat/stream", get(handlers::chat_stream))
         .route("/api/sessions", get(handlers::list_sessions))
@@ -42,7 +59,27 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/status", get(handlers::status));
 
-    // Admin API routes (1MB body limit)
+    // User self-service endpoints (user or admin auth)
+    let my_api = Router::new()
+        .route("/api/my/profile", get(auth_handlers::my_profile))
+        .route("/api/my/profile", put(auth_handlers::update_my_profile))
+        .route(
+            "/api/my/profile/start",
+            post(auth_handlers::start_my_gateway),
+        )
+        .route("/api/my/profile/stop", post(auth_handlers::stop_my_gateway))
+        .route(
+            "/api/my/profile/restart",
+            post(auth_handlers::restart_my_gateway),
+        )
+        .route(
+            "/api/my/profile/status",
+            get(auth_handlers::my_gateway_status),
+        )
+        .route("/api/my/profile/logs", get(auth_handlers::my_gateway_logs))
+        .route("/api/auth/me", get(auth_handlers::me));
+
+    // Admin API routes (admin auth only, 1MB body limit)
     let admin_api = Router::new()
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .route("/api/admin/overview", get(admin::overview))
@@ -63,38 +100,148 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/admin/profiles/{id}/logs", get(admin::gateway_logs))
         .route("/api/admin/start-all", post(admin::start_all))
-        .route("/api/admin/stop-all", post(admin::stop_all));
+        .route("/api/admin/stop-all", post(admin::stop_all))
+        // User management
+        .route("/api/admin/users", get(user_admin::list_users))
+        .route("/api/admin/users", post(user_admin::create_user))
+        .route("/api/admin/users/{id}", delete(user_admin::delete_user));
 
-    // Wrap with auth middleware if token is configured
-    let api = if state.auth_token.is_some() {
-        api.merge(admin_api).layer(middleware::from_fn_with_state(
+    // Determine whether auth middleware is needed
+    let has_auth = state.auth_token.is_some() || state.auth_manager.is_some();
+
+    // Build the authenticated routes
+    let protected = if has_auth {
+        // Routes requiring user-level auth (user session OR admin token)
+        let user_routes = my_api.merge(chat_api).layer(middleware::from_fn_with_state(
             state.clone(),
-            auth_middleware,
-        ))
+            user_auth_middleware,
+        ));
+
+        // Routes requiring admin-level auth (admin token only)
+        let admin_routes = admin_api.layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth_middleware,
+        ));
+
+        user_routes.merge(admin_routes)
     } else {
-        api.merge(admin_api)
+        // No auth configured — all routes accessible
+        my_api.merge(chat_api).merge(admin_api)
     };
 
-    // Unauthenticated routes (metrics + static files)
-    let public = Router::new().route("/metrics", get(metrics::metrics_handler));
+    // Unauthenticated routes (metrics + static files + auth endpoints)
+    let public = Router::new()
+        .route("/metrics", get(metrics::metrics_handler))
+        .merge(auth_api);
 
     public
-        .merge(api)
+        .merge(protected)
         .fallback(static_files::static_handler)
         .layer(cors)
         .with_state(state)
 }
 
-/// Constant-time byte comparison to prevent timing attacks on auth tokens.
+/// Constant-time byte comparison to prevent timing attacks on auth tokens (no length leak).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    let len_eq = a.len() ^ b.len();
     let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
         result |= x ^ y;
     }
-    result == 0
+    result == 0 && len_eq == 0
+}
+
+/// Extract bearer token from request headers or query params.
+fn extract_token(req: &axum::http::Request<axum::body::Body>) -> String {
+    // Try Authorization header first
+    let header_token = req
+        .headers()
+        .get("authorization")
+        .and_then(|v: &HeaderValue| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    // Fall back to ?token= query param (for SSE / EventSource)
+    let query_token = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
+        .unwrap_or("");
+
+    if !header_token.is_empty() {
+        header_token.to_string()
+    } else {
+        query_token.to_string()
+    }
+}
+
+/// Resolve token to an AuthIdentity.
+async fn resolve_identity(state: &AppState, token: &str) -> Option<AuthIdentity> {
+    if token.is_empty() {
+        return None;
+    }
+
+    // 1. Check admin token (constant-time)
+    if let Some(expected) = &state.auth_token {
+        if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+            return Some(AuthIdentity::Admin);
+        }
+    }
+
+    // 2. Check user session
+    if let Some(ref auth_mgr) = state.auth_manager {
+        if let Some((user_id, role)) = auth_mgr.validate_session(token).await {
+            return Some(AuthIdentity::User { id: user_id, role });
+        }
+    }
+
+    None
+}
+
+/// Auth middleware for user-level access (user session or admin token).
+async fn user_auth_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    mut req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let token = extract_token(&req);
+
+    match resolve_identity(&state, &token).await {
+        Some(identity) => {
+            req.extensions_mut().insert(identity);
+            Ok(next.run(req).await)
+        }
+        None => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// Auth middleware for admin-level access (admin token only, or admin role user).
+async fn admin_auth_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    mut req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let token = extract_token(&req);
+
+    match resolve_identity(&state, &token).await {
+        Some(AuthIdentity::Admin) => {
+            req.extensions_mut().insert(AuthIdentity::Admin);
+            Ok(next.run(req).await)
+        }
+        Some(AuthIdentity::User {
+            role: UserRole::Admin,
+            id,
+        }) => {
+            req.extensions_mut().insert(AuthIdentity::User {
+                id,
+                role: UserRole::Admin,
+            });
+            Ok(next.run(req).await)
+        }
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
 }
 
 #[cfg(test)]
@@ -125,41 +272,4 @@ mod tests {
     fn test_constant_time_eq_single_bit_diff() {
         assert!(!constant_time_eq(b"\x00", b"\x01"));
     }
-}
-
-/// Simple bearer token auth middleware.
-/// Accepts token via `Authorization: Bearer <token>` header or `?token=<token>` query param.
-/// The query param fallback is needed for SSE (EventSource) which cannot send custom headers.
-async fn auth_middleware(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    req: axum::http::Request<axum::body::Body>,
-    next: Next,
-) -> Result<axum::response::Response, StatusCode> {
-    if let Some(expected) = &state.auth_token {
-        // Try Authorization header first
-        let header_token = req
-            .headers()
-            .get("authorization")
-            .and_then(|v: &HeaderValue| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .unwrap_or("");
-
-        // Fall back to ?token= query param (for SSE / EventSource)
-        let query_token = req
-            .uri()
-            .query()
-            .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
-            .unwrap_or("");
-
-        let token = if !header_token.is_empty() {
-            header_token
-        } else {
-            query_token
-        };
-
-        if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    }
-    Ok(next.run(req).await)
 }

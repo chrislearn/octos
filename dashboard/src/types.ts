@@ -90,3 +90,33 @@ export const PROVIDERS = [
   'anthropic', 'openai', 'gemini', 'openrouter', 'deepseek',
   'groq', 'moonshot', 'dashscope', 'minimax', 'zhipu', 'ollama', 'vllm',
 ] as const
+
+// ── User & Auth types ───────────────────────────────────────────────
+
+export type UserRole = 'admin' | 'user'
+
+export interface User {
+  id: string
+  email: string
+  name: string
+  role: UserRole
+  created_at: string
+  last_login_at: string | null
+}
+
+export interface OtpSendResponse {
+  ok: boolean
+  message?: string
+}
+
+export interface OtpVerifyResponse {
+  ok: boolean
+  token?: string
+  user?: User
+  message?: string
+}
+
+export interface MeResponse {
+  user: User
+  profile: ProfileResponse | null
+}

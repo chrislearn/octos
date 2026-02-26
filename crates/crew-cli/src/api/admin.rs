@@ -325,6 +325,14 @@ pub async fn start_gateway(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
 
+    // Validate LLM provider is configured
+    if profile.config.provider.is_none() && profile.config.model.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Cannot start: LLM provider must be configured first".into(),
+        ));
+    }
+
     pm.start(&profile)
         .await
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;

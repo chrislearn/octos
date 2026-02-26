@@ -1,12 +1,19 @@
-import { Link } from 'react-router-dom'
+import { Link, Navigate } from 'react-router-dom'
 import { useOverview } from '../hooks/useProfiles'
 import { useToast } from '../components/Toast'
+import { useAuth } from '../contexts/AuthContext'
 import ProfileCard from '../components/ProfileCard'
 import { api } from '../api'
 import { useState } from 'react'
 
 export default function Dashboard() {
+  const { isAdmin } = useAuth()
   const { data, error, loading, refresh } = useOverview()
+
+  // Non-admins go straight to their profile
+  if (!isAdmin) {
+    return <Navigate to="/my-profile" replace />
+  }
   const { toast } = useToast()
   const [actionLoading, setActionLoading] = useState(false)
 

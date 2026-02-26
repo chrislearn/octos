@@ -4,13 +4,18 @@ import type {
   ActionResponse,
   BulkActionResponse,
   ProfileConfig,
+  OtpSendResponse,
+  OtpVerifyResponse,
+  MeResponse,
+  User,
 } from './types'
 
 const BASE = '/api/admin'
 
 function getHeaders(): HeadersInit {
   const headers: HeadersInit = { 'Content-Type': 'application/json' }
-  const token = localStorage.getItem('crew_auth_token')
+  const token = localStorage.getItem('crew_session_token')
+    || localStorage.getItem('crew_auth_token')
   if (token) {
     headers['Authorization'] = `Bearer ${token}`
   }
@@ -28,6 +33,32 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
   }
   return res.json()
 }
+
+async function publicRequest<T>(path: string, opts?: RequestInit): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(text || `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
+async function authedRequest<T>(path: string, opts?: RequestInit): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    headers: getHeaders(),
+    ...opts,
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(text || `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
+// ── Admin API (existing) ────────────────────────────────────────────
 
 export const api = {
   overview: () => request<OverviewResponse>('/overview'),
@@ -77,4 +108,80 @@ export const api = {
   startAll: () => request<BulkActionResponse>('/start-all', { method: 'POST' }),
 
   stopAll: () => request<BulkActionResponse>('/stop-all', { method: 'POST' }),
+
+  // User management (admin)
+  listUsers: () => request<{ users: User[] }>('/users'),
+
+  createUser: (data: { email: string; name: string; role?: string }) =>
+    request<{ user: User }>('/users', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  deleteUser: (id: string) =>
+    request<ActionResponse>(`/users/${id}`, { method: 'DELETE' }),
+}
+
+// ── Auth API (public) ───────────────────────────────────────────────
+
+export const authApi = {
+  sendCode: (email: string) =>
+    publicRequest<OtpSendResponse>('/auth/send-code', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
+
+  verify: (email: string, code: string) =>
+    publicRequest<OtpVerifyResponse>('/auth/verify', {
+      method: 'POST',
+      body: JSON.stringify({ email, code }),
+    }),
+
+  me: () => authedRequest<MeResponse>('/auth/me'),
+
+  logout: () =>
+    authedRequest<ActionResponse>('/auth/logout', { method: 'POST' }),
+}
+
+// ── User self-service API (/api/my) ─────────────────────────────────
+
+export const myApi = {
+  getProfile: () => authedRequest<ProfileResponse>('/my/profile'),
+
+  updateProfile: (data: {
+    name?: string
+    enabled?: boolean
+    config?: ProfileConfig
+  }) =>
+    authedRequest<ProfileResponse>('/my/profile', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+
+  startGateway: () =>
+    authedRequest<ActionResponse>('/my/profile/start', { method: 'POST' }),
+
+  stopGateway: () =>
+    authedRequest<ActionResponse>('/my/profile/stop', { method: 'POST' }),
+
+  restartGateway: () =>
+    authedRequest<ActionResponse>('/my/profile/restart', { method: 'POST' }),
+
+  gatewayStatus: () =>
+    authedRequest<{ running: boolean; pid: number | null }>('/my/profile/status'),
+}
+
+// Helper to get SSE log URL with auth token (user's own profile)
+export function getLogStreamUrl(): string {
+  const token = localStorage.getItem('crew_session_token')
+    || localStorage.getItem('crew_auth_token')
+  const base = `/api/my/profile/logs`
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base
+}
+
+export function getAdminLogStreamUrl(profileId: string): string {
+  const token = localStorage.getItem('crew_session_token')
+    || localStorage.getItem('crew_auth_token')
+  const base = `/api/admin/profiles/${profileId}/logs`
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base
 }

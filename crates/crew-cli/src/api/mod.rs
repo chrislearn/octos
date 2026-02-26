@@ -3,11 +3,13 @@
 //! Feature-gated behind `api`. Start with `crew serve [--port 8080]`.
 
 pub mod admin;
+pub mod auth_handlers;
 mod handlers;
 pub mod metrics;
 mod router;
 mod sse;
 mod static_files;
+pub mod user_admin;
 
 pub use metrics::init_metrics;
 pub use router::build_router;
@@ -15,8 +17,10 @@ pub use sse::SseBroadcaster;
 
 use std::sync::Arc;
 
+use crate::otp::AuthManager;
 use crate::process_manager::ProcessManager;
 use crate::profiles::ProfileStore;
+use crate::user_store::UserStore;
 
 /// Shared application state for API handlers.
 pub struct AppState {
@@ -36,4 +40,8 @@ pub struct AppState {
     pub profile_store: Option<Arc<ProfileStore>>,
     /// Process manager for gateway lifecycle.
     pub process_manager: Option<Arc<ProcessManager>>,
+    /// User store for multi-user management.
+    pub user_store: Option<Arc<UserStore>>,
+    /// Auth manager for email OTP and sessions.
+    pub auth_manager: Option<Arc<AuthManager>>,
 }
