@@ -175,6 +175,7 @@ impl ServeCommand {
             process_manager: Some(process_manager.clone()),
             user_store: Some(user_store),
             auth_manager,
+            http_client: reqwest::Client::new(),
         });
 
         // Auto-start enabled profiles

@@ -45,4 +45,6 @@ pub struct AppState {
     pub user_store: Option<Arc<UserStore>>,
     /// Auth manager for email OTP and sessions.
     pub auth_manager: Option<Arc<AuthManager>>,
+    /// Shared HTTP client for webhook proxying.
+    pub http_client: reqwest::Client,
 }

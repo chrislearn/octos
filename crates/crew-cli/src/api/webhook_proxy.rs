@@ -64,8 +64,7 @@ async fn proxy_to_gateway(
     };
 
     // Build upstream request preserving headers
-    let client = reqwest::Client::new();
-    let mut req = client.post(&url).body(body_bytes.to_vec());
+    let mut req = state.http_client.post(&url).body(body_bytes.to_vec());
 
     // Forward relevant headers
     for (name, value) in &headers {

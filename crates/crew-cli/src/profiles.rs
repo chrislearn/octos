@@ -513,8 +513,10 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
 /// - `None` — no Feishu channel
 pub fn feishu_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
     for ch in &profile.config.channels {
-        if let ChannelCredentials::Feishu { webhook_port, .. } = ch {
-            return Some(*webhook_port);
+        if let ChannelCredentials::Feishu { mode, webhook_port, .. } = ch {
+            if mode == "webhook" {
+                return Some(*webhook_port);
+            }
         }
     }
     None
