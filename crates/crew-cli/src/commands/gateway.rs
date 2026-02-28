@@ -1017,16 +1017,19 @@ async fn process_session_message(
                 };
                 let _ = mgr.add_message(session_key, user_msg).await;
 
-                let assistant_msg = Message {
-                    role: MessageRole::Assistant,
-                    content: conv_response.content.clone(),
-                    media: vec![],
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    timestamp: Utc::now(),
-                };
-                let _ = mgr.add_message(session_key, assistant_msg).await;
+                // Only save non-empty assistant messages to session history
+                if !conv_response.content.is_empty() {
+                    let assistant_msg = Message {
+                        role: MessageRole::Assistant,
+                        content: conv_response.content.clone(),
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        timestamp: Utc::now(),
+                    };
+                    let _ = mgr.add_message(session_key, assistant_msg).await;
+                }
 
                 // Compact session if it's grown too large
                 if let Err(e) =

@@ -136,6 +136,13 @@ impl OpenAIProvider {
     ) -> OpenAIRequest<'a> {
         let openai_messages: Vec<OpenAIMessage> = messages
             .iter()
+            .filter(|m| {
+                // Drop empty assistant messages (no content, no tool_calls) —
+                // these can appear in session history and cause 400 errors.
+                !(m.role == MessageRole::Assistant
+                    && m.content.is_empty()
+                    && m.tool_calls.as_ref().is_none_or(|tc| tc.is_empty()))
+            })
             .map(|m| {
                 let role = m.role.as_str();
                 // Convert tool_calls from crew_core format to OpenAI format
@@ -237,7 +244,7 @@ impl LlmProvider for OpenAIProvider {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             eyre::bail!(
-                "OpenAI API error: {status} - {}",
+                "API error ({}): {status} - {}", self.model,
                 crate::provider::truncate_error_body(&body)
             );
         }
@@ -321,7 +328,7 @@ impl LlmProvider for OpenAIProvider {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             eyre::bail!(
-                "OpenAI API error: {status} - {}",
+                "API error ({}): {status} - {}", self.model,
                 crate::provider::truncate_error_body(&text)
             );
         }
