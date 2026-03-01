@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use eyre::{Result, WrapErr};
 
+use crate::builtin_skills::BUILTIN_SKILLS;
+
 /// Information about a loaded skill.
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
@@ -16,7 +18,7 @@ pub struct SkillInfo {
     pub path: PathBuf,
     pub available: bool,
     pub always: bool,
-    /// Kept for API compatibility; always false now (all skills are workspace-installed).
+    /// True for system skills compiled into the binary.
     pub builtin: bool,
     /// True if this skill package includes a manifest.json (provides tools).
     pub has_tools: bool,
@@ -35,10 +37,19 @@ impl SkillsLoader {
         }
     }
 
-    /// List all installed skills from `.crew/skills/`.
+    /// List all skills (built-in system skills + installed workspace skills).
     pub async fn list_skills(&self) -> Result<Vec<SkillInfo>> {
         let mut skills = Vec::new();
 
+        // Load built-in system skills
+        for (name, content) in BUILTIN_SKILLS {
+            let path = PathBuf::from(format!("<builtin>/{name}/SKILL.md"));
+            if let Some(info) = parse_skill(&path, content, true) {
+                skills.push(info);
+            }
+        }
+
+        // Load workspace skills from .crew/skills/
         let entries = match tokio::fs::read_dir(&self.skills_dir).await {
             Ok(entries) => Some(entries),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -55,6 +66,8 @@ impl SkillsLoader {
                 let skill_file = path.join("SKILL.md");
                 if let Ok(content) = tokio::fs::read_to_string(&skill_file).await {
                     if let Some(info) = parse_skill(&skill_file, &content, false) {
+                        // Workspace skill overrides builtin with same name
+                        skills.retain(|s| !(s.builtin && s.name == info.name));
                         skills.push(info);
                     }
                 }
@@ -67,12 +80,22 @@ impl SkillsLoader {
 
     /// Load a specific skill's full content (without frontmatter).
     pub async fn load_skill(&self, name: &str) -> Result<Option<String>> {
+        // Check workspace first
         let skill_file = self.skills_dir.join(name).join("SKILL.md");
         match tokio::fs::read_to_string(&skill_file).await {
-            Ok(content) => Ok(Some(strip_frontmatter(&content))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).wrap_err_with(|| format!("failed to read skill: {name}")),
+            Ok(content) => return Ok(Some(strip_frontmatter(&content))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).wrap_err_with(|| format!("failed to read skill: {name}")),
         }
+
+        // Fall back to built-in system skills
+        for (builtin_name, content) in BUILTIN_SKILLS {
+            if *builtin_name == name {
+                return Ok(Some(strip_frontmatter(content)));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Build an XML summary of all skills for the system prompt.
@@ -235,11 +258,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_empty_dir() {
+    async fn test_empty_dir_has_builtins() {
         let dir = tempfile::tempdir().unwrap();
         let loader = SkillsLoader::new(dir.path());
         let skills = loader.list_skills().await.unwrap();
-        assert!(skills.is_empty());
+        // Empty workspace dir still has built-in system skills
+        assert!(skills.iter().all(|s| s.builtin));
+        assert!(skills.iter().any(|s| s.name == "cron"));
+        assert!(skills.iter().any(|s| s.name == "skill-store"));
+        assert!(skills.iter().any(|s| s.name == "skill-creator"));
     }
 
     #[tokio::test]
