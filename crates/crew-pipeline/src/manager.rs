@@ -47,7 +47,7 @@ pub enum SupervisionStrategy {
     AllOrNothing,
     /// Continue even if some children fail; collect all results.
     BestEffort,
-    /// Retry failed children up to `max_retries` times.
+    /// Retry failed children up to `max_retries` times (capped at 10).
     RetryFailed { max_retries: u32 },
 }
 
@@ -81,6 +81,11 @@ impl PipelineManager {
                 Ok(r) => {
                     if !r.success {
                         failures.push(r.name.clone());
+                        results.push(r);
+                        if self.strategy == SupervisionStrategy::AllOrNothing {
+                            break;
+                        }
+                        continue;
                     }
                     results.push(r);
                 }
@@ -111,13 +116,22 @@ impl PipelineManager {
         })
     }
 
+    /// Maximum allowed retries (prevents DoS from unbounded retry configs).
+    const MAX_RETRY_CAP: u32 = 10;
+
     async fn execute_with_strategy(&self, spec: &ChildSpec) -> Result<ChildResult> {
         match &self.strategy {
             SupervisionStrategy::RetryFailed { max_retries } => {
+                let capped = (*max_retries).min(Self::MAX_RETRY_CAP);
                 let mut last_result = self.executor.execute_child(spec).await?;
                 let mut attempts = 0;
-                while !last_result.success && attempts < *max_retries {
+                while !last_result.success && attempts < capped {
                     attempts += 1;
+                    // Exponential backoff: 100ms, 200ms, 400ms, ... capped at 5s
+                    let delay = std::time::Duration::from_millis(
+                        (100 * (1u64 << attempts.min(6))).min(5000),
+                    );
+                    tokio::time::sleep(delay).await;
                     last_result = self.executor.execute_child(spec).await?;
                 }
                 Ok(last_result)
@@ -222,6 +236,8 @@ mod tests {
         let outcome = mgr.run(vec![make_spec("a"), make_spec("b")]).await.unwrap();
         assert!(!outcome.success);
         assert!(outcome.failures.contains(&"a".to_string()));
+        // AllOrNothing should stop after first failure — "b" not executed
+        assert_eq!(outcome.results.len(), 1);
     }
 
     #[tokio::test]

@@ -123,7 +123,8 @@ impl LlmError {
             s if (500..600).contains(&s) => LlmErrorKind::ServerError { status: s },
             _ => LlmErrorKind::Provider { code: None },
         };
-        Self::new(kind, format!("HTTP {status}: {}", &body[..body.len().min(200)]))
+        let truncated_body: String = body.chars().take(200).collect();
+        Self::new(kind, format!("HTTP {status}: {truncated_body}"))
     }
 }
 
@@ -190,6 +191,16 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("Authentication"));
         assert!(s.contains("invalid API key"));
+    }
+
+    #[test]
+    fn should_handle_non_ascii_body_without_panic() {
+        // Multi-byte UTF-8 characters that would panic with byte-level slicing
+        let body = "あ".repeat(100); // 300 bytes, 100 chars
+        let err = LlmError::from_status(500, &body);
+        assert!(matches!(err.kind, LlmErrorKind::ServerError { status: 500 }));
+        // Should not panic — truncates at char boundary
+        let _ = err.to_string();
     }
 
     #[test]

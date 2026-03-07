@@ -11,6 +11,26 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use eyre::Result;
 
+use crate::sandbox::BLOCKED_ENV_VARS;
+
+/// Filter out dangerous environment variables (code injection vectors).
+fn sanitize_env(env: &HashMap<String, String>) -> HashMap<String, String> {
+    env.iter()
+        .filter(|(k, _)| !BLOCKED_ENV_VARS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Validate a path for Docker argument safety.
+/// Rejects paths containing characters that could corrupt argument lists or mount specs.
+fn validate_docker_path(path: &Path) -> Result<()> {
+    let s = path.to_string_lossy();
+    if s.contains(':') || s.contains('\0') || s.contains('\n') || s.contains('\r') {
+        eyre::bail!("path contains invalid characters for Docker: {}", s);
+    }
+    Ok(())
+}
+
 /// Output from a command execution.
 #[derive(Debug, Clone)]
 pub struct ExecOutput {
@@ -65,13 +85,14 @@ impl ExecEnvironment for LocalEnvironment {
         env: &HashMap<String, String>,
         timeout_secs: u64,
     ) -> Result<ExecOutput> {
+        let safe_env = sanitize_env(env);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             tokio::process::Command::new("sh")
                 .arg("-c")
                 .arg(command)
                 .current_dir(working_dir)
-                .envs(env)
+                .envs(&safe_env)
                 .output(),
         )
         .await;
@@ -137,15 +158,21 @@ impl ExecEnvironment for DockerEnvironment {
         &self,
         command: &str,
         working_dir: &Path,
-        _env: &HashMap<String, String>,
+        env: &HashMap<String, String>,
         timeout_secs: u64,
     ) -> Result<ExecOutput> {
+        validate_docker_path(working_dir)?;
         let wd = working_dir.to_string_lossy();
+        let safe_env = sanitize_env(env);
+        let mut cmd = tokio::process::Command::new("docker");
+        cmd.arg("exec").arg("-w").arg(wd.as_ref());
+        for (k, v) in &safe_env {
+            cmd.arg("--env").arg(format!("{k}={v}"));
+        }
+        cmd.arg(&self.container_id).arg("sh").arg("-c").arg(command);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            tokio::process::Command::new("docker")
-                .args(["exec", "-w", &wd, &self.container_id, "sh", "-c", command])
-                .output(),
+            cmd.output(),
         )
         .await;
 
@@ -161,6 +188,7 @@ impl ExecEnvironment for DockerEnvironment {
     }
 
     async fn read_file(&self, path: &Path) -> Result<String> {
+        validate_docker_path(path)?;
         let output = tokio::process::Command::new("docker")
             .args(["exec", &self.container_id, "cat", &path.to_string_lossy()])
             .output()
@@ -172,6 +200,7 @@ impl ExecEnvironment for DockerEnvironment {
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
+        validate_docker_path(path)?;
         let mut child = tokio::process::Command::new("docker")
             .args([
                 "exec",
@@ -188,11 +217,15 @@ impl ExecEnvironment for DockerEnvironment {
             use tokio::io::AsyncWriteExt;
             stdin.write_all(content.as_bytes()).await?;
         }
-        child.wait().await?;
+        let status = child.wait().await?;
+        if !status.success() {
+            eyre::bail!("docker write_file failed with exit code {:?}", status.code());
+        }
         Ok(())
     }
 
     async fn file_exists(&self, path: &Path) -> Result<bool> {
+        validate_docker_path(path)?;
         let output = tokio::process::Command::new("docker")
             .args([
                 "exec",
@@ -207,6 +240,7 @@ impl ExecEnvironment for DockerEnvironment {
     }
 
     async fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        validate_docker_path(path)?;
         let output = tokio::process::Command::new("docker")
             .args([
                 "exec",
@@ -306,5 +340,40 @@ mod tests {
             DockerEnvironment::new("abc123", "/app").name(),
             "docker"
         );
+    }
+
+    #[test]
+    fn should_filter_blocked_env_vars() {
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), "/usr/bin".into());
+        env.insert("LD_PRELOAD".into(), "/evil.so".into());
+        env.insert("DYLD_INSERT_LIBRARIES".into(), "/evil.dylib".into());
+        env.insert("MY_VAR".into(), "safe".into());
+
+        let filtered = sanitize_env(&env);
+        assert!(filtered.contains_key("PATH"));
+        assert!(filtered.contains_key("MY_VAR"));
+        assert!(!filtered.contains_key("LD_PRELOAD"));
+        assert!(!filtered.contains_key("DYLD_INSERT_LIBRARIES"));
+    }
+
+    #[test]
+    fn should_reject_docker_path_with_null() {
+        assert!(validate_docker_path(Path::new("/tmp/evil\0path")).is_err());
+    }
+
+    #[test]
+    fn should_reject_docker_path_with_colon() {
+        assert!(validate_docker_path(Path::new("/tmp/evil:path")).is_err());
+    }
+
+    #[test]
+    fn should_reject_docker_path_with_newline() {
+        assert!(validate_docker_path(Path::new("/tmp/evil\npath")).is_err());
+    }
+
+    #[test]
+    fn should_accept_valid_docker_path() {
+        assert!(validate_docker_path(Path::new("/app/src/main.rs")).is_ok());
     }
 }

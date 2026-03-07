@@ -12,6 +12,12 @@ use std::sync::Arc;
 use crew_core::Message;
 use tokio::sync::RwLock;
 
+/// Maximum number of threads per registry.
+const MAX_THREADS: usize = 1000;
+
+/// Maximum number of messages per thread.
+const MAX_MESSAGES_PER_THREAD: usize = 10_000;
+
 /// A conversation thread shared between pipeline nodes.
 #[derive(Debug, Clone)]
 pub struct Thread {
@@ -69,14 +75,27 @@ impl ThreadRegistry {
     }
 
     /// Append messages to a thread (creates if not exists).
-    pub async fn append(&self, thread_id: &str, messages: Vec<Message>) {
+    ///
+    /// Returns an error if the thread or message count limits are exceeded.
+    pub async fn append(&self, thread_id: &str, messages: Vec<Message>) -> eyre::Result<()> {
         let mut threads = self.threads.write().await;
+        if !threads.contains_key(thread_id) && threads.len() >= MAX_THREADS {
+            eyre::bail!("thread limit exceeded ({MAX_THREADS})");
+        }
         let thread = threads
             .entry(thread_id.to_string())
             .or_insert_with(|| Thread::new(thread_id));
+        let remaining = MAX_MESSAGES_PER_THREAD.saturating_sub(thread.len());
+        if messages.len() > remaining {
+            eyre::bail!(
+                "message limit exceeded for thread '{}' ({MAX_MESSAGES_PER_THREAD})",
+                thread_id
+            );
+        }
         for msg in messages {
             thread.push(msg);
         }
+        Ok(())
     }
 
     /// Get thread IDs.
@@ -143,10 +162,12 @@ mod tests {
         let registry = ThreadRegistry::new();
         registry
             .append("t1", vec![Message::user("hello")])
-            .await;
+            .await
+            .unwrap();
         registry
             .append("t1", vec![Message::assistant("hi")])
-            .await;
+            .await
+            .unwrap();
 
         let msgs = registry.get_messages("t1").await;
         assert_eq!(msgs.len(), 2);
@@ -155,8 +176,8 @@ mod tests {
     #[tokio::test]
     async fn should_track_thread_ids() {
         let registry = ThreadRegistry::new();
-        registry.append("t1", vec![Message::user("a")]).await;
-        registry.append("t2", vec![Message::user("b")]).await;
+        registry.append("t1", vec![Message::user("a")]).await.unwrap();
+        registry.append("t2", vec![Message::user("b")]).await.unwrap();
 
         let ids = registry.thread_ids().await;
         assert_eq!(ids.len(), 2);
