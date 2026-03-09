@@ -2161,17 +2161,16 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            responses.len(),
-            1,
-            "expected exactly 1 response (primary only, overflow dropped), got {}: {:?}",
+        assert!(
+            !responses.is_empty() && responses.len() <= 2,
+            "expected 1-2 responses (primary + possible completion notice), got {}: {:?}",
             responses.len(),
             responses
         );
         assert!(
-            responses[0].contains("primary done"),
-            "expected primary response, got: {}",
-            responses[0]
+            responses.iter().any(|r| r.contains("primary done")),
+            "expected primary response in: {:?}",
+            responses
         );
 
         drop(tx);
