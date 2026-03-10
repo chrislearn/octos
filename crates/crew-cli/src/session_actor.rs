@@ -1518,19 +1518,22 @@ impl SessionActor {
 
             match result {
                 Ok(Ok(conv_response)) => {
-                    // Save tool calls, tool results, assistant reply (skip user msg)
+                    // Save ONLY the final assistant reply to session history.
+                    // Intermediate tool_call/tool_result messages are NOT saved
+                    // to avoid tool_call ID collisions when multiple overflow
+                    // tasks run concurrently (e.g. two deep_search_0 IDs).
                     {
                         let mut mgr = session_mgr.lock().await;
-                        let messages_to_save = if !conv_response.messages.is_empty()
-                            && conv_response.messages[0].role == MessageRole::User
-                        {
-                            &conv_response.messages[1..]
-                        } else {
-                            &conv_response.messages
+                        let final_reply = Message {
+                            role: MessageRole::Assistant,
+                            content: conv_response.content.clone(),
+                            media: vec![],
+                            tool_calls: None,
+                            tool_call_id: None,
+                            reasoning_content: None,
+                            timestamp: chrono::Utc::now(),
                         };
-                        for m in messages_to_save {
-                            let _ = mgr.add_message(&session_key, m.clone()).await;
-                        }
+                        let _ = mgr.add_message(&session_key, final_reply).await;
                     }
 
                     let reply = strip_think_tags(&conv_response.content);
