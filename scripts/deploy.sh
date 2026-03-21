@@ -748,6 +748,15 @@ echo "  ominix-api plist generated"'"'"
         mkdir -p "$HOME/.cargo/bin"
     '\'''
 
+    # Upload provider baseline + model catalog for adaptive router pre-seeding
+    for qos_file in provider_baseline.json model_catalog.json; do
+        QOS_PATH="$OCTOS_BUILD_DIR/$qos_file"
+        if [ -f "$QOS_PATH" ]; then
+            echo "    $qos_file"
+            scp_target "$i" "$QOS_PATH" "$REMOTE:$RDATA/$qos_file"
+        fi
+    done
+
     echo "==> Cleaning stale skill dirs (bootstrap recreates them)..."
     for skill in news deep-search deep-crawl send-email account-manager voice voice-skill clock weather; do
         ssh_target "$i" "rm -rf '${RDATA}/skills/${skill}'" 2>/dev/null || true
