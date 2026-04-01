@@ -7,14 +7,14 @@ use std::sync::Arc;
 use eyre::Result;
 use octos_llm::ToolSpec;
 
+#[cfg(feature = "ast")]
+use super::CodeStructureTool;
 use super::policy::{self, ToolPolicy};
 use super::{
     BrowserTool, ConfigureToolTool, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool,
     ReadFileTool, ShellTool, Tool, ToolConfigStore, ToolLifecycle, ToolResult, WebFetchTool,
     WebSearchTool, WriteFileTool,
 };
-#[cfg(feature = "ast")]
-use super::CodeStructureTool;
 use crate::sandbox::{NoSandbox, Sandbox};
 
 /// Estimate the serialized JSON size without allocating.
@@ -816,8 +816,9 @@ mod cwd_isolation_tests {
 
 #[cfg(test)]
 mod lifecycle_tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     fn make_registry(max_active: usize, idle_threshold: u32) -> ToolRegistry {
         let mut reg = ToolRegistry::with_builtins(PathBuf::from("/tmp"));

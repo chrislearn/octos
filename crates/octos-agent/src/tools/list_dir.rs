@@ -144,8 +144,9 @@ impl Tool for ListDirTool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_list_dir() {

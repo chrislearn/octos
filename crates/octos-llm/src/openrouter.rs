@@ -4,18 +4,15 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
 use octos_core::{Message, MessageRole};
-
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-
 use secrecy::{ExposeSecret, SecretString};
-
-use crate::vision;
+use serde::{Deserialize, Serialize};
 
 use crate::config::ChatConfig;
 use crate::openai::parse_openai_sse_events;
 use crate::provider::LlmProvider;
 use crate::types::{ChatResponse, ChatStream, StopReason, TokenUsage, ToolSpec};
+use crate::vision;
 
 /// OpenRouter provider (routes to many LLM providers).
 pub struct OpenRouterProvider {
@@ -399,8 +396,9 @@ struct Usage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use octos_core::{Message, MessageRole};
+
+    use super::*;
 
     fn text_msg(role: MessageRole, content: &str) -> Message {
         Message {

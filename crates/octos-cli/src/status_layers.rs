@@ -805,12 +805,13 @@ pub(crate) fn fmt_tokens(n: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use octos_core::{InboundMessage, METADATA_SENDER_USER_ID};
     use tokio::sync::{Mutex, mpsc};
+
+    use super::*;
 
     #[derive(Default)]
     struct MockChannel {

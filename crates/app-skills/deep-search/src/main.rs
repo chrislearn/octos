@@ -967,7 +967,7 @@ async fn ddg_search(client: &reqwest::Client, query: &str, count: u8) -> SearchR
             return SearchResult {
                 output: format!("DuckDuckGo error: {e}"),
                 success: false,
-            }
+            };
         }
     };
     if !response.status().is_success() {
@@ -1080,7 +1080,7 @@ async fn brave_search(
             return SearchResult {
                 output: format!("Brave error: {e}"),
                 success: false,
-            }
+            };
         }
     };
     if !response.status().is_success() {
@@ -1097,7 +1097,7 @@ async fn brave_search(
             return SearchResult {
                 output: format!("Brave parse error: {e}"),
                 success: false,
-            }
+            };
         }
     };
     let results = brave.web.map(|w| w.results).unwrap_or_default();
@@ -1136,9 +1136,11 @@ async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
     let crawl_bin = {
         let candidates: Vec<std::path::PathBuf> = [
             // Sibling bundled-app-skill directory
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent()?.parent().map(|d| d.join("deep-crawl").join("main"))),
+            std::env::current_exe().ok().and_then(|p| {
+                p.parent()?
+                    .parent()
+                    .map(|d| d.join("deep-crawl").join("main"))
+            }),
             // Same directory as our binary
             std::env::current_exe()
                 .ok()
@@ -1212,26 +1214,24 @@ async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
     }
 
     // Wait with timeout
-    let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            return SearchResult {
-                output: format!("bing_cdp:deep_crawl failed: {e}"),
-                success: false,
-            };
-        }
-        Err(_) => {
-            return SearchResult {
-                output: "bing_cdp:timeout after 60s".into(),
-                success: false,
-            };
-        }
-    };
+    let output =
+        match tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+            .await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return SearchResult {
+                    output: format!("bing_cdp:deep_crawl failed: {e}"),
+                    success: false,
+                };
+            }
+            Err(_) => {
+                return SearchResult {
+                    output: "bing_cdp:timeout after 60s".into(),
+                    success: false,
+                };
+            }
+        };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -1246,10 +1246,7 @@ async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
         }
     };
 
-    let text = parsed
-        .get("output")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let text = parsed.get("output").and_then(|v| v.as_str()).unwrap_or("");
 
     if text.is_empty() {
         return SearchResult {
@@ -1288,14 +1285,22 @@ async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
     if results.is_empty() {
         // Fall back to returning the raw text which may have useful content
         return SearchResult {
-            output: format!("Bing results for: {query}\n\n{}", &text[..text.len().min(3000)]),
+            output: format!(
+                "Bing results for: {query}\n\n{}",
+                &text[..text.len().min(3000)]
+            ),
             success: !text.is_empty(),
         };
     }
 
     let output = format!(
         "Bing results for: {query}\n\n{}",
-        results.iter().take(count as usize).cloned().collect::<Vec<_>>().join("\n\n")
+        results
+            .iter()
+            .take(count as usize)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     );
 
     SearchResult {
@@ -1326,7 +1331,7 @@ async fn you_search(
             return SearchResult {
                 output: format!("You.com error: {e}"),
                 success: false,
-            }
+            };
         }
     };
     if !response.status().is_success() {
@@ -1343,7 +1348,7 @@ async fn you_search(
             return SearchResult {
                 output: format!("You.com parse error: {e}"),
                 success: false,
-            }
+            };
         }
     };
     let results = you.results.and_then(|r| r.web).unwrap_or_default();
@@ -1393,7 +1398,7 @@ async fn perplexity_search(client: &reqwest::Client, query: &str, api_key: &str)
             return SearchResult {
                 output: format!("Perplexity error: {e}"),
                 success: false,
-            }
+            };
         }
     };
     if !response.status().is_success() {
@@ -1410,7 +1415,7 @@ async fn perplexity_search(client: &reqwest::Client, query: &str, api_key: &str)
             return SearchResult {
                 output: format!("Perplexity parse error: {e}"),
                 success: false,
-            }
+            };
         }
     };
     let answer = pplx

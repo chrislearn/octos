@@ -80,7 +80,8 @@ impl WhatsAppChannel {
         self.allowed_senders.is_empty() || self.allowed_senders.contains(sender_id)
     }
 
-    /// Extract a clean sender ID from a WhatsApp JID (e.g. "1234567890@s.whatsapp.net" -> "1234567890").
+    /// Extract a clean sender ID from a WhatsApp JID (e.g. "1234567890@s.whatsapp.net" ->
+    /// "1234567890").
     fn clean_sender(jid: &str) -> &str {
         jid.split('@').next().unwrap_or(jid)
     }

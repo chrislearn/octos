@@ -300,8 +300,9 @@ fn which_exists(bin: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     async fn setup_skills_dir(dir: &TempDir) -> PathBuf {
         let skills = dir.path().join("skills");

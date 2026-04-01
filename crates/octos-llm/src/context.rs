@@ -5,9 +5,10 @@
 //! conservative fallback when the catalog hasn't been loaded or doesn't contain
 //! the requested model.
 
-use octos_core::Message;
 use std::collections::HashMap;
 use std::sync::RwLock;
+
+use octos_core::Message;
 
 // ── Runtime catalog (loaded from model_catalog.json) ─────────
 

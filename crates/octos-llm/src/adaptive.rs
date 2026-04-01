@@ -502,7 +502,8 @@ impl AdaptiveRouter {
                 metrics: ProviderMetrics::new(),
                 priority: i,
                 cost_per_m: costs.get(i).copied().unwrap_or(0.0),
-                model_type: AtomicU8::new(ModelType::Fast.to_u8()), // default, overridden by catalog seed
+                model_type: AtomicU8::new(ModelType::Fast.to_u8()), /* default, overridden by
+                                                                     * catalog seed */
                 cost_in: AtomicU64::new(0),
                 ds_output: AtomicU64::new(0),
                 baseline_stability: AtomicU64::new(0),
@@ -641,7 +642,8 @@ impl AdaptiveRouter {
                 slot.provider.model_id()
             );
             if let Some(entry) = entries.iter().find(|e| e.provider == slot_key) {
-                slot.model_type.store(entry.model_type.to_u8(), Ordering::Relaxed);
+                slot.model_type
+                    .store(entry.model_type.to_u8(), Ordering::Relaxed);
                 slot.cost_in
                     .store(entry.cost_in.to_bits(), Ordering::Relaxed);
                 slot.ds_output.store(entry.ds_output, Ordering::Relaxed);
@@ -821,8 +823,8 @@ impl AdaptiveRouter {
     /// Four factors:
     ///   - **Stability** (35%): blended baseline + live error rate. Does it complete reliably?
     ///   - **Quality** (30%): catalog ds_output × stability. Does it produce good output?
-    ///   - **Throughput** (20%): output tokens per second. Task-normalized speed.
-    ///     Raw latency is NOT used — it depends on task complexity, not provider quality.
+    ///   - **Throughput** (20%): output tokens per second. Task-normalized speed. Raw latency is
+    ///     NOT used — it depends on task complexity, not provider quality.
     ///   - **Cost** (15%): normalized output cost. Cheaper is better when quality is similar.
     fn score(&self, slot: &AdaptiveSlot) -> f64 {
         let total = slot.metrics.success_count.load(Ordering::Relaxed)
@@ -892,8 +894,8 @@ impl AdaptiveRouter {
 
     /// Select provider index and whether this is a probe request.
     ///
-    /// - Off / Hedge: priority order, skip circuit-broken only.
-    ///   (Hedge mode uses this to pick the primary for racing.)
+    /// - Off / Hedge: priority order, skip circuit-broken only. (Hedge mode uses this to pick the
+    ///   primary for racing.)
     /// - Lane: score-based selection across all providers.
     fn select_provider(&self) -> (usize, bool) {
         let mode = self.mode();
@@ -1368,9 +1370,10 @@ fn now_epoch_us() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::types::{StopReason, TokenUsage};
-    use std::sync::Arc;
 
     struct MockProvider {
         name: &'static str,

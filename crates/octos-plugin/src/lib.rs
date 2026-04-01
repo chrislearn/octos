@@ -12,15 +12,14 @@
 //! ```no_run
 //! use std::collections::HashMap;
 //! use std::path::PathBuf;
+//!
 //! use octos_plugin::discovery::{PluginSource, discover_plugins};
 //! use octos_plugin::types::PluginOrigin;
 //!
-//! let sources = vec![
-//!     PluginSource {
-//!         path: PathBuf::from("/home/user/.octos/plugins"),
-//!         origin: PluginOrigin::User,
-//!     },
-//! ];
+//! let sources = vec![PluginSource {
+//!     path: PathBuf::from("/home/user/.octos/plugins"),
+//!     origin: PluginOrigin::User,
+//! }];
 //! let plugins = discover_plugins(&sources, &HashMap::new());
 //! for p in &plugins {
 //!     println!("{}: {:?}", p.manifest.id, p.status);

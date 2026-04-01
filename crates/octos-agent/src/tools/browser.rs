@@ -260,7 +260,8 @@ impl Tool for BrowserTool {
             });
         }
 
-        // Validate navigate parameters BEFORE launching Chrome (avoid expensive startup for bad URLs)
+        // Validate navigate parameters BEFORE launching Chrome (avoid expensive startup for bad
+        // URLs)
         if input.action == "navigate" {
             let url = match &input.url {
                 Some(u) => u,

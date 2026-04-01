@@ -637,8 +637,9 @@ impl MatrixChannel {
         register_user_via_appservice(&self.http, &self.homeserver, &self.as_token, localpart).await
     }
 
-    /// Generate a Matrix Appservice registration YAML file at `{data_dir}/matrix-appservice-registration.yaml`.
-    /// Returns the file path. Does NOT overwrite existing files.
+    /// Generate a Matrix Appservice registration YAML file at
+    /// `{data_dir}/matrix-appservice-registration.yaml`. Returns the file path. Does NOT
+    /// overwrite existing files.
     pub fn generate_registration(&self, data_dir: &std::path::Path) -> Result<PathBuf> {
         use std::io::Write;
         let path = data_dir.join("matrix-appservice-registration.yaml");
@@ -1779,13 +1780,14 @@ impl MatrixChannel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
 
     use axum::extract::State;
     use axum::http::{Method, Uri};
     use axum::routing::any;
     use tokio::sync::Mutex;
+
+    use super::*;
 
     fn make_channel() -> MatrixChannel {
         MatrixChannel::new(

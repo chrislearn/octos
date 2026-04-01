@@ -47,8 +47,9 @@ pub fn drain_pending(rx: &mut SteeringReceiver) -> Vec<SteeringMessage> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use octos_core::MessageRole;
+
+    use super::*;
 
     #[tokio::test]
     async fn should_send_and_receive_follow_up() {

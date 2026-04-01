@@ -6,10 +6,9 @@ use std::path::Path;
 
 use tracing::warn;
 
+use super::manifest::{PluginManifest, SkillHookDef, SkillMcpServer};
 use crate::hooks::HookConfig;
 use crate::mcp::McpServerConfig;
-
-use super::manifest::{PluginManifest, SkillHookDef, SkillMcpServer};
 
 /// Resolved extras from a skill manifest, ready to merge into agent config.
 #[derive(Debug, Default)]
@@ -25,8 +24,8 @@ pub struct SkillExtras {
 
 /// Resolve manifest extras against the skill directory.
 ///
-/// - MCP: resolves relative commands against `skill_dir`, looks up env var names
-///   from the process environment.
+/// - MCP: resolves relative commands against `skill_dir`, looks up env var names from the process
+///   environment.
 /// - Hooks: parses event strings into `HookEvent`, resolves relative command paths.
 /// - Prompts: expands glob patterns against `skill_dir`, reads `.md` files.
 pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtras {

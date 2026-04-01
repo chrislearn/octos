@@ -325,7 +325,8 @@ impl Channel for TwilioChannel {
                 }
             }
 
-            // Use full From value as sender_id (preserves "whatsapp:" prefix for correct reply routing)
+            // Use full From value as sender_id (preserves "whatsapp:" prefix for correct reply
+            // routing)
             let sender_id = &from;
             let clean_sender = TwilioChannel::clean_number(&from);
 

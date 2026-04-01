@@ -171,10 +171,11 @@ impl Tool for ActivateToolsTool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tools::ToolRegistry;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    use super::*;
+    use crate::tools::ToolRegistry;
 
     #[tokio::test]
     async fn should_list_deferred_groups_when_no_args() {

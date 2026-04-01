@@ -72,8 +72,7 @@ fn elapsed_str(start: Instant) -> String {
 }
 
 // ===========================================================================
-// 1. PROVIDER CONNECTIVITY
-//    Isolate: can we even reach the LLM API?
+// 1. PROVIDER CONNECTIVITY Isolate: can we even reach the LLM API?
 // ===========================================================================
 
 #[tokio::test]
@@ -178,8 +177,7 @@ async fn test_01_dashscope_connectivity() {
 }
 
 // ===========================================================================
-// 2. SINGLE-NODE PIPELINE
-//    Isolate: executor + CodergenHandler + agent loop
+// 2. SINGLE-NODE PIPELINE Isolate: executor + CodergenHandler + agent loop
 // ===========================================================================
 
 #[tokio::test]
@@ -294,8 +292,7 @@ async fn test_02_single_node_shell() {
 }
 
 // ===========================================================================
-// 3. MULTI-NODE SEQUENTIAL PIPELINE
-//    Isolate: edge selection + input forwarding between nodes
+// 3. MULTI-NODE SEQUENTIAL PIPELINE Isolate: edge selection + input forwarding between nodes
 // ===========================================================================
 
 #[tokio::test]
@@ -424,8 +421,7 @@ async fn test_03_conditional_branching() {
 }
 
 // ===========================================================================
-// 4. VARIABLE SUBSTITUTION
-//    Isolate: template variables in prompts
+// 4. VARIABLE SUBSTITUTION Isolate: template variables in prompts
 // ===========================================================================
 
 #[tokio::test]
@@ -469,8 +465,7 @@ async fn test_04_variable_substitution() {
 }
 
 // ===========================================================================
-// 5. FILE I/O WITHIN PIPELINES
-//    Isolate: can pipeline nodes read and write files in working_dir?
+// 5. FILE I/O WITHIN PIPELINES Isolate: can pipeline nodes read and write files in working_dir?
 // ===========================================================================
 
 #[tokio::test]
@@ -589,9 +584,8 @@ async fn test_05_write_then_read_chain() {
 }
 
 // ===========================================================================
-// 6. SEND FILE TOOL (file upload to chat)
-//    Isolate: SendFileTool → OutboundMessage.media flow
-//    No real channel needed — capture via mpsc
+// 6. SEND FILE TOOL (file upload to chat) Isolate: SendFileTool → OutboundMessage.media flow No
+//    real channel needed — capture via mpsc
 // ===========================================================================
 
 #[tokio::test]
@@ -762,8 +756,8 @@ async fn test_06_send_file_no_context() {
 }
 
 // ===========================================================================
-// 7. FILE RECEIVING (InboundMessage.media)
-//    Isolate: inbound messages with media paths get passed to agents
+// 7. FILE RECEIVING (InboundMessage.media) Isolate: inbound messages with media paths get passed to
+//    agents
 // ===========================================================================
 
 #[tokio::test]
@@ -851,8 +845,7 @@ async fn test_07_outbound_message_carries_media() {
 }
 
 // ===========================================================================
-// 8. TIMEOUT BEHAVIOR
-//    Isolate: does the pipeline-level timeout work?
+// 8. TIMEOUT BEHAVIOR Isolate: does the pipeline-level timeout work?
 // ===========================================================================
 
 #[tokio::test]
@@ -899,8 +892,7 @@ async fn test_09_shell_timeout() {
 }
 
 // ===========================================================================
-// 10. RETRY BEHAVIOR
-//     Isolate: does max_retries with exponential backoff work?
+// 10. RETRY BEHAVIOR Isolate: does max_retries with exponential backoff work?
 // ===========================================================================
 
 #[tokio::test]
@@ -934,8 +926,7 @@ async fn test_10_shell_retry_on_error() {
 }
 
 // ===========================================================================
-// 11. MIXED HANDLERS IN ONE PIPELINE
-//     Isolate: codergen → shell → gate chain
+// 11. MIXED HANDLERS IN ONE PIPELINE Isolate: codergen → shell → gate chain
 // ===========================================================================
 
 #[tokio::test]
@@ -983,8 +974,7 @@ async fn test_11_mixed_handlers() {
 }
 
 // ===========================================================================
-// 12. ERROR PROPAGATION
-//     Isolate: what happens when a node fails?
+// 12. ERROR PROPAGATION Isolate: what happens when a node fails?
 // ===========================================================================
 
 #[tokio::test]
@@ -1030,8 +1020,7 @@ async fn test_12_node_failure_propagation() {
 }
 
 // ===========================================================================
-// 13. DOT PARSE VALIDATION
-//     Isolate: does malformed DOT fail gracefully?
+// 13. DOT PARSE VALIDATION Isolate: does malformed DOT fail gracefully?
 // ===========================================================================
 
 #[tokio::test]
@@ -1070,8 +1059,7 @@ async fn test_13_empty_graph_error() {
 }
 
 // ===========================================================================
-// 14. TOKEN TRACKING ACROSS NODES
-//     Isolate: are tokens accumulated correctly across pipeline nodes?
+// 14. TOKEN TRACKING ACROSS NODES Isolate: are tokens accumulated correctly across pipeline nodes?
 // ===========================================================================
 
 #[tokio::test]
@@ -1136,8 +1124,8 @@ async fn test_14_token_accumulation() {
 }
 
 // ===========================================================================
-// 15. DEEP RESEARCH PIPELINE (realistic end-to-end)
-//     This is the real workflow that gets "network error"
+// 15. DEEP RESEARCH PIPELINE (realistic end-to-end) This is the real workflow that gets "network
+//     error"
 // ===========================================================================
 
 #[tokio::test]
@@ -1262,8 +1250,7 @@ async fn test_16_goal_gate_early_exit() {
 }
 
 // ===========================================================================
-// 17. NODE SUMMARY REPORTING
-//     Isolate: do we get correct per-node summaries?
+// 17. NODE SUMMARY REPORTING Isolate: do we get correct per-node summaries?
 // ===========================================================================
 
 #[tokio::test]
@@ -1311,9 +1298,9 @@ async fn test_17_node_summaries_complete() {
 }
 
 // ===========================================================================
-// 18. WRITE_FILE + SEND_FILE PIPELINE (Telegram test report: 3.1.6)
-//     Bug: "Bot completes write_file but sends no confirmation reply"
-//     Isolate: write_file → send_file → verify outbound message produced
+// 18. WRITE_FILE + SEND_FILE PIPELINE (Telegram test report: 3.1.6) Bug: "Bot completes write_file
+//     but sends no confirmation reply" Isolate: write_file → send_file → verify outbound message
+//     produced
 // ===========================================================================
 
 #[tokio::test]
@@ -1368,9 +1355,8 @@ async fn test_18_write_file_produces_output() {
 }
 
 // ===========================================================================
-// 19. FILE UPLOAD → READ CHAIN (Telegram test report: 3.1.7)
-//     Bug: "Telegram file upload, Bot can't find file in next message"
-//     Isolate: file exists in working_dir, agent can read it
+// 19. FILE UPLOAD → READ CHAIN (Telegram test report: 3.1.7) Bug: "Telegram file upload, Bot can't
+//     find file in next message" Isolate: file exists in working_dir, agent can read it
 // ===========================================================================
 
 #[tokio::test]
@@ -1488,8 +1474,8 @@ async fn test_19_translate_uploaded_file() {
 }
 
 // ===========================================================================
-// 20. SEND_FILE COMPLETE FLOW (file write → send → verify outbound)
-//     Isolate: pipeline node writes file, then SendFileTool delivers it
+// 20. SEND_FILE COMPLETE FLOW (file write → send → verify outbound) Isolate: pipeline node writes
+//     file, then SendFileTool delivers it
 // ===========================================================================
 
 #[tokio::test]
@@ -1532,8 +1518,8 @@ async fn test_20_send_file_after_write() {
 }
 
 // ===========================================================================
-// 21. MULTIPLE FILE OUTPUTS (realistic pipeline scenario)
-//     A pipeline that produces multiple files and sends them all
+// 21. MULTIPLE FILE OUTPUTS (realistic pipeline scenario) A pipeline that produces multiple files
+//     and sends them all
 // ===========================================================================
 
 #[tokio::test]
@@ -1581,8 +1567,8 @@ async fn test_21_send_multiple_files() {
 }
 
 // ===========================================================================
-// 22. INBOUND MEDIA → AGENT CONTEXT
-//     Verify the full path: InboundMessage.media → agent sees file paths
+// 22. INBOUND MEDIA → AGENT CONTEXT Verify the full path: InboundMessage.media → agent sees file
+//     paths
 // ===========================================================================
 
 #[tokio::test]
@@ -1656,8 +1642,7 @@ async fn test_22_inbound_media_empty_content_gets_placeholder() {
 }
 
 // ===========================================================================
-// 23. LARGE FILE HANDLING
-//     Verify SendFileTool handles large files without corruption
+// 23. LARGE FILE HANDLING Verify SendFileTool handles large files without corruption
 // ===========================================================================
 
 #[tokio::test]
@@ -1703,8 +1688,8 @@ async fn test_23_send_large_file() {
 }
 
 // ===========================================================================
-// 24. CONCURRENT PIPELINE NODES DON'T CORRUPT WORKING DIR
-//     When parallel nodes write files, they shouldn't step on each other
+// 24. CONCURRENT PIPELINE NODES DON'T CORRUPT WORKING DIR When parallel nodes write files, they
+//     shouldn't step on each other
 // ===========================================================================
 
 #[tokio::test]

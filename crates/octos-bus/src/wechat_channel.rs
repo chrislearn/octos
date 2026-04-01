@@ -1,7 +1,8 @@
 //! WeChat channel — connects to wechat-bridge via WebSocket.
 //!
 //! The bridge maintains the persistent WeChat long-poll connection.
-//! This channel just translates between the bridge's WS protocol and octos InboundMessage/OutboundMessage.
+//! This channel just translates between the bridge's WS protocol and octos
+//! InboundMessage/OutboundMessage.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,12 +12,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use eyre::{Result, bail};
 use futures::{SinkExt, StreamExt};
+use octos_core::{InboundMessage, OutboundMessage};
 use serde_json::json;
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
-
-use octos_core::{InboundMessage, OutboundMessage};
 
 use crate::channel::Channel;
 

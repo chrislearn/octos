@@ -12,9 +12,10 @@
 //!   - STRONG → best "strong" model (lowest score from AdaptiveRouter, prefer cheaper)
 //!   - FAST → best "fast" model (lowest score, prefer cheaper)
 
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct HookPayload {

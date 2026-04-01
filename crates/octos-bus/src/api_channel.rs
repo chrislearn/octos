@@ -10,13 +10,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use axum::Json;
-use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use axum::{Json, Router};
 use chrono::Utc;
 use eyre::Result;
 use octos_core::{InboundMessage, OutboundMessage, SessionKey};

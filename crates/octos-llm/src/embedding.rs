@@ -2,11 +2,9 @@
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-
 use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
 
 use crate::provider::truncate_error_body;
 

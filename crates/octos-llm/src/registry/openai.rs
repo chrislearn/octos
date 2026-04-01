@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use eyre::Result;
 
+use super::{CreateParams, ProviderEntry};
 use crate::openai::OpenAIProvider;
 use crate::openai_responses::{OpenAIResponsesProvider, is_responses_capable};
 use crate::provider::LlmProvider;
-
-use super::{CreateParams, ProviderEntry};
 
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "openai",

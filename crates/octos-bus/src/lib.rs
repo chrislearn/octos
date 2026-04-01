@@ -41,30 +41,29 @@ pub(crate) mod wecom_crypto;
 #[cfg(feature = "whatsapp")]
 pub mod whatsapp_channel;
 
+#[cfg(feature = "api")]
+pub use api_channel::ApiChannel;
 pub use bus::{AgentHandle, BusPublisher, create_bus};
 pub use channel::{Channel, ChannelHealth, ChannelManager};
 pub use cli_channel::CliChannel;
 pub use cron_service::CronService;
 pub use cron_types::{CronJob, CronPayload, CronSchedule, CronStore};
 pub use dedup::MessageDedup;
-pub use heartbeat::HeartbeatService;
-pub use session::{
-    ActiveSessionStore, Session, SessionHandle, SessionListEntry, SessionManager,
-    validate_topic_name,
-};
-
-#[cfg(feature = "api")]
-pub use api_channel::ApiChannel;
 #[cfg(feature = "discord")]
 pub use discord_channel::DiscordChannel;
 #[cfg(feature = "email")]
 pub use email_channel::EmailChannel;
 #[cfg(feature = "feishu")]
 pub use feishu_channel::FeishuChannel;
+pub use heartbeat::HeartbeatService;
 #[cfg(feature = "matrix")]
 pub use matrix_channel::{BotEntry, BotManager, BotRouter, BotVisibility, MatrixChannel};
 #[cfg(feature = "qq-bot")]
 pub use qq_bot_channel::QQBotChannel;
+pub use session::{
+    ActiveSessionStore, Session, SessionHandle, SessionListEntry, SessionManager,
+    validate_topic_name,
+};
 #[cfg(feature = "slack")]
 pub use slack_channel::SlackChannel;
 #[cfg(feature = "telegram")]

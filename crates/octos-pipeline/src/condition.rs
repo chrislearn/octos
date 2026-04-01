@@ -320,9 +320,10 @@ impl<'a> ExprParser<'a> {
 
 #[cfg(test)]
 mod tests {
+    use octos_core::TokenUsage;
+
     use super::*;
     use crate::graph::{NodeOutcome, OutcomeStatus};
-    use octos_core::TokenUsage;
 
     fn outcome(status: OutcomeStatus, content: &str) -> NodeOutcome {
         NodeOutcome {

@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use eyre::Result;
 
+use super::{CreateParams, ProviderEntry};
 use crate::anthropic::AnthropicProvider;
 use crate::openai::OpenAIProvider;
 use crate::provider::LlmProvider;
-
-use super::{CreateParams, ProviderEntry};
 
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "r9s",

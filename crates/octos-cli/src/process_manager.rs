@@ -1157,10 +1157,12 @@ fn find_node() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use chrono::Utc;
+
     use super::*;
     use crate::profiles::{ProfileConfig, ProfileStore, UserProfile};
-    use chrono::Utc;
-    use std::sync::Arc;
 
     /// Create a temporary ProfileStore backed by a real temp directory.
     fn temp_profile_store() -> (tempfile::TempDir, Arc<ProfileStore>) {
@@ -1627,7 +1629,10 @@ mod tests {
         let ports = [BRIDGE_BASE_WS_PORT, WEBHOOK_BASE_PORT, API_BASE_PORT];
         for i in 0..ports.len() {
             for j in (i + 1)..ports.len() {
-                assert_ne!(ports[i], ports[j], "base port collision at index {i} and {j}");
+                assert_ne!(
+                    ports[i], ports[j],
+                    "base port collision at index {i} and {j}"
+                );
             }
         }
         // Bridge ports are in the 3000s, webhook/api in the 9000s.

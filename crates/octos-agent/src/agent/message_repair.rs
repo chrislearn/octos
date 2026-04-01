@@ -139,8 +139,8 @@ pub(crate) fn normalize_system_messages(messages: &mut Vec<Message>) {
 /// user messages, system messages, or other threads' tool_call groups.
 ///
 /// Strategy:
-/// 1. For each assistant with tool_calls, extract ALL matching tool results
-///    from the entire message list (both before and after the assistant).
+/// 1. For each assistant with tool_calls, extract ALL matching tool results from the entire message
+///    list (both before and after the assistant).
 /// 2. Deduplicate by tool_call_id (keep the latest result for each ID).
 /// 3. Re-insert exactly one result per tool_call right after the assistant.
 ///

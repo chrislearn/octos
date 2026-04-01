@@ -170,8 +170,9 @@ fn find_tool_name(tool_msg: &Message, messages: &[Message]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use octos_core::ToolCall;
+
+    use super::*;
 
     fn user_msg(content: &str) -> Message {
         Message {

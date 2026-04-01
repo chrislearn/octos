@@ -82,8 +82,9 @@ pub enum EpisodeOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     #[test]
     fn test_episode_new() {

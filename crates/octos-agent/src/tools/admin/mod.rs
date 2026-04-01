@@ -177,9 +177,10 @@ pub fn register_admin_api_tools(registry: &mut ToolRegistry, ctx: Arc<AdminApiCo
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    use super::*;
 
     async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
         let mut buffer = Vec::new();

@@ -1222,9 +1222,10 @@ pub fn validate_topic_name(topic: &str) -> std::result::Result<(), &'static str>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use octos_core::MessageRole;
     use tempfile::TempDir;
+
+    use super::*;
 
     fn make_message(role: MessageRole, content: &str) -> Message {
         Message {
@@ -1392,8 +1393,14 @@ mod tests {
 
         assert_eq!(mgr.get_or_create(&k1).await.messages.len(), 1);
         assert_eq!(mgr.get_or_create(&k2).await.messages.len(), 1);
-        assert_eq!(mgr.get_or_create(&k1).await.messages[0].content, "from chat1");
-        assert_eq!(mgr.get_or_create(&k2).await.messages[0].content, "from chat2");
+        assert_eq!(
+            mgr.get_or_create(&k1).await.messages[0].content,
+            "from chat1"
+        );
+        assert_eq!(
+            mgr.get_or_create(&k2).await.messages[0].content,
+            "from chat2"
+        );
     }
 
     #[tokio::test]
@@ -1516,6 +1523,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_session_processing() {
         use std::sync::Arc;
+
         use tokio::sync::Mutex;
 
         let tmp = TempDir::new().unwrap();

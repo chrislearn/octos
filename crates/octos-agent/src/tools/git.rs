@@ -494,8 +494,9 @@ fn git_blame(cwd: &std::path::Path, path: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     fn setup_git_repo() -> TempDir {
         let dir = TempDir::new().unwrap();

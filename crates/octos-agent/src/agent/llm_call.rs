@@ -3,8 +3,7 @@
 use std::time::{Duration, Instant};
 
 use eyre::Result;
-use octos_core::Message;
-use octos_core::TokenUsage;
+use octos_core::{Message, TokenUsage};
 use octos_llm::{ChatConfig, ChatResponse, StopReason, ToolSpec};
 use tracing::{info, warn};
 

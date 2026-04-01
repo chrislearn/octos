@@ -132,8 +132,9 @@ impl Default for ThreadRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use octos_core::Message;
+
+    use super::*;
 
     #[test]
     fn should_create_empty_thread() {

@@ -332,10 +332,12 @@ impl ChannelManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use chrono::Utc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chrono::Utc;
     use tokio::sync::Mutex;
+
+    use super::*;
 
     struct MockChannel {
         channel_name: String,

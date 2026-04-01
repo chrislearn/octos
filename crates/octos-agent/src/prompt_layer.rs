@@ -123,8 +123,9 @@ fn read_prompt_file(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn should_build_base_only() {

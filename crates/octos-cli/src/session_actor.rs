@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 use octos_agent::tools::{MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry};
 use octos_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
-use octos_core::AgentId;
 use octos_core::{
-    InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
+    AgentId, InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
     OutboundMessage, SessionKey,
 };
 use octos_llm::{
@@ -581,19 +580,17 @@ impl ActorFactory {
 
         // Wire background result sender for spawn_only tool lifecycle notifications
         let bg_tx2 = tx.clone();
-        tools.set_background_result_sender(Arc::new(
-            move |task_label: String, content: String| {
-                let tx = bg_tx2.clone();
-                Box::pin(async move {
-                    tx.send(ActorMessage::BackgroundResult {
-                        task_label,
-                        content,
-                    })
-                    .await
-                    .is_ok()
+        tools.set_background_result_sender(Arc::new(move |task_label: String, content: String| {
+            let tx = bg_tx2.clone();
+            Box::pin(async move {
+                tx.send(ActorMessage::BackgroundResult {
+                    task_label,
+                    content,
                 })
-            },
-        ));
+                .await
+                .is_ok()
+            })
+        }));
 
         let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
             let cron_tool = Arc::new(CronTool::with_context(
@@ -2702,7 +2699,8 @@ impl SessionActor {
                 "sustained latency degradation detected, activating auto-protection"
             );
             self.responsiveness.set_active(true);
-            // Escalate: hedge routing (race providers) + speculative queue (unblock for new messages)
+            // Escalate: hedge routing (race providers) + speculative queue (unblock for new
+            // messages)
             self.queue_mode = QueueMode::Speculative;
             if let Some(ref router) = self.adaptive_router {
                 router.set_mode(AdaptiveMode::Hedge);
@@ -3000,10 +2998,12 @@ fn format_thinking_prefix(reasoning: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
     use async_trait::async_trait;
     use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
-    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
 
     #[test]
     fn test_strip_think_tags() {

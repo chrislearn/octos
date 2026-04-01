@@ -206,9 +206,17 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
+use std::path::{Component, Path};
+
+pub use activate_tools::ActivateToolsTool;
+pub use browser::BrowserTool;
+#[cfg(feature = "ast")]
+pub use code_structure::CodeStructureTool;
 pub use deep_search::DeepSearchTool;
 pub use diff_edit::DiffEditTool;
 pub use edit_file::EditFileTool;
+#[cfg(feature = "git")]
+pub use git::GitTool;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use list_dir::ListDirTool;
@@ -222,21 +230,10 @@ pub use shell::ShellTool;
 pub use spawn::SpawnTool;
 pub use synthesize_research::SynthesizeResearchTool;
 pub use take_photo::TakePhotoTool;
+pub use tool_config::{ConfigureToolTool, ToolConfigStore};
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
-
-pub use activate_tools::ActivateToolsTool;
-pub use browser::BrowserTool;
-pub use tool_config::{ConfigureToolTool, ToolConfigStore};
-
-#[cfg(feature = "git")]
-pub use git::GitTool;
-
-#[cfg(feature = "ast")]
-pub use code_structure::CodeStructureTool;
-
-use std::path::{Component, Path};
 
 /// Resolve a user-provided path, ensuring it stays within base_dir.
 ///
@@ -478,8 +475,9 @@ mod nofollow_tests {
 
 #[cfg(test)]
 mod path_tests {
-    use super::*;
     use std::path::Path;
+
+    use super::*;
 
     #[test]
     fn test_resolve_rejects_absolute_path() {

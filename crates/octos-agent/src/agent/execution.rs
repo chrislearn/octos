@@ -398,7 +398,7 @@ impl Agent {
             };
 
         // Log completion of all parallel tools
-        let result_sizes: Vec<usize> = results.iter().map(|(m, _, _)| m.content.len()).collect();
+        let result_sizes: Vec<usize> = results.iter().map(|(m, ..)| m.content.len()).collect();
         let total_result_bytes: usize = result_sizes.iter().sum();
         tracing::info!(
             parallel_tools = results.len(),

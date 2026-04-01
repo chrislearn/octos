@@ -1,8 +1,7 @@
 //! Authentication and user self-service API handlers.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -13,10 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::admin::ProfileResponse;
+use super::router::AuthIdentity;
 use crate::profiles::mask_secrets;
 use crate::user_store::{User, UserRole};
-
-use super::router::AuthIdentity;
 
 /// In-memory rate limiter for OTP send requests: email -> (count, window_start).
 /// Allows at most 3 requests per 5-minute window per email address.
@@ -766,9 +764,10 @@ fn ensure_admin_profile(ps: &crate::profiles::ProfileStore) -> Result<(), Status
 
 #[cfg(test)]
 mod tests {
+    use axum::http::Request;
+
     use super::*;
     use crate::profiles::ProfileStore;
-    use axum::http::Request;
 
     fn temp_profile_store() -> (tempfile::TempDir, ProfileStore) {
         let dir = tempfile::tempdir().unwrap();

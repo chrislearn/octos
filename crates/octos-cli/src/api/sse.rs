@@ -99,8 +99,9 @@ pub(crate) fn event_to_json(event: &ProgressEvent) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     #[test]
     fn event_to_json_tool_started() {

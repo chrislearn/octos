@@ -7,12 +7,11 @@ mod bwrap;
 mod docker;
 mod macos;
 
+use std::path::Path;
+
 pub use bwrap::BwrapSandbox;
 pub use docker::DockerSandbox;
 pub use macos::MacosSandbox;
-
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
@@ -416,7 +415,10 @@ mod tests {
     #[test]
     fn test_sandbox_config_serde_defaults() {
         let config: SandboxConfig = serde_json::from_str("{}").unwrap();
-        assert!(config.enabled, "sandbox should be enabled by default when field is missing");
+        assert!(
+            config.enabled,
+            "sandbox should be enabled by default when field is missing"
+        );
         assert_eq!(config.mode, SandboxMode::Auto);
         assert!(!config.allow_network);
         assert_eq!(config.docker.image, "ubuntu:24.04");
@@ -424,8 +426,7 @@ mod tests {
 
     #[test]
     fn test_sandbox_config_explicit_disable() {
-        let config: SandboxConfig =
-            serde_json::from_str(r#"{"enabled": false}"#).unwrap();
+        let config: SandboxConfig = serde_json::from_str(r#"{"enabled": false}"#).unwrap();
         assert!(!config.enabled);
     }
 

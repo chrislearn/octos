@@ -19,18 +19,17 @@ mod status;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
-use eyre::Result;
-
 pub use account::AccountCommand;
 pub use admin::AdminCommand;
 pub use auth::AuthCommand;
 pub use channels::ChannelsCommand;
 pub use chat::ChatCommand;
+use clap::{Parser, Subcommand};
 pub use clean::CleanCommand;
 pub use completions::CompletionsCommand;
 pub use cron::CronCommand;
 pub use docs::DocsCommand;
+use eyre::Result;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
 pub use office::OfficeCommand;

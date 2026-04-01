@@ -643,8 +643,8 @@ pub async fn whatsapp_qr(
 ///
 /// Verify an LLM provider/model/key combo works. Accepts either:
 /// - `api_key`: raw key (for newly entered, unsaved keys)
-/// - `api_key_env`: env var name to resolve from the user's saved profile
-///   (used when the key is already saved and the frontend only has the masked value)
+/// - `api_key_env`: env var name to resolve from the user's saved profile (used when the key is
+///   already saved and the frontend only has the masked value)
 pub async fn test_provider(
     State(state): State<Arc<AppState>>,
     identity: Option<axum::Extension<super::router::AuthIdentity>>,
@@ -1621,7 +1621,7 @@ pub async fn list_platform_skills(
 
     // Build platform skills list
     let mut skills = Vec::new();
-    for &(name, _, _, _) in octos_agent::bundled_app_skills::PLATFORM_SKILLS {
+    for &(name, ..) in octos_agent::bundled_app_skills::PLATFORM_SKILLS {
         let is_installed = installed.iter().any(|s| s.name == name);
         skills.push(serde_json::json!({
             "name": name,

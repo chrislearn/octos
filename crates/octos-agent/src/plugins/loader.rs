@@ -7,14 +7,13 @@ use eyre::Result;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use super::extras::{SkillExtras, resolve_extras};
+use super::manifest::PluginManifest;
+use super::tool::PluginTool;
 use crate::hooks::HookConfig;
 use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
-
-use super::extras::{resolve_extras, SkillExtras};
-use super::manifest::PluginManifest;
-use super::tool::PluginTool;
 
 /// Aggregated result from loading plugins across directories.
 #[derive(Debug, Default)]
@@ -403,8 +402,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_hash_verification_pass() {
-        use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
+
+        use sha2::{Digest, Sha256};
 
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("hash-plugin");

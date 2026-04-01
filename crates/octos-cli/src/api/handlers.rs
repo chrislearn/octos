@@ -4,14 +4,12 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use octos_agent::Agent;
 use octos_core::{AgentId, Message, SessionKey};
 use serde::{Deserialize, Serialize};
-
-use axum::http::HeaderMap;
 
 use super::AppState;
 use super::metrics::MetricsReporter;

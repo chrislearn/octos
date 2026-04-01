@@ -43,10 +43,11 @@ impl AgentMessage {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::task::{Task, TaskContext, TaskKind, TaskResult, TokenUsage};
     use crate::types::AgentId;
-    use std::path::PathBuf;
 
     fn make_task() -> Task {
         Task::new(

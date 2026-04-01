@@ -107,9 +107,10 @@ impl CheckpointStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use octos_core::TokenUsage;
     use tempfile::TempDir;
+
+    use super::*;
 
     fn make_outcome(node_id: &str, status: OutcomeStatus) -> NodeOutcome {
         NodeOutcome {

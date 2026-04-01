@@ -15,8 +15,7 @@ use octos_llm::LlmProvider;
 use serde::Deserialize;
 use tracing::info;
 
-use super::research_utils;
-use super::{Tool, ToolResult};
+use super::{Tool, ToolResult, research_utils};
 
 pub struct SynthesizeResearchTool {
     llm: Arc<dyn LlmProvider>,

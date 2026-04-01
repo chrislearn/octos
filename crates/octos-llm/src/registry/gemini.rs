@@ -2,10 +2,9 @@ use std::sync::Arc;
 
 use eyre::Result;
 
+use super::{CreateParams, ProviderEntry};
 use crate::gemini::GeminiProvider;
 use crate::provider::LlmProvider;
-
-use super::{CreateParams, ProviderEntry};
 
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "gemini",

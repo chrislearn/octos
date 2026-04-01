@@ -115,8 +115,9 @@ pub struct PipelineRunSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn should_create_run_directory() {

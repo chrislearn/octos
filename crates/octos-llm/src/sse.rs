@@ -143,8 +143,9 @@ fn parse_event_block(block: &str) -> Option<SseEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use futures::StreamExt;
+
+    use super::*;
 
     fn make_stream(chunks: Vec<&str>) -> impl Stream<Item = String> + Send + 'static {
         let owned: Vec<String> = chunks.into_iter().map(|s| s.to_string()).collect();

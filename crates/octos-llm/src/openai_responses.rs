@@ -8,11 +8,9 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
 use octos_core::{Message, MessageRole};
-
 use reqwest::Client;
-use serde::Deserialize;
-
 use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
 
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
@@ -607,8 +605,9 @@ pub fn is_responses_capable(model: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use octos_core::{Message, MessageRole};
+
+    use super::*;
 
     fn msg(role: MessageRole, content: &str) -> Message {
         Message {

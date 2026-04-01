@@ -6,8 +6,10 @@
 //! The bridge never restarts, so the WeChat session stays alive even when the gateway restarts.
 //!
 //! Protocol (WebSocket JSON messages):
-//!   Bridge → Client: {"type":"message","sender":"xxx@im.wechat","content":"hello","context_token":"...","message_id":"123"}
-//!   Client → Bridge: {"type":"send","to":"xxx@im.wechat","text":"reply","context_token":"..."}
+//!   Bridge → Client:
+//! {"type":"message","sender":"xxx@im.wechat","content":"hello","context_token":"...","message_id":
+//! "123"}   Client → Bridge:
+//! {"type":"send","to":"xxx@im.wechat","text":"reply","context_token":"..."}
 //!
 //! Stdout events (read by ProcessManager):
 //!   {"type":"qr","qr_url":"https://..."}

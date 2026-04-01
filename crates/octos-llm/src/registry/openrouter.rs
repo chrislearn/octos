@@ -2,10 +2,9 @@ use std::sync::Arc;
 
 use eyre::Result;
 
+use super::{CreateParams, ProviderEntry};
 use crate::openrouter::OpenRouterProvider;
 use crate::provider::LlmProvider;
-
-use super::{CreateParams, ProviderEntry};
 
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "openrouter",

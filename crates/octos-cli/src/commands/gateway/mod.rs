@@ -15,16 +15,12 @@ use std::path::PathBuf;
 
 use clap::Args;
 use eyre::{Result, WrapErr};
-use octos_core::{MAIN_PROFILE_ID, SessionKey};
-use tracing::warn;
-
-use super::Executable;
-
 // Re-exports used by submodules (prompt, gateway_runtime)
 #[cfg(feature = "matrix")]
 use matrix_integration::*;
+use octos_core::{MAIN_PROFILE_ID, SessionKey};
 pub(crate) use prompt::build_system_prompt;
-
+use tracing::warn;
 // Types used by tests via `use super::*`
 #[cfg(test)]
 use {
@@ -35,6 +31,8 @@ use {
     std::sync::Arc,
     std::sync::atomic::{AtomicBool, AtomicUsize},
 };
+
+use super::Executable;
 
 /// Run as a persistent gateway daemon.
 #[derive(Debug, Args)]
@@ -166,14 +164,16 @@ impl GatewayCommand {
 
 #[cfg(all(test, feature = "matrix"))]
 mod tests {
-    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use chrono::Utc;
     use octos_agent::ToolConfigStore;
     use octos_bus::BotManager;
     use octos_memory::{EpisodeStore, MemoryStore};
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use tokio::sync::{Mutex, RwLock, mpsc};
+
+    use super::*;
 
     fn make_profile(id: &str, system_prompt: Option<&str>) -> crate::profiles::UserProfile {
         crate::profiles::UserProfile {

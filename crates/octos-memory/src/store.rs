@@ -412,10 +412,12 @@ impl EpisodeStore {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use octos_core::{AgentId, TaskId};
+
     use super::*;
     use crate::episode::{Episode, EpisodeOutcome};
-    use octos_core::{AgentId, TaskId};
-    use std::path::PathBuf;
 
     fn make_episode(summary: &str, cwd: &str) -> Episode {
         Episode::new(

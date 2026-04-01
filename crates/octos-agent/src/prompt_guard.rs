@@ -12,8 +12,8 @@
 //! Architectural controls are the real mitigations:
 //! - **Sandbox isolation** prevents tool-level damage regardless of prompt state.
 //! - **Tool policy** (allow/deny lists) restricts which tools the agent can invoke.
-//! - **Human-in-the-loop** (hook `before_tool_call` with exit code 1) blocks
-//!   high-impact actions pending user approval.
+//! - **Human-in-the-loop** (hook `before_tool_call` with exit code 1) blocks high-impact actions
+//!   pending user approval.
 //!
 //! This module provides logging and best-effort sanitization as an additional
 //! layer, not as a substitute for the above.

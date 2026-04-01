@@ -314,7 +314,8 @@ impl Channel for TelegramChannel {
                         // Extract text: plain text or caption (for photos/documents)
                         let mut text = msg.text().or(msg.caption()).unwrap_or("").to_string();
 
-                        // Mention-gating: in groups, only respond to @mentions, replies, or commands
+                        // Mention-gating: in groups, only respond to @mentions, replies, or
+                        // commands
                         let is_group = msg.chat.is_group() || msg.chat.is_supergroup();
                         let is_reply_to_bot = msg
                             .reply_to_message()

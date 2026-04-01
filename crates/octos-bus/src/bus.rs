@@ -78,8 +78,9 @@ pub fn create_bus() -> (AgentHandle, BusPublisher) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::Utc;
+
+    use super::*;
 
     fn make_inbound(content: &str) -> InboundMessage {
         InboundMessage {

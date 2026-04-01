@@ -180,8 +180,9 @@ impl ManagerOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     struct MockExecutor {
         results: HashMap<String, ChildResult>,

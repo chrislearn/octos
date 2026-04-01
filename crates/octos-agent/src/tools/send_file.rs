@@ -253,8 +253,9 @@ impl Tool for SendFileTool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_send_file() {

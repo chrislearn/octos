@@ -2,10 +2,9 @@ use std::sync::Arc;
 
 use eyre::Result;
 
+use super::{CreateParams, ProviderEntry};
 use crate::anthropic::AnthropicProvider;
 use crate::provider::LlmProvider;
-
-use super::{CreateParams, ProviderEntry};
 
 /// Z.AI uses the Anthropic Messages API protocol.
 pub const ENTRY: ProviderEntry = ProviderEntry {

@@ -7,8 +7,9 @@ use super::Agent;
 
 impl Agent {
     pub(super) fn trim_to_context_window(&self, messages: &mut Vec<Message>) {
-        use crate::compaction::{MIN_RECENT_MESSAGES, compact_messages, find_recent_boundary};
         use octos_llm::context::{estimate_message_tokens, estimate_tokens};
+
+        use crate::compaction::{MIN_RECENT_MESSAGES, compact_messages, find_recent_boundary};
 
         if messages.len() <= 1 + MIN_RECENT_MESSAGES {
             return;

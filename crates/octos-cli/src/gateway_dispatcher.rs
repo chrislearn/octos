@@ -480,10 +480,11 @@ pub(crate) fn make_reply(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
     use tokio::sync::mpsc;
 
+    use super::*;
     use crate::commands::gateway::build_profiled_session_key;
     use crate::session_actor::PendingMessages;
 

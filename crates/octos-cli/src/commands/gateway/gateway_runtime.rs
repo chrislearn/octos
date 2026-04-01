@@ -29,11 +29,13 @@ use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{info, warn};
 
-use super::build_system_prompt;
-use super::message_preprocessing;
+#[cfg(feature = "matrix")]
+use super::matrix_integration::*;
 use super::profile_factory::{ProfileActorFactoryBuilder, build_plugin_env};
-use super::{account_handler, adapters, skills_handler};
-use super::{build_profiled_session_key, resolve_dispatch_profile_id};
+use super::{
+    account_handler, adapters, build_profiled_session_key, build_system_prompt,
+    message_preprocessing, resolve_dispatch_profile_id, skills_handler,
+};
 use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
 use crate::commands::{load_prompt, resolve_data_dir};
 use crate::config::{Config, detect_provider};
@@ -41,9 +43,6 @@ use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
 use crate::session_actor::{ActorFactory, ActorRegistry, SnapshotToolRegistryFactory};
 use crate::status_layers::StatusComposer;
-
-#[cfg(feature = "matrix")]
-use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
 
@@ -684,9 +683,9 @@ impl GatewayRuntime {
                     }
                 }
 
-                // 2. Auto-register primary + fallback models so the LLM can see
-                //    all available models in the pipeline tool's model catalog.
-                //    Keys are "{provider}" or "{provider}-{n}" for duplicates.
+                // 2. Auto-register primary + fallback models so the LLM can see all available
+                //    models in the pipeline tool's model catalog. Keys are "{provider}" or
+                //    "{provider}-{n}" for duplicates.
                 if config.sub_providers.is_empty() {
                     // Register primary provider — use model name as key so the
                     // LLM sees the actual model (e.g. "kimi-k2.5") not the API
@@ -1270,7 +1269,8 @@ impl GatewayRuntime {
             pending_messages.clone(),
         );
 
-        // Create session command dispatcher (testable extraction of /new, /s, /sessions, /back, /delete)
+        // Create session command dispatcher (testable extraction of /new, /s, /sessions, /back,
+        // /delete)
         let session_dispatcher = crate::gateway_dispatcher::GatewayDispatcher::new(
             session_mgr.clone(),
             active_sessions.clone(),

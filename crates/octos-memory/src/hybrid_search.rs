@@ -369,7 +369,8 @@ mod tests {
         // Query embedding is close to ep2/ep3
         let results = index.search("rust programming", Some(&[0.0, 1.0, 0.0, 0.0]), 3);
         assert_eq!(results.len(), 3);
-        // With default weights (0.7 vector + 0.3 bm25), ep3 should rank well (has "rust" + close embedding)
+        // With default weights (0.7 vector + 0.3 bm25), ep3 should rank well (has "rust" + close
+        // embedding)
     }
 
     #[test]

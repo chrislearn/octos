@@ -7,12 +7,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::Result;
+use octos_agent::progress::{ProgressEvent, ProgressReporter};
 use octos_core::{AgentId, Task, TaskContext, TaskKind, TokenUsage};
 use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
 use tracing::{info, warn};
-
-use octos_agent::progress::{ProgressEvent, ProgressReporter};
 
 use crate::condition;
 use crate::graph::{HandlerKind, NodeOutcome, OutcomeStatus, PipelineNode};

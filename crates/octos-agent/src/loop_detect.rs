@@ -83,8 +83,9 @@ impl LoopDetector {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn should_not_detect_on_few_calls() {

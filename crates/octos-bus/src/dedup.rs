@@ -4,11 +4,11 @@
 //! multiple times on timeout/retry. This module provides a shared, TTL-aware
 //! dedup cache that any channel or the gateway dispatcher can use.
 
+use std::num::NonZeroUsize;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
-use std::num::NonZeroUsize;
-use std::sync::Mutex;
 
 /// Default capacity: 1000 message IDs.
 const DEFAULT_CAPACITY: usize = 1000;

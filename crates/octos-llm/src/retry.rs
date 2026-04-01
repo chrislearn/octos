@@ -473,7 +473,8 @@ mod tests {
     async fn test_chat_stream_retries_on_503() {
         let provider = RetryProvider {
             inner: Arc::new(FailingStreamProvider {
-                remaining_failures: std::sync::atomic::AtomicU32::new(2), // fail twice, then succeed
+                remaining_failures: std::sync::atomic::AtomicU32::new(2), /* fail twice, then
+                                                                           * succeed */
             }),
             config: RetryConfig {
                 max_retries: 3,

@@ -27,7 +27,8 @@ pub struct Config {
     #[serde(default)]
     pub base_url: Option<String>,
 
-    /// Environment variable name for API key (default: ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY).
+    /// Environment variable name for API key (default: ANTHROPIC_API_KEY, OPENAI_API_KEY, or
+    /// GEMINI_API_KEY).
     #[serde(default)]
     pub api_key_env: Option<String>,
 
@@ -1070,9 +1071,11 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.tool_policy_by_provider.len(), 2);
         assert!(config.tool_policy_by_provider.contains_key("gemini"));
-        assert!(config
-            .tool_policy_by_provider
-            .contains_key("claude-sonnet-4-20250514"));
+        assert!(
+            config
+                .tool_policy_by_provider
+                .contains_key("claude-sonnet-4-20250514")
+        );
     }
 
     #[test]

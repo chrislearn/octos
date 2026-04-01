@@ -300,12 +300,10 @@ impl WeComChannel {
 
     /// Run webhook HTTP server.
     async fn start_webhook(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
-        use axum::{
-            Router,
-            extract::{Query, State},
-            response::IntoResponse,
-            routing::get,
-        };
+        use axum::Router;
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::routing::get;
 
         #[derive(Clone)]
         struct WebhookState {

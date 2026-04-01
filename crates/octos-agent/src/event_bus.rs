@@ -145,9 +145,10 @@ impl EventSubscriber for CollectingSubscriber {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::progress::SilentReporter;
-    use std::time::Duration;
 
     #[test]
     fn should_dispatch_to_subscribers() {

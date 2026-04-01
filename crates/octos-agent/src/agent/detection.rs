@@ -69,9 +69,10 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use octos_core::ToolCall;
     use octos_llm::{ChatResponse, StopReason, TokenUsage as LlmTokenUsage};
+
+    use super::*;
 
     fn make_response(
         content: Option<&str>,

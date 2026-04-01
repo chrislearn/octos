@@ -12,12 +12,12 @@ mod static_files;
 pub mod user_admin;
 pub mod webhook_proxy;
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 pub use metrics::init_metrics;
 pub use router::build_router;
 pub use sse::SseBroadcaster;
-
-use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::otp::AuthManager;
 use crate::process_manager::ProcessManager;

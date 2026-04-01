@@ -4,18 +4,15 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
 use octos_core::{Message, MessageRole};
-
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-
 use secrecy::{ExposeSecret, SecretString};
-
-use crate::vision;
+use serde::{Deserialize, Serialize};
 
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
 use crate::sse::SseEvent;
 use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
+use crate::vision;
 
 /// Declarative hints about model API behavior.
 ///
@@ -728,10 +725,11 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
+    use octos_core::{Message, MessageRole};
+
     use super::*;
     use crate::config::ChatConfig;
     use crate::provider::LlmProvider;
-    use octos_core::{Message, MessageRole};
 
     fn msg(content: &str) -> Message {
         Message {

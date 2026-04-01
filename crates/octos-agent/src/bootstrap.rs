@@ -114,14 +114,13 @@ pub fn bootstrap_single_skill(octos_home: &Path, name: &str) -> bool {
     };
 
     // Determine which list this skill belongs to and its target directory
-    let (entry, subdir) =
-        if let Some(e) = BUNDLED_APP_SKILLS.iter().find(|&&(d, _, _, _)| d == name) {
-            (e, BUNDLED_APP_SKILLS_DIR)
-        } else if let Some(e) = PLATFORM_SKILLS.iter().find(|&&(d, _, _, _)| d == name) {
-            (e, PLATFORM_SKILLS_DIR)
-        } else {
-            return false;
-        };
+    let (entry, subdir) = if let Some(e) = BUNDLED_APP_SKILLS.iter().find(|&&(d, ..)| d == name) {
+        (e, BUNDLED_APP_SKILLS_DIR)
+    } else if let Some(e) = PLATFORM_SKILLS.iter().find(|&&(d, ..)| d == name) {
+        (e, PLATFORM_SKILLS_DIR)
+    } else {
+        return false;
+    };
 
     let &(dir_name, binary_name, skill_md, manifest_json) = entry;
 

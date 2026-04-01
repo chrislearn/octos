@@ -288,9 +288,11 @@ impl ServeCommand {
             let ps = profile_store.clone();
             let pm = process_manager.clone();
             tokio::spawn(async move {
-                use crate::profiles::{ProfileChange, UserProfile, diff_profiles};
-                use sha2::{Digest, Sha256};
                 use std::collections::HashMap;
+
+                use sha2::{Digest, Sha256};
+
+                use crate::profiles::{ProfileChange, UserProfile, diff_profiles};
 
                 // Snapshot of known profile states: (hash, profile)
                 let mut known: HashMap<String, ([u8; 32], UserProfile)> = HashMap::new();
@@ -415,9 +417,10 @@ impl ServeCommand {
 
         // Start monitor (watchdog + health checks + alerts)
         {
-            use crate::monitor::{FeishuAlertSender, Monitor, TelegramAlertSender};
             use std::sync::atomic::AtomicBool;
             use std::time::Duration;
+
+            use crate::monitor::{FeishuAlertSender, Monitor, TelegramAlertSender};
 
             let monitor_cfg = config.monitor.clone();
 
@@ -510,12 +513,12 @@ impl ServeCommand {
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-                println!();
-                println!("{}", "Shutting down server...".yellow());
-            })
-            .await?;
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            println!();
+            println!("{}", "Shutting down server...".yellow());
+        })
+        .await?;
 
         // Stop all gateway child processes before exiting
         tracing::info!("stopping all gateway child processes");

@@ -411,7 +411,7 @@ fn should_isolate_two_users_simultaneously() {
 
     // User A writes to own workspace
     let profile_a = octos_sbpl(&real_a, false);
-    let (code_a, _, _) = run_sandboxed(
+    let (code_a, ..) = run_sandboxed(
         &profile_a,
         &format!("echo 'user_a_data' > {workspace_a}/data.txt"),
     );
@@ -419,7 +419,7 @@ fn should_isolate_two_users_simultaneously() {
 
     // User B writes to own workspace
     let profile_b = octos_sbpl(&real_b, false);
-    let (code_b, _, _) = run_sandboxed(
+    let (code_b, ..) = run_sandboxed(
         &profile_b,
         &format!("echo 'user_b_data' > {workspace_b}/data.txt"),
     );
@@ -491,7 +491,7 @@ fn should_restrict_reads_when_configured() {
 "#;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/nobody".into());
     if std::path::Path::new(&home).exists() {
-        let (code, _, _) = run_sandboxed(deny_profile, &format!("ls {home}"));
+        let (code, ..) = run_sandboxed(deny_profile, &format!("ls {home}"));
         assert_ne!(code, 0, "should deny reading /Users with deny-list SBPL");
     }
 }
@@ -611,8 +611,9 @@ fn should_reject_symlink_in_write_no_follow() {
 
 #[test]
 fn should_block_private_ips() {
-    use octos_agent::tools::ssrf::is_private_ip;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use octos_agent::tools::ssrf::is_private_ip;
 
     // Private ranges
     assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));

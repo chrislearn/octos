@@ -10,14 +10,9 @@ use axum::routing::{delete, get, post, put};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use super::AppState;
-use super::admin;
-use super::auth_handlers;
-use super::handlers;
-use super::metrics;
-use super::static_files;
-use super::user_admin;
-use super::webhook_proxy;
+use super::{
+    AppState, admin, auth_handlers, handlers, metrics, static_files, user_admin, webhook_proxy,
+};
 use crate::user_store::UserRole;
 
 /// Authentication identity extracted by the auth middleware.
@@ -537,8 +532,9 @@ async fn admin_auth_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use axum::http::Request;
+
+    use super::*;
 
     #[test]
     fn test_constant_time_eq_equal() {

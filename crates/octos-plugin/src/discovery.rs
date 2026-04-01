@@ -142,9 +142,11 @@ fn load_plugin_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
+
     use tempfile::TempDir;
+
+    use super::*;
 
     fn write_manifest(dir: &Path, name: &str, json: &str) {
         let plugin_dir = dir.join(name);

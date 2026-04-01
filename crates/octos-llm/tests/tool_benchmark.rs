@@ -1,10 +1,12 @@
 //! Tool Use Capability Benchmark Suite
 //!
 //! Tests all configured LLM providers for tool calling stability, quality, and stress.
-//! Uses real API calls — run with: `cargo test -p octos-llm --test tool_benchmark -- --ignored --nocapture`
+//! Uses real API calls — run with: `cargo test -p octos-llm --test tool_benchmark -- --ignored
+//! --nocapture`
 //!
-//! Quick rank (stability only): `cargo test -p octos-llm --test tool_benchmark stability -- --ignored --nocapture`
-//! Full suite: `cargo test -p octos-llm --test tool_benchmark full_benchmark -- --ignored --nocapture`
+//! Quick rank (stability only): `cargo test -p octos-llm --test tool_benchmark stability --
+//! --ignored --nocapture` Full suite: `cargo test -p octos-llm --test tool_benchmark full_benchmark
+//! -- --ignored --nocapture`
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

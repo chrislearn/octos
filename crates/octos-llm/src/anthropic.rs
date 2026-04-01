@@ -4,17 +4,14 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
 use octos_core::Message;
-
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-
 use secrecy::{ExposeSecret, SecretString};
-
-use crate::vision;
+use serde::{Deserialize, Serialize};
 
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
 use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
+use crate::vision;
 
 /// Anthropic Claude provider.
 pub struct AnthropicProvider {
@@ -458,8 +455,9 @@ fn map_anthropic_sse(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use octos_core::{Message, MessageRole};
+
+    use super::*;
 
     fn msg(role: MessageRole, content: &str) -> Message {
         Message {

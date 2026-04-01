@@ -280,8 +280,9 @@ impl ExecEnvironment for DockerEnvironment {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[tokio::test]
     async fn should_exec_local_command() {

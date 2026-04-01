@@ -106,7 +106,8 @@ impl RunPipelineTool {
                         dot = %dot_preview,
                         "inline DOT parse failed, trying named fallback: {parse_err}"
                     );
-                    // Try to extract a pipeline name hint from the DOT (e.g. "digraph deep_research")
+                    // Try to extract a pipeline name hint from the DOT (e.g. "digraph
+                    // deep_research")
                     if let Some(name) = trimmed
                         .strip_prefix("digraph ")
                         .and_then(|s| s.split_whitespace().next())
@@ -306,11 +307,7 @@ impl Tool for RunPipelineTool {
         }
 
         // Also set files_to_send so the execution loop auto-delivers
-        let files_to_send = report_file
-            .iter()
-            .filter(|p| p.exists())
-            .cloned()
-            .collect();
+        let files_to_send = report_file.iter().filter(|p| p.exists()).cloned().collect();
 
         Ok(ToolResult {
             output: format!(

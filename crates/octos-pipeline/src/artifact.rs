@@ -103,8 +103,9 @@ impl ArtifactStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn should_store_small_in_memory() {

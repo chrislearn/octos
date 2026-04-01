@@ -120,7 +120,9 @@ fn geocode(client: &reqwest::blocking::Client, city: &str) -> GeoLocation {
         let url = if lang.is_empty() {
             format!("https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=5")
         } else {
-            format!("https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=5&language={lang}")
+            format!(
+                "https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=5&language={lang}"
+            )
         };
 
         if let Ok(r) = client.get(&url).send() {
@@ -138,7 +140,10 @@ fn geocode(client: &reqwest::blocking::Client, city: &str) -> GeoLocation {
         }
     }
 
-    fail(&format!("City '{}' not found. Please retry with the English/romanized city name (e.g. 'Saratoga' instead of '萨拉托加', 'Tokyo' instead of '東京').", city));
+    fail(&format!(
+        "City '{}' not found. Please retry with the English/romanized city name (e.g. 'Saratoga' instead of '萨拉托加', 'Tokyo' instead of '東京').",
+        city
+    ));
 }
 
 fn weather_description(code: u32) -> &'static str {

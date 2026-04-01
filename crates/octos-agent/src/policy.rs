@@ -126,8 +126,9 @@ impl CommandPolicy for SafePolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::Path;
+
+    use super::*;
 
     #[test]
     fn test_allow_all_policy() {

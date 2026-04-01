@@ -722,9 +722,11 @@ impl FeishuChannel {
 
     /// Run webhook HTTP server mode.
     async fn start_webhook(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
-        use axum::{
-            Router, extract::State, http::HeaderMap, response::IntoResponse, routing::post,
-        };
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
 
         #[derive(Clone)]
         struct WebhookState {
@@ -791,9 +793,7 @@ impl FeishuChannel {
                                 warn!("Feishu webhook: failed to parse decrypted event: {e}");
                                 return (
                                     axum::http::StatusCode::BAD_REQUEST,
-                                    axum::Json(
-                                        serde_json::json!({"error": "decrypt parse error"}),
-                                    ),
+                                    axum::Json(serde_json::json!({"error": "decrypt parse error"})),
                                 )
                                     .into_response();
                             }

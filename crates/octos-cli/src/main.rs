@@ -65,7 +65,8 @@ fn main() -> Result<()> {
 fn init_tracing(
     log_dir: Option<&std::path::Path>,
 ) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{EnvFilter, Layer, fmt};
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))

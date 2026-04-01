@@ -118,9 +118,10 @@ impl LlmClient {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+
     use super::*;
     use crate::types::{StopReason, TokenUsage};
-    use async_trait::async_trait;
 
     struct MockProvider {
         response: String,

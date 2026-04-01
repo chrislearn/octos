@@ -104,11 +104,11 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use super::super::{AgentConfig, TokenTracker};
+    use super::*;
 
     // ---------- AgentConfig::default ----------
 
