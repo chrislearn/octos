@@ -16,6 +16,8 @@ pub mod session;
 
 #[cfg(feature = "api")]
 pub mod api_channel;
+#[cfg(feature = "cokret")]
+pub mod cokret;
 #[cfg(feature = "discord")]
 pub mod discord_channel;
 #[cfg(feature = "email")]
@@ -66,6 +68,8 @@ pub use session::{
 
 #[cfg(feature = "api")]
 pub use api_channel::{ApiChannel, TaskCancelOutcome, TaskRelaunchOutcome};
+#[cfg(feature = "cokret")]
+pub use cokret::{CokretAppletConfig, CokretChannel, CokretChannelConfig};
 #[cfg(feature = "discord")]
 pub use discord_channel::DiscordChannel;
 #[cfg(feature = "email")]

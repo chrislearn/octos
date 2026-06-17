@@ -1,0 +1,60 @@
+{
+  "gateway": {
+    "max_history": 50,
+    "queue_mode": "followup",
+    "channels": [
+      {
+        "type": "cokret",
+        "allowed_senders": [],
+        "settings": {
+          "id": "cokret-account",
+          "mode": "account",
+          "baseUrl": "http://127.0.0.1:8008",
+          "serviceDid": "did:webvh:127.0.0.1%3A8008",
+          "accounts": [
+            {
+              "id": "support",
+              "principalId": "did:webvh:127.0.0.1%3A8008:agents:support",
+              "deviceId": "ck:device:01904100-0000-7000-8000-000000000001",
+              "accessToken": "ck.session.grant:CHANGE_ME",
+              "defaultRealmId": "ck:realm:01904100-0000-7000-8000-0000000000aa",
+              "defaultFlowId": "ck:flow:01904100-0000-7000-8000-0000000000bb",
+              "agentId": "support",
+              "listen": true,
+              "send": true
+            }
+          ]
+        }
+      },
+      {
+        "type": "cokret",
+        "allowed_senders": [],
+        "settings": {
+          "id": "cokret-applet",
+          "mode": "applet",
+          "appletId": "ck:applet:21532600-0000-7000-8000-000000000000",
+          "serviceDid": "did:web:octos-bridge.example",
+          "controllerDid": "did:webvh:example.com:admin",
+          "baseUrl": "https://octos.example/appservices/cokret/cokret-applet",
+          "bind_addr": "127.0.0.1:8330",
+          "botActorId": "did:web:octos-bridge.example:bot",
+          "cokretServerUrl": "http://127.0.0.1:8008",
+          "cokretServerDid": "did:webvh:127.0.0.1%3A8008",
+          "accessToken": "CHANGE_ME_inbound_applet_bearer",
+          "protocols": ["octos"],
+          "namespaces": {
+            "actors": [
+              { "pattern": "did:web:octos-bridge.example:ghost:*", "exclusive": true }
+            ],
+            "realms": [
+              { "pattern": "ck:realm:*", "exclusive": false }
+            ],
+            "handles": []
+          },
+          "ghostDidPrefix": "ghost:",
+          "receiveEvents": true
+        }
+      }
+    ]
+  }
+}

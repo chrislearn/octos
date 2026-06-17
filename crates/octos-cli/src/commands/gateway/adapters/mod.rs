@@ -16,6 +16,8 @@ use crate::config::ChannelEntry;
 #[cfg(feature = "api")]
 mod api;
 mod cli;
+#[cfg(feature = "cokret")]
+mod cokret;
 #[cfg(feature = "discord")]
 mod discord;
 #[cfg(feature = "email")]
@@ -150,6 +152,8 @@ pub fn register_all(
                 ctx.shutdown,
                 ctx.data_dir,
             )?,
+            #[cfg(feature = "cokret")]
+            "cokret" => cokret::register(channel_mgr, entry, ctx.shutdown, ctx.data_dir)?,
             #[cfg(feature = "qq-bot")]
             "qq-bot" => qq_bot::register(channel_mgr, entry, ctx.shutdown)?,
             #[cfg(feature = "wechat")]
