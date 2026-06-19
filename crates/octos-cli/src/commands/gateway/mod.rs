@@ -193,7 +193,6 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
-            public_subdomain: None,
             config: crate::profiles::ProfileConfig {
                 gateway: crate::profiles::GatewaySettings {
                     system_prompt: system_prompt.map(str::to_string),

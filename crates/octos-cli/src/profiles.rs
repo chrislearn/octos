@@ -843,6 +843,9 @@ impl LlmModelSelectionConfig {
 }
 
 /// Channel-specific credentials (tagged by type).
+// The Matrix variant carries many user-mode fields; boxing a serde
+// `tag`-serialized struct variant isn't worth the (de)serialization churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ChannelCredentials {
@@ -1522,10 +1525,11 @@ fn mask_value(s: &str) -> String {
 
 fn mask_channel_secrets(channel: &mut ChannelCredentials) {
     match channel {
-        ChannelCredentials::Api { auth_token, .. } => {
-            if let Some(token) = auth_token {
-                *token = mask_value(token);
-            }
+        ChannelCredentials::Api {
+            auth_token: Some(token),
+            ..
+        } => {
+            *token = mask_value(token);
         }
         ChannelCredentials::Matrix {
             as_token,

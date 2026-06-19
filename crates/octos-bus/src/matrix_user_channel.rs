@@ -223,7 +223,7 @@ impl MatrixInviteStore {
         if !include_dismissed {
             invites.retain(|invite| invite.dismissed_at.is_none());
         }
-        invites.sort_by(|a, b| b.last_seen_at.cmp(&a.last_seen_at));
+        invites.sort_by_key(|b| std::cmp::Reverse(b.last_seen_at));
         Ok(invites)
     }
 
