@@ -59,6 +59,54 @@ pub(crate) async fn transcribe_audio_media(
     out
 }
 
+/// Tools kept active during a voice turn; everything else is deferred.
+///
+/// A spoken turn is almost always a single-iteration conversational reply that
+/// calls no tools, yet the full registry (50+ specs in a skill-rich profile)
+/// otherwise dominates the prompt's prefill — measured as the single largest
+/// contributor to voice-turn latency (≈half of a 34k-token input). Deferring
+/// keeps the tools *recoverable* via `activate_tools`, so a voice query that
+/// genuinely needs one pays a single extra round-trip instead of taxing every
+/// turn. We keep `activate_tools` itself so that recovery path stays reachable.
+const VOICE_TURN_KEEP_TOOLS: &[&str] = &["activate_tools"];
+
+/// Pure core of [`defer_tools_for_voice_turn`]: every registered name that is
+/// not on the keep-list. Split out so it is unit-testable without standing up
+/// a real `ToolRegistry`.
+fn voice_turn_deferred_names(all: &[String], keep: &[&str]) -> Vec<String> {
+    all.iter()
+        .filter(|name| !keep.contains(&name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Whether deferral is safe on this registry: at least one keep-list (recovery)
+/// tool is actually registered. Without it, deferring would hide every tool with
+/// no `activate_tools` path back, stranding a voice request that genuinely needs
+/// one of the remaining allowed tools. Split out for unit-testing.
+fn voice_turn_can_defer(all: &[String], keep: &[&str]) -> bool {
+    all.iter().any(|name| keep.contains(&name.as_str()))
+}
+
+/// Defer every tool except the voice-turn keep-list on a per-turn registry
+/// snapshot, so the spoken turn's first LLM call carries a lean tool set.
+/// Returns the number of tools deferred. Safe on any registry: `defer` only
+/// acts on names that are actually registered. Call on the mutable per-turn
+/// snapshot BEFORE it is wrapped in `Arc`.
+pub(crate) fn defer_tools_for_voice_turn(registry: &mut octos_agent::ToolRegistry) -> usize {
+    let all = registry.tool_names();
+    // If the recovery tool isn't registered (e.g. a tool surface small enough to
+    // skip auto-defer), deferring everything would leave the first LLM call with
+    // no tools AND no `activate_tools` to recover one. Skip deferral entirely.
+    if !voice_turn_can_defer(&all, VOICE_TURN_KEEP_TOOLS) {
+        return 0;
+    }
+    let to_defer = voice_turn_deferred_names(&all, VOICE_TURN_KEEP_TOOLS);
+    let count = to_defer.len();
+    registry.defer(to_defer);
+    count
+}
+
 /// Whether a char is safe to hand to TTS: letters/digits (incl. CJK),
 /// whitespace, and common sentence punctuation. Everything else — emoji,
 /// pictographs, math/misc symbols — is dropped, because some on-device engines
@@ -182,6 +230,44 @@ pub(crate) fn clean_for_tts(text: &str) -> String {
         .to_string()
 }
 
+/// Ensure the text ends on a *strong* terminal boundary so the TTS engine
+/// fully renders the final syllable.
+///
+/// On-device GPT-SoVITS (and similar) clips the last character when the input
+/// ends on a soft pause mark (comma / 顿号 / 分号 / 冒号) or a bare content
+/// char: it reads the trailing pause as "more is coming" and stops generating
+/// mid-syllable, so e.g. `"…往下跳，"` comes back as audio that cuts off just
+/// as `跳` begins. The streamed-reply chunker (`drain_voice_sentences`) emits
+/// comma-terminated fragments, and the reply's trailing fragment often has no
+/// punctuation at all — both hit this. Normalising the tail to a full stop
+/// gives a clean sentence-final boundary the engine renders in full.
+///
+/// Strong terminals already present (`。！？!?…`) are left untouched.
+fn ensure_terminal_punctuation(text: &str) -> String {
+    const STRONG: &[char] = &['。', '！', '？', '!', '?', '…', '.'];
+    const SOFT: &[char] = &['，', ',', '、', '；', ';', '：', ':'];
+
+    let mut s = text.trim_end().to_string();
+    if s.is_empty() {
+        return s;
+    }
+    match s.chars().next_back() {
+        Some(c) if STRONG.contains(&c) => return s,
+        _ => {}
+    }
+    // Drop any trailing run of soft pause marks / whitespace, then append one
+    // full stop so a comma-ended (or bare) fragment gets a real boundary.
+    while let Some(c) = s.chars().next_back() {
+        if SOFT.contains(&c) || c.is_whitespace() {
+            s.pop();
+        } else {
+            break;
+        }
+    }
+    s.push('。');
+    s
+}
+
 /// Volcano Engine (ByteDance) cloud-TTS config, sourced from env. Returns
 /// `None` (→ fall back to on-device ominix) unless appid + token are set.
 /// Moving TTS to the cloud also stops ominix from thrashing ASR↔TTS model
@@ -287,6 +373,9 @@ pub(crate) async fn synthesize_reply(
     if speak.trim().is_empty() {
         return None;
     }
+    // Normalise the tail to a strong terminal so engines (notably on-device
+    // GPT-SoVITS) don't clip the final syllable of comma-ended / bare fragments.
+    let speak = ensure_terminal_punctuation(&speak);
     let tts_t = std::time::Instant::now();
     eprintln!("[TIMING] TTS_start epoch_ms={}", now_ms());
 
@@ -347,6 +436,42 @@ mod tests {
     }
 
     #[test]
+    fn trailing_comma_becomes_full_stop_so_final_syllable_is_not_clipped() {
+        // GPT-SoVITS clips the last syllable when a chunk ends on a soft comma
+        // (it reads the trailing pause as "more coming" and stops generating
+        // mid-syllable). Normalising to a full stop gives a clean sentence-final
+        // boundary so the engine renders the whole last character.
+        assert_eq!(
+            ensure_terminal_punctuation("就每天背着壳爬到山顶往下跳，"),
+            "就每天背着壳爬到山顶往下跳。"
+        );
+    }
+
+    #[test]
+    fn bare_ending_gets_terminal_punctuation() {
+        // The reply's trailing fragment often has no punctuation at all; a bare
+        // content char is just as prone to clipping as a trailing comma.
+        assert_eq!(
+            ensure_terminal_punctuation("好的我知道了"),
+            "好的我知道了。"
+        );
+    }
+
+    #[test]
+    fn strong_terminal_is_left_unchanged() {
+        assert_eq!(ensure_terminal_punctuation("你好！"), "你好！");
+        assert_eq!(ensure_terminal_punctuation("真的吗？"), "真的吗？");
+        assert_eq!(ensure_terminal_punctuation("等等…"), "等等…");
+        assert_eq!(ensure_terminal_punctuation("Okay."), "Okay.");
+    }
+
+    #[test]
+    fn trailing_soft_marks_and_whitespace_collapse_to_one_full_stop() {
+        assert_eq!(ensure_terminal_punctuation("走吧， "), "走吧。");
+        assert_eq!(ensure_terminal_punctuation("等一下；"), "等一下。");
+    }
+
+    #[test]
     fn clean_for_tts_strips_markdown_noise() {
         let md = "# 标题\n\n这是**重点**和 `代码` 还有 [链接](https://x.com)。\n\n```rust\nfn main() {}\n```\n\n- 一项\n- 两项";
         let got = clean_for_tts(md);
@@ -375,6 +500,56 @@ mod tests {
         assert!(got.contains("晚上好呀！"));
         assert!(got.contains("今天第 N 次"));
         assert!(got.contains("打招呼"));
+    }
+
+    #[test]
+    fn voice_turn_defers_everything_but_the_keep_list() {
+        // A spoken turn keeps only the recovery tool; every other registered
+        // tool is deferred so the first LLM call is not taxed by the full set.
+        let all = vec![
+            "read_file".to_string(),
+            "shell".to_string(),
+            "web_search".to_string(),
+            "activate_tools".to_string(),
+            "spawn".to_string(),
+        ];
+        let deferred = voice_turn_deferred_names(&all, VOICE_TURN_KEEP_TOOLS);
+        assert_eq!(
+            deferred,
+            vec![
+                "read_file".to_string(),
+                "shell".to_string(),
+                "web_search".to_string(),
+                "spawn".to_string(),
+            ]
+        );
+        assert!(
+            !deferred.contains(&"activate_tools".to_string()),
+            "activate_tools must stay active so deferred tools remain recoverable"
+        );
+    }
+
+    #[test]
+    fn voice_turn_defer_is_noop_when_only_keep_tools_present() {
+        let all = vec!["activate_tools".to_string()];
+        assert!(voice_turn_deferred_names(&all, VOICE_TURN_KEEP_TOOLS).is_empty());
+    }
+
+    #[test]
+    fn voice_turn_skips_defer_when_no_recovery_tool_present() {
+        // Regression (#1464 P2): without `activate_tools` on the surface,
+        // deferring everything would strand the turn — no tools and no way to
+        // recover one. `defer_tools_for_voice_turn` must skip in that case.
+        let without = vec!["read_file".to_string(), "shell".to_string()];
+        assert!(
+            !voice_turn_can_defer(&without, VOICE_TURN_KEEP_TOOLS),
+            "no recovery tool ⇒ must not defer"
+        );
+        let with = vec!["read_file".to_string(), "activate_tools".to_string()];
+        assert!(
+            voice_turn_can_defer(&with, VOICE_TURN_KEEP_TOOLS),
+            "recovery tool present ⇒ deferral is safe"
+        );
     }
 
     #[test]

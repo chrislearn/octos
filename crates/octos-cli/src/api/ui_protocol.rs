@@ -2102,11 +2102,21 @@ struct AppUiLoopPromptScratch {
     runtime_system: Option<Message>,
 }
 
+/// Default per-turn history budget (tokens) for the model prompt on a voice
+/// turn. Caps ONLY the outgoing projection the model sees — the persisted
+/// transcript is untouched — so older turns are trimmed (recent-first kept,
+/// any compaction summary preserved) to keep the spoken-turn prefill small.
+/// Override via `OCTOS_VOICE_MAX_PROMPT_TOKENS`.
+const VOICE_TURN_MAX_PROMPT_TOKENS: usize = 3000;
+
 struct AppUiPromptContextBridge {
     session_id: SessionKey,
     data_dir: PathBuf,
     context_manager: Arc<StdMutex<ContextManager>>,
     scratch: StdMutex<Option<AppUiLoopPromptScratch>>,
+    /// When true, the outgoing model prompt is capped at
+    /// [`VOICE_TURN_MAX_PROMPT_TOKENS`] (see [`Self::outgoing_prompt_policy`]).
+    voice_turn: bool,
 }
 
 impl AppUiPromptContextBridge {
@@ -2114,13 +2124,38 @@ impl AppUiPromptContextBridge {
         session_id: SessionKey,
         data_dir: PathBuf,
         context_manager: Arc<StdMutex<ContextManager>>,
+        voice_turn: bool,
     ) -> Self {
         Self {
             session_id,
             data_dir,
             context_manager,
             scratch: StdMutex::new(None),
+            voice_turn,
         }
+    }
+
+    /// Voice-turn history budget (tokens), env-overridable.
+    fn voice_prompt_budget() -> usize {
+        std::env::var("OCTOS_VOICE_MAX_PROMPT_TOKENS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(VOICE_TURN_MAX_PROMPT_TOKENS)
+    }
+
+    /// Policy for the FINAL outgoing projection (`for_prompt`) sent to the
+    /// model. Identical to [`Self::prompt_policy`] except that voice turns add
+    /// a `max_prompt_token_estimate` cap. Kept separate from `prompt_policy`
+    /// because the coverage/record and compaction passes MUST run uncapped —
+    /// capping their `for_prompt` view would make the manager treat trimmed-off
+    /// older messages as "not covered" and re-record them, duplicating the
+    /// persisted transcript.
+    fn outgoing_prompt_policy(&self, request: &PromptContextRequest) -> PromptBuildPolicy {
+        let mut policy = Self::prompt_policy(request);
+        if self.voice_turn {
+            policy.max_prompt_token_estimate = Some(Self::voice_prompt_budget());
+        }
+        policy
     }
 
     fn threshold_tokens(request: &PromptContextRequest) -> usize {
@@ -2233,7 +2268,12 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 .cloned();
         }
         let runtime_system = scratch.runtime_system.clone();
-        let frame = scratch.manager.for_prompt(&policy);
+        // Project the OUTGOING prompt with the (possibly voice-capped) policy.
+        // `policy` above stays uncapped for the record/coverage/compaction
+        // passes so the persisted transcript is never re-recorded from a
+        // trimmed view.
+        let out_policy = self.outgoing_prompt_policy(&request);
+        let frame = scratch.manager.for_prompt(&out_policy);
         let prompt_replaced = messages.len() != frame.messages.len()
             || messages
                 .iter()
@@ -6877,6 +6917,11 @@ async fn raw_profile_llm_upsert(
         upsert_llm_fallback(&mut llm.fallbacks, selection);
     }
     profile.config.llm = Some(llm);
+    // Relocate keychain-backed secrets (e.g. a Vertex SA JSON supplied as the
+    // route api_key) into the OS keychain before persisting, so this RPC can't
+    // write a private key to plaintext profile config.
+    crate::api::admin::relocate_keychain_backed_secrets(&mut profile.config.env_vars, &profile_id)
+        .map_err(|(_, msg)| RpcError::invalid_params(msg))?;
     profile.updated_at = Utc::now();
     store
         .save_with_merge(&mut profile)
@@ -6966,10 +7011,12 @@ async fn raw_profile_llm_test(
     };
 
     let Some(api_key) = secret_from_value(params.api_key).or_else(|| {
-        route
-            .api_key_env
-            .as_ref()
-            .and_then(|env_name| profile.as_ref()?.config.env_vars.get(env_name).cloned())
+        route.api_key_env.as_ref().and_then(|env_name| {
+            // Resolve a keychain marker to the real secret (e.g. a scoped Vertex
+            // SA JSON); plain values pass through unchanged.
+            let raw = profile.as_ref()?.config.env_vars.get(env_name)?;
+            crate::auth::keychain::resolve_value(env_name, raw)
+        })
     }) else {
         return Ok(profile_llm_test_result(
             state,
@@ -7094,9 +7141,12 @@ async fn raw_profile_llm_fetch_models(
         .or_else(|| dashboard_family_api_key_env(&family_id));
 
     let api_key = secret_from_value(params.api_key).or_else(|| {
-        api_key_env
-            .as_ref()
-            .and_then(|env_name| profile.as_ref()?.config.env_vars.get(env_name).cloned())
+        api_key_env.as_ref().and_then(|env_name| {
+            // Resolve a keychain marker to the real secret (e.g. a scoped Vertex
+            // SA JSON); plain values pass through unchanged.
+            let raw = profile.as_ref()?.config.env_vars.get(env_name)?;
+            crate::auth::keychain::resolve_value(env_name, raw)
+        })
     });
 
     let Some(api_key) = api_key else {
@@ -10186,6 +10236,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         topic: None,
         rewrite_for: None,
         reasoning_effort: None,
+        live_video: false,
     };
     let prompt = prompt_text(&params.input).unwrap_or_default();
     let routed_profile_id = Some(profile_id.clone());
@@ -16527,6 +16578,17 @@ async fn run_standalone_turn(
     // the chat path's `maybe_advance_goal_runtime_after_turn(goal_turn_start)`
     // pattern in `SessionActor`.
     let goal_turn_start = goal_context.as_ref().map(|_| std::time::Instant::now());
+    // Voice-turn lean-prompt signal. Derived cheaply from the turn's media
+    // (an audio attachment) WITHOUT waiting for STT — a safe over-approximation
+    // of `had_audio_input` that is available before the tool registry and the
+    // prompt-context bridge are built. When set we (1) defer all non-essential
+    // tools so the spoken turn's first LLM call carries a lean tool set, and
+    // (2) cap the projected history the context bridge sends to the model.
+    // Both shrink the prompt prefill, which dominates voice-turn latency.
+    let voice_turn_hint = params
+        .media
+        .iter()
+        .any(|file_ref| octos_bus::media::is_audio(&file_ref.path));
     let mut tool_registry = session_runtime.tools.snapshot_excluding(&[]);
     // Stamp the per-turn snapshot with this session's key so
     // `spawn::register_with_lineage` writes `session_key:
@@ -17329,6 +17391,8 @@ async fn run_standalone_turn(
                     child_session_id,
                     child_context_data_dir.clone(),
                     Arc::new(StdMutex::new(child_manager)),
+                    // Spawned subagent: not a spoken turn, never voice-capped.
+                    false,
                 )))
             },
         ));
@@ -17452,6 +17516,19 @@ async fn run_standalone_turn(
     let progress_workspace_root = workspace_root
         .clone()
         .or_else(|| tool_registry.workspace_root().map(Path::to_path_buf));
+    // Voice turn: defer all non-essential tools on this per-turn snapshot so
+    // the (usually single) spoken-reply LLM call is not taxed by the full tool
+    // set. The per-turn snapshot is private to this turn, so this never leaks
+    // into other turns / sessions. Deferred tools stay recoverable via
+    // `activate_tools`. Must run BEFORE the `Arc::new` wrap below — `defer`
+    // takes `&mut self`.
+    if voice_turn_hint {
+        let deferred = crate::api::voice_turn::defer_tools_for_voice_turn(&mut tool_registry);
+        tracing::info!(
+            deferred,
+            "voice turn: deferred non-essential tools for a lean prefill"
+        );
+    }
     // Wrap the per-turn `ToolRegistry` in an `Arc` here so we retain a
     // handle after `Agent::new_shared` consumes its own clone. The
     // post-terminal drain task (issue #961) inspects
@@ -17540,6 +17617,7 @@ async fn run_standalone_turn(
             session_id.clone(),
             session_runtime.profile.data_dir.clone(),
             context_manager.clone(),
+            voice_turn_hint,
         ));
     request_agent = request_agent.with_prompt_context_manager(prompt_context_bridge);
     if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
@@ -17818,7 +17896,21 @@ async fn run_standalone_turn(
         // connection negotiated `user_question.v1` (`user_question_requester`
         // is `Some`); otherwise the agent's `ask_user_question` tool sees no
         // requester and degrades to its structured-metadata fallback.
-        let message_future = request_agent.process_message(&prompt, &history, turn_media_paths);
+        // #1478: thread the explicit live-video signal into the turn so the
+        // agent loop's video-call note (and the rich-output camera-frame
+        // grounding) fire only when the client says this is a live camera turn
+        // — never inferred from attachment types. Other attachment-context
+        // fields stay at their serve-path defaults.
+        let turn_attachments = octos_agent::TurnAttachmentContext {
+            live_video: params.live_video,
+            ..Default::default()
+        };
+        let message_future = request_agent.process_message_with_attachments(
+            &prompt,
+            &history,
+            turn_media_paths,
+            turn_attachments,
+        );
         let scoped_message_future: std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = eyre::Result<octos_agent::ConversationResponse>>
@@ -18433,7 +18525,12 @@ async fn run_standalone_turn(
         let w_session = session_id.clone();
         let w_turn = turn_id.clone();
         let w_dir = session_runtime.workspace_root.clone();
-        let w_voice = session_runtime.profile.voice.default_voice.clone();
+        // Per-tenant reply voice: live override (set via PUT /api/my/voice) wins,
+        // else the profile's bootstrapped default.
+        let w_voice = crate::api::voices::resolve_reply_voice(
+            &session_runtime.profile.profile_id,
+            &session_runtime.profile.voice.default_voice,
+        );
         let w_provider = session_runtime.profile.voice.tts_provider.clone();
         let handle = tokio::spawn(async move {
             let mut n: usize = 0;
@@ -18832,11 +18929,15 @@ async fn run_standalone_turn(
     // path above produced no audio (e.g. a reply with no sentence boundaries).
     if had_audio_input && voice_streamed_count == 0 {
         if let Some(reply) = final_response_content.as_deref() {
-            let voice = session_runtime.profile.voice.default_voice.as_str();
+            // Per-tenant reply voice: live override wins, else profile default.
+            let voice = crate::api::voices::resolve_reply_voice(
+                &session_runtime.profile.profile_id,
+                &session_runtime.profile.voice.default_voice,
+            );
             let provider = session_runtime.profile.voice.tts_provider.as_str();
             let reply_audio_dir = session_runtime.workspace_root.as_path();
             if let Some(audio_path) =
-                crate::api::voice_turn::synthesize_reply(reply, voice, provider, reply_audio_dir)
+                crate::api::voice_turn::synthesize_reply(reply, &voice, provider, reply_audio_dir)
                     .await
             {
                 // Deliver via the EXISTING file/attached carrier. Emit the
@@ -22499,8 +22600,12 @@ mod tests {
             &history,
         )));
         let dir = tempfile::tempdir().unwrap();
-        let bridge =
-            AppUiPromptContextBridge::new(session_id.clone(), dir.path().to_path_buf(), manager);
+        let bridge = AppUiPromptContextBridge::new(
+            session_id.clone(),
+            dir.path().to_path_buf(),
+            manager,
+            false,
+        );
         let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
         prompt.extend(history);
         prompt.push(test_message(MessageRole::User, "current request"));
@@ -22545,6 +22650,52 @@ mod tests {
             crate::context_manager::context_ledger_path(dir.path(), &session_id.to_string())
                 .exists(),
             "AppUI prompt-context preparation should persist the canonical context ledger"
+        );
+    }
+
+    #[test]
+    fn voice_turn_bridge_caps_outgoing_prompt_only() {
+        // Lever 2: a voice turn caps the OUTGOING projection at the voice
+        // budget so the spoken-turn prefill stays small; a text turn leaves it
+        // uncapped. The cap lives on `outgoing_prompt_policy` only — the
+        // record/coverage/compaction passes use the uncapped `prompt_policy`,
+        // so the persisted transcript is never re-recorded from a trimmed view.
+        let session_id = SessionKey::new("api", "voice-cap");
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+            session_id.to_string(),
+            None,
+            &[],
+        )));
+        let request = PromptContextRequest {
+            phase: PromptContextPhase::TurnStart,
+            iteration: 1,
+            provider_name: "test".to_string(),
+            model_id: "m".to_string(),
+            context_window: 16_000,
+        };
+
+        let voice = AppUiPromptContextBridge::new(
+            session_id.clone(),
+            dir.path().to_path_buf(),
+            manager.clone(),
+            true,
+        );
+        assert_eq!(
+            voice
+                .outgoing_prompt_policy(&request)
+                .max_prompt_token_estimate,
+            Some(AppUiPromptContextBridge::voice_prompt_budget()),
+            "voice turns must cap the outgoing prompt projection"
+        );
+
+        let text =
+            AppUiPromptContextBridge::new(session_id, dir.path().to_path_buf(), manager, false);
+        assert_eq!(
+            text.outgoing_prompt_policy(&request)
+                .max_prompt_token_estimate,
+            None,
+            "text turns must leave the outgoing prompt uncapped"
         );
     }
 
@@ -24788,6 +24939,7 @@ ignore = []
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            live_video: false,
         })
         .into_rpc_request("1")
         .expect("request");
@@ -32133,6 +32285,7 @@ ignore = []
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            live_video: false,
         };
         let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
         let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
@@ -37451,6 +37604,7 @@ ignore = []
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,

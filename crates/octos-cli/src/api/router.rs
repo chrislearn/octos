@@ -206,6 +206,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let my_api = Router::new()
         .route("/api/my/profile", get(auth_handlers::my_profile))
         .route("/api/my/profile", put(auth_handlers::update_my_profile))
+        // Reply-voice selection: list synthesizable voices + set this user's
+        // sticky default. Both need the caller's identity, so they live in the
+        // authenticated `my_api` group.
+        .route("/api/voices", get(auth_handlers::list_voices))
+        .route("/api/my/voice", put(auth_handlers::set_my_voice))
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))
@@ -234,6 +239,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/my/profile/status",
             get(auth_handlers::my_gateway_status),
+        )
+        .route(
+            "/api/my/profile/matrix/invites",
+            get(auth_handlers::my_matrix_invites),
+        )
+        .route(
+            "/api/my/profile/matrix/test",
+            post(auth_handlers::test_my_matrix_connection),
+        )
+        .route(
+            "/api/my/profile/matrix/invites/{room_id}/accept",
+            post(auth_handlers::accept_my_matrix_invite),
+        )
+        .route(
+            "/api/my/profile/matrix/invites/{room_id}/reject",
+            post(auth_handlers::reject_my_matrix_invite),
+        )
+        .route(
+            "/api/my/profile/matrix/invites/{room_id}/dismiss",
+            post(auth_handlers::dismiss_my_matrix_invite),
         )
         .route("/api/my/profile/logs", get(auth_handlers::my_gateway_logs))
         .route(

@@ -237,6 +237,10 @@ pub struct ProfileRuntime {
     /// workflow resolve specialists from the same profile runtime that
     /// owns model, memory, sandbox, and tools.
     pub review_config: Option<ReviewConfig>,
+    /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): per-profile
+    /// human-approval rules, converted once at bootstrap and inherited by
+    /// every per-session Agent this profile spawns.
+    pub human_approval_rules: Option<octos_agent::HumanApprovalRules>,
 
     /// Long-lived [`EpisodeStore`] for this profile (redb at
     /// `<data_dir>/episodes.redb`). Shared across all sessions of
@@ -970,6 +974,16 @@ impl ProfileRuntime {
             "ProfileRuntime: bootstrapped"
         );
 
+        // Validate the per-profile approval policy with the SAME checks the
+        // top-level config load applies, so a bad profile rule fails fast
+        // instead of gating unexpectedly / creating unanswerable or
+        // instantly-expiring requests (review finding #4).
+        if let Some(policy) = profile.config.approval_policy.as_ref() {
+            policy
+                .validate()
+                .wrap_err("invalid profile approval_policy")?;
+        }
+
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
@@ -990,6 +1004,11 @@ impl ProfileRuntime {
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
             plugin_hooks: plugin_result.hooks.clone(),
             review_config: profile.config.review.clone(),
+            human_approval_rules: profile
+                .config
+                .approval_policy
+                .as_ref()
+                .map(|policy| policy.to_runtime_rules()),
             system_prompt,
             memory,
             memory_store,
@@ -998,15 +1017,19 @@ impl ProfileRuntime {
             pipeline_factory,
             hook_executor,
             lane_routing: profile.config.lane_routing.clone(),
-            // Voice (ASR/TTS) is a serve-level platform setting living on the
-            // top-level config.json, not on per-profile JSON. `config_from_profile`
-            // drops it, so the caller (serve/gateway) passes the host's
-            // `config.voice` here; fall back to defaults when absent.
+            // Voice (ASR/TTS) route/ASR settings are a serve-level platform
+            // setting living on the top-level config.json, not on per-profile
+            // JSON. `config_from_profile` drops it, so the caller (serve/gateway)
+            // passes the host's `config.voice` here; fall back to defaults when
+            // absent. The *timbre* (`default_voice`), however, is per-tenant:
+            // overlay the profile's `voice_default` on top so each user keeps
+            // their own reply voice (set via `PUT /api/my/voice`).
             voice: config
                 .voice
                 .clone()
                 .or_else(|| host_voice.cloned())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .with_default_voice_override(profile.config.voice_default.as_deref()),
         }))
     }
 }
