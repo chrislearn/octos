@@ -3105,6 +3105,7 @@ pub async fn config_check(
             crate::profiles::ChannelCredentials::QQBot { .. } => "qq-bot",
             crate::profiles::ChannelCredentials::WeChat { .. } => "wechat",
             crate::profiles::ChannelCredentials::Line { .. } => "line",
+            crate::profiles::ChannelCredentials::Cokret { .. } => "cokret",
         })
         .collect();
 
@@ -3289,6 +3290,9 @@ fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
                 insert_ref(channel_secret_env, "channels");
                 insert_ref(channel_access_token_env, "channels");
             }
+            crate::profiles::ChannelCredentials::Cokret { settings } => {
+                collect_cokret_env_refs(settings, |name| insert_ref(name, "channels"));
+            }
             crate::profiles::ChannelCredentials::WhatsApp { .. }
             | crate::profiles::ChannelCredentials::Api { .. }
             | crate::profiles::ChannelCredentials::Matrix { .. } => {}
@@ -3314,6 +3318,41 @@ fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
             }
         })
         .collect()
+}
+
+fn collect_cokret_env_refs(
+    settings: &serde_json::Map<String, serde_json::Value>,
+    mut insert_ref: impl FnMut(&str),
+) {
+    fn walk(value: &serde_json::Value, insert_ref: &mut impl FnMut(&str)) {
+        match value {
+            serde_json::Value::Object(obj) => {
+                let kind = obj
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if kind.eq_ignore_ascii_case("env")
+                    && let Some(var) = obj.get("var").and_then(serde_json::Value::as_str)
+                {
+                    insert_ref(var);
+                }
+                for child in obj.values() {
+                    walk(child, insert_ref);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    walk(child, insert_ref);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk(
+        &serde_json::Value::Object(settings.clone()),
+        &mut insert_ref,
+    );
 }
 
 /// GET /api/admin/model-limits — returns model catalog (runtime source of truth).
@@ -4989,6 +5028,19 @@ mod tests {
                 )]
                 .into(),
             }),
+            channels: vec![crate::profiles::ChannelCredentials::Cokret {
+                settings: serde_json::json!({
+                    "mode": "account",
+                    "base_url": "https://cokret.example.org",
+                    "principal_id": "did:web:bot.example",
+                    "device_id": "octos-device",
+                    "keyRef": { "kind": "env", "var": "OCTOS_COKRET_BOT_KEY" },
+                    "login_challenge": "0123456789abcdef"
+                })
+                .as_object()
+                .expect("object")
+                .clone(),
+            }],
             ..Default::default()
         };
 
@@ -5009,6 +5061,13 @@ mod tests {
         assert!(!tavily.configured);
         assert_eq!(tavily.status, "awaiting_user_secret");
         assert_eq!(tavily.surfaces, vec!["tools".to_string()]);
+
+        let cokret = refs
+            .iter()
+            .find(|entry| entry.name == "OCTOS_COKRET_BOT_KEY")
+            .expect("cokret keyRef env var should be listed");
+        assert!(!cokret.configured);
+        assert_eq!(cokret.surfaces, vec!["channels".to_string()]);
     }
 
     #[test]

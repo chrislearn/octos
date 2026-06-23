@@ -48,8 +48,8 @@ pub fn build_ghost_profile_event(
     external_ref: Value,
     actor_seq: u64,
 ) -> Result<Event> {
-    let realm =
-        RealmId::new(realm_id.to_owned()).wrap_err_with(|| format!("invalid realm_id: {realm_id}"))?;
+    let realm = RealmId::new(realm_id.to_owned())
+        .wrap_err_with(|| format!("invalid realm_id: {realm_id}"))?;
     let ghost = Did::new(ghost_did.to_owned())
         .wrap_err_with(|| format!("invalid ghost actor DID: {ghost_did}"))?;
     let controller = Did::new(controller_did.to_owned())

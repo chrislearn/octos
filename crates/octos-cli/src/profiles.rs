@@ -1002,6 +1002,10 @@ pub enum ChannelCredentials {
         #[serde(default)]
         bot_user_id: String,
     },
+    Cokret {
+        #[serde(flatten)]
+        settings: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 fn default_telegram_env() -> String {
@@ -1523,6 +1527,121 @@ fn mask_value(s: &str) -> String {
     }
 }
 
+fn normalized_json_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_cokret_secret_key(key: &str, in_key_ref: bool) -> bool {
+    matches!(
+        normalized_json_key(key).as_str(),
+        "accesstoken"
+            | "cokretbearertoken"
+            | "sessiongrant"
+            | "token"
+            | "inlineseedbase64"
+            | "seedbase64"
+            | "signingkeyseedhex"
+    ) || (in_key_ref && normalized_json_key(key) == "value")
+}
+
+fn mask_cokret_json_secrets(value: &mut serde_json::Value) {
+    fn walk(value: &mut serde_json::Value, in_key_ref: bool) {
+        match value {
+            serde_json::Value::Object(obj) => {
+                for (key, child) in obj {
+                    let child_in_key_ref = in_key_ref || normalized_json_key(key) == "keyref";
+                    if is_cokret_secret_key(key, in_key_ref) {
+                        if let Some(raw) = child.as_str() {
+                            *child = serde_json::Value::String(mask_value(raw));
+                            continue;
+                        }
+                    }
+                    walk(child, child_in_key_ref);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    walk(child, in_key_ref);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk(value, false);
+}
+
+fn restore_cokret_json_secrets(new_value: &mut serde_json::Value, old_value: &serde_json::Value) {
+    fn walk(
+        new_value: &mut serde_json::Value,
+        old_value: &serde_json::Value,
+        key: Option<&str>,
+        in_key_ref: bool,
+    ) {
+        let sensitive = key
+            .map(|k| is_cokret_secret_key(k, in_key_ref))
+            .unwrap_or(false);
+        if sensitive
+            && new_value.as_str().is_some_and(is_display_secret_value)
+            && old_value.as_str().is_some()
+        {
+            *new_value = old_value.clone();
+            return;
+        }
+
+        match (new_value, old_value) {
+            (serde_json::Value::Object(new_obj), serde_json::Value::Object(old_obj)) => {
+                for (child_key, child) in new_obj {
+                    if let Some(old_child) = old_obj.get(child_key) {
+                        let child_in_key_ref =
+                            in_key_ref || normalized_json_key(child_key) == "keyref";
+                        walk(child, old_child, Some(child_key), child_in_key_ref);
+                    }
+                }
+            }
+            (serde_json::Value::Array(new_items), serde_json::Value::Array(old_items)) => {
+                for (new_child, old_child) in new_items.iter_mut().zip(old_items) {
+                    walk(new_child, old_child, None, in_key_ref);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk(new_value, old_value, None, false);
+}
+
+fn json_string_by_keys<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        map.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn cokret_channel_identity(settings: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mode = json_string_by_keys(settings, &["mode"]).unwrap_or("account");
+    let id = json_string_by_keys(settings, &["id", "accountId", "account_id"]);
+    let base_url = json_string_by_keys(settings, &["baseUrl", "base_url", "homeserver", "url"]);
+    let principal =
+        json_string_by_keys(settings, &["principalId", "principal_id", "did", "user_id"]);
+    let applet = json_string_by_keys(settings, &["appletId", "applet_id"]);
+    let service = json_string_by_keys(settings, &["serviceDid", "service_did"]);
+
+    [Some(mode), id, base_url, principal, applet, service]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 fn mask_channel_secrets(channel: &mut ChannelCredentials) {
     match channel {
         ChannelCredentials::Api {
@@ -1542,6 +1661,13 @@ fn mask_channel_secrets(channel: &mut ChannelCredentials) {
             *hs_token = mask_value(hs_token);
             *access_token = mask_value(access_token);
             *password = mask_value(password);
+        }
+        ChannelCredentials::Cokret { settings } => {
+            let mut value = serde_json::Value::Object(std::mem::take(settings));
+            mask_cokret_json_secrets(&mut value);
+            if let serde_json::Value::Object(masked) = value {
+                *settings = masked;
+            }
         }
         _ => {}
     }
@@ -1583,6 +1709,21 @@ fn restore_masked_channel_secrets(
             restore_masked_secret(new_access_token, old_access_token);
             restore_masked_secret(new_password, old_password);
         }
+        (
+            ChannelCredentials::Cokret {
+                settings: new_settings,
+            },
+            ChannelCredentials::Cokret {
+                settings: old_settings,
+            },
+        ) => {
+            let mut new_value = serde_json::Value::Object(std::mem::take(new_settings));
+            let old_value = serde_json::Value::Object(old_settings.clone());
+            restore_cokret_json_secrets(&mut new_value, &old_value);
+            if let serde_json::Value::Object(restored) = new_value {
+                *new_settings = restored;
+            }
+        }
         _ => {}
     }
 }
@@ -1599,6 +1740,9 @@ fn same_secret_channel_variant(
         ) | (
             ChannelCredentials::Matrix { .. },
             ChannelCredentials::Matrix { .. }
+        ) | (
+            ChannelCredentials::Cokret { .. },
+            ChannelCredentials::Cokret { .. }
         )
     )
 }
@@ -1649,6 +1793,17 @@ fn channel_secret_identity_matches(
                     && new_sender_localpart == old_sender_localpart
                     && new_user_prefix == old_user_prefix
             }
+        }
+        (
+            ChannelCredentials::Cokret {
+                settings: new_settings,
+            },
+            ChannelCredentials::Cokret {
+                settings: old_settings,
+            },
+        ) => {
+            let new_identity = cokret_channel_identity(new_settings);
+            !new_identity.is_empty() && new_identity == cokret_channel_identity(old_settings)
         }
         _ => false,
     }
@@ -2068,6 +2223,14 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             serde_json::json!({
                 "type": "line",
                 "allowed_senders": senders,
+                "settings": settings,
+            })
+        }
+        ChannelCredentials::Cokret { settings } => {
+            let mut settings = settings.clone();
+            settings.remove("enabled");
+            serde_json::json!({
+                "type": "cokret",
                 "settings": settings,
             })
         }
@@ -2870,6 +3033,23 @@ mod tests {
                         port: 9911,
                         auth_token: Some("api-token-secret".into()),
                     },
+                    ChannelCredentials::Cokret {
+                        settings: serde_json::json!({
+                            "mode": "account",
+                            "base_url": "https://cokret.example.org",
+                            "principal_id": "did:web:bot.example",
+                            "device_id": "octos-device",
+                            "access_token": "ck-session-secret",
+                            "default_realm_id": "ck:realm:test",
+                            "keyRef": {
+                                "kind": "inline_seed_base64",
+                                "value": "c2F2ZWQtaW5saW5lLXNlZWQtc2VjcmV0LWRhdGE="
+                            }
+                        })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                    },
                     ChannelCredentials::Matrix {
                         homeserver: "https://matrix.example.org".into(),
                         as_token: "as-token-secret".into(),
@@ -2904,13 +3084,18 @@ mod tests {
             panic!("expected api channel");
         };
         assert_eq!(auth_token.as_deref(), Some("api-***ret"));
+        let ChannelCredentials::Cokret { settings } = &masked.config.channels[1] else {
+            panic!("expected cokret channel");
+        };
+        assert_eq!(settings["access_token"], "ck-s***ret");
+        assert_eq!(settings["keyRef"]["value"], "c2F2***GE=");
         let ChannelCredentials::Matrix {
             as_token,
             hs_token,
             access_token,
             password,
             ..
-        } = &masked.config.channels[1]
+        } = &masked.config.channels[2]
         else {
             panic!("expected matrix channel");
         };
@@ -3017,6 +3202,23 @@ mod tests {
                         port: 9911,
                         auth_token: Some("api-real-token".into()),
                     },
+                    ChannelCredentials::Cokret {
+                        settings: serde_json::json!({
+                            "mode": "account",
+                            "base_url": "https://cokret.example.org",
+                            "principal_id": "did:web:bot.example",
+                            "device_id": "octos-device",
+                            "access_token": "ck-real-session-token",
+                            "default_realm_id": "ck:realm:test",
+                            "keyRef": {
+                                "kind": "inline_seed_base64",
+                                "value": "cmVhbC1jb2tyZXQtaW5saW5lLXNlZWQ="
+                            }
+                        })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                    },
                     ChannelCredentials::Matrix {
                         homeserver: "https://old.example.org".into(),
                         as_token: "as-real-token".into(),
@@ -3050,6 +3252,11 @@ mod tests {
             panic!("expected api channel");
         };
         *auth_token = Some("api-***ken".into());
+        let ChannelCredentials::Cokret { settings } = &mut updated.config.channels[1] else {
+            panic!("expected cokret channel");
+        };
+        settings["access_token"] = serde_json::json!("ck-r***ken");
+        settings["keyRef"]["value"] = serde_json::json!("cmVh***WQ=");
         let ChannelCredentials::Matrix {
             homeserver,
             as_token,
@@ -3058,7 +3265,7 @@ mod tests {
             password,
             device_name,
             ..
-        } = &mut updated.config.channels[1]
+        } = &mut updated.config.channels[2]
         else {
             panic!("expected matrix channel");
         };
@@ -3075,6 +3282,14 @@ mod tests {
             panic!("expected api channel");
         };
         assert_eq!(auth_token.as_deref(), Some("api-real-token"));
+        let ChannelCredentials::Cokret { settings } = &loaded.config.channels[1] else {
+            panic!("expected cokret channel");
+        };
+        assert_eq!(settings["access_token"], "ck-real-session-token");
+        assert_eq!(
+            settings["keyRef"]["value"],
+            "cmVhbC1jb2tyZXQtaW5saW5lLXNlZWQ="
+        );
         let ChannelCredentials::Matrix {
             homeserver,
             as_token,
@@ -3083,7 +3298,7 @@ mod tests {
             password,
             device_name,
             ..
-        } = &loaded.config.channels[1]
+        } = &loaded.config.channels[2]
         else {
             panic!("expected matrix channel");
         };
@@ -3971,11 +4186,51 @@ mod tests {
                 username_env: "EU".into(),
                 password_env: "EP".into(),
             },
+            ChannelCredentials::Cokret {
+                settings: serde_json::json!({
+                    "mode": "account",
+                    "base_url": "https://cokret.example.org",
+                    "principal_id": "did:web:bot.example",
+                    "device_id": "octos-device",
+                    "access_token": "ck-session-secret",
+                    "default_realm_id": "ck:realm:test"
+                })
+                .as_object()
+                .expect("object")
+                .clone(),
+            },
         ];
 
         let json = serde_json::to_string(&channels).unwrap();
         let parsed: Vec<ChannelCredentials> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.len(), 6);
+        assert_eq!(parsed.len(), 7);
+    }
+
+    #[test]
+    fn test_cokret_channel_to_entry_preserves_settings() {
+        let channel = ChannelCredentials::Cokret {
+            settings: serde_json::json!({
+                "enabled": true,
+                "mode": "account",
+                "base_url": "https://cokret.example.org",
+                "service_did": "did:webvh:cokret.example.org",
+                "principal_id": "did:web:bot.example",
+                "device_id": "octos-device",
+                "access_token": "ck-session-secret",
+                "default_realm_id": "ck:realm:test"
+            })
+            .as_object()
+            .expect("object")
+            .clone(),
+        };
+
+        let entry = channel_to_entry(&channel);
+        assert_eq!(entry["type"], "cokret");
+        assert!(entry["settings"].get("enabled").is_none());
+        assert_eq!(entry["settings"]["mode"], "account");
+        assert_eq!(entry["settings"]["base_url"], "https://cokret.example.org");
+        assert_eq!(entry["settings"]["principal_id"], "did:web:bot.example");
+        assert_eq!(entry["settings"]["access_token"], "ck-session-secret");
     }
 
     #[test]

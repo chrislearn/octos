@@ -26,12 +26,12 @@ use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 use std::time::Duration;
 
 use axum::Json;
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use chrono::Utc;
 use cokret::{IdempotencyDecision, IdempotencyWindow};
 use cokret_core::{
@@ -105,9 +105,10 @@ impl AppletState {
                     cfg.id
                 )
             })?;
-            let challenge = cfg.login_challenge.as_deref().ok_or_else(|| {
-                eyre!("applet '{}' has key_ref but no login_challenge", cfg.id)
-            })?;
+            let challenge = cfg
+                .login_challenge
+                .as_deref()
+                .ok_or_else(|| eyre!("applet '{}' has key_ref but no login_challenge", cfg.id))?;
             let signer = load_ed25519_signer(key_ref, &cfg.bot_actor_id, &vm)?;
             let principal = Did::new(cfg.bot_actor_id.clone())
                 .map_err(|err| eyre!("invalid bot DID: {err}"))?;
@@ -128,7 +129,10 @@ impl AppletState {
             Ok(client)
         } else {
             let bearer = cfg.cokret_bearer_token.as_deref().ok_or_else(|| {
-                eyre!("applet '{}' has neither key_ref nor cokret_bearer_token", cfg.id)
+                eyre!(
+                    "applet '{}' has neither key_ref nor cokret_bearer_token",
+                    cfg.id
+                )
             })?;
             CokretHttpClient::new(&cfg.cokret_server_url, bearer)
         }
@@ -236,7 +240,10 @@ pub async fn serve(
     let app = Router::new()
         .route("/_cokret/edge/applet/ping", get(applet_ping))
         .route("/_cokret/edge/applet/describe", get(applet_describe))
-        .route("/_cokret/edge/applet/transactions", post(applet_transactions))
+        .route(
+            "/_cokret/edge/applet/transactions",
+            post(applet_transactions),
+        )
         .route("/_cokret/edge/applet/actors/{actor_id}", get(applet_actor))
         .route(
             "/_cokret/edge/applet/realms/{realm_id_or_alias}",
@@ -473,7 +480,10 @@ async fn applet_transactions(
                     .into_response();
             }
             IdempotencyDecision::Conflict { .. } => {
-                warn!(source_service_did, idempotency_key, "applet: idempotency conflict");
+                warn!(
+                    source_service_did,
+                    idempotency_key, "applet: idempotency conflict"
+                );
                 return err_json(
                     StatusCode::CONFLICT,
                     "duplicate_conflict",
@@ -516,7 +526,10 @@ async fn applet_transactions(
                     origin: MessageOrigin::ExternalUser,
                 };
                 if ctx.inbound_tx.send(inbound).await.is_err() {
-                    warn!("applet: inbound bus closed; dropping event {}", cmd.event_id);
+                    warn!(
+                        "applet: inbound bus closed; dropping event {}",
+                        cmd.event_id
+                    );
                 }
             }
             AppletEventOutcome::Skip(reason) => {
@@ -637,11 +650,14 @@ async fn applet_third_party_users(
             "third_party lookup requires a supported protocol query parameter",
         );
     };
-    let actor_id = field_first(&fields, &["actor_id", "user", "user_id", "external_id", "id"])
-        .map(|external_id| {
-            super::ghost::mint_ghost_did(&cfg.service_did, &cfg.ghost_did_prefix, external_id)
-        })
-        .filter(|actor_id| cfg.namespaces.actor_matches(actor_id));
+    let actor_id = field_first(
+        &fields,
+        &["actor_id", "user", "user_id", "external_id", "id"],
+    )
+    .map(|external_id| {
+        super::ghost::mint_ghost_did(&cfg.service_did, &cfg.ghost_did_prefix, external_id)
+    })
+    .filter(|actor_id| cfg.namespaces.actor_matches(actor_id));
     let exists = actor_id.is_some();
     (
         StatusCode::OK,
@@ -694,7 +710,10 @@ fn field_first<'a>(fields: &'a HashMap<String, String>, keys: &[&str]) -> Option
     })
 }
 
-fn supported_protocol(cfg: &CokretAppletConfig, fields: &HashMap<String, String>) -> Option<String> {
+fn supported_protocol(
+    cfg: &CokretAppletConfig,
+    fields: &HashMap<String, String>,
+) -> Option<String> {
     let protocol = field_first(fields, &["protocol"])?;
     cfg.protocols
         .iter()
@@ -729,7 +748,13 @@ fn location_candidates(protocol: &str, fields: &HashMap<String, String>) -> Vec<
     }
     if let Some(location) = field_first(
         fields,
-        &["location", "location_id", "external_id", "id", "conversation"],
+        &[
+            "location",
+            "location_id",
+            "external_id",
+            "id",
+            "conversation",
+        ],
     ) {
         candidates.push(format!("{protocol}:location:{location}"));
     }

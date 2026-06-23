@@ -121,12 +121,24 @@ fn is_channel_compiled(channel_type: &str) -> bool {
         "whatsapp" => true,
         #[cfg(feature = "feishu")]
         "feishu" | "lark" => true,
+        #[cfg(feature = "twilio")]
+        "twilio" => true,
+        #[cfg(feature = "wecom")]
+        "wecom" => true,
         #[cfg(feature = "wecom-bot")]
         "wecom-bot" => true,
         #[cfg(feature = "qq-bot")]
         "qq-bot" => true,
+        #[cfg(feature = "wechat")]
+        "wechat" => true,
+        #[cfg(feature = "line")]
+        "line" => true,
         #[cfg(feature = "matrix")]
         "matrix" => true,
+        #[cfg(feature = "api")]
+        "api" => true,
+        #[cfg(feature = "cokret")]
+        "cokret" => true,
         _ => false,
     }
 }
@@ -234,6 +246,21 @@ fn channel_config_summary(channel_type: &str, settings: &serde_json::Value) -> S
             } else {
                 format!("{id_env}: not set")
             }
+        }
+        "cokret" => {
+            let mode = settings
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("account");
+            let url = settings
+                .get("baseUrl")
+                .or_else(|| settings.get("base_url"))
+                .or_else(|| settings.get("cokretServerUrl"))
+                .or_else(|| settings.get("cokret_server_url"))
+                .or_else(|| settings.get("homeserver"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("no server URL");
+            format!("{mode}: {url}")
         }
         other => format!("unknown: {other}"),
     }

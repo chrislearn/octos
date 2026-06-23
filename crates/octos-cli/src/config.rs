@@ -1445,10 +1445,14 @@ impl Config {
                 "email",
                 "feishu",
                 "twilio",
+                "api",
                 "wecom",
                 "wecom-bot",
                 "qq-bot",
                 "wechat",
+                "line",
+                "matrix",
+                "cokret",
             ];
             for ch in &gw.channels {
                 if !VALID_CHANNELS.contains(&ch.channel_type.as_str()) {

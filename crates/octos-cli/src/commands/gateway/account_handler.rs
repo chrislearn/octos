@@ -62,6 +62,7 @@ pub async fn handle_account_command(
                             crate::profiles::ChannelCredentials::QQBot { .. } => "qq-bot",
                             crate::profiles::ChannelCredentials::WeChat { .. } => "wechat",
                             crate::profiles::ChannelCredentials::Line { .. } => "line",
+                            crate::profiles::ChannelCredentials::Cokret { .. } => "cokret",
                         })
                         .collect();
                     let sb = if s.config.sandbox.enabled {

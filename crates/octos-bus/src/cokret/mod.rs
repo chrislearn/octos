@@ -225,10 +225,12 @@ async fn construct_account_client(
                     account.id
                 )
             })?;
-        let challenge = account
-            .login_challenge
-            .as_deref()
-            .ok_or_else(|| eyre!("cokret account '{}' has key_ref but no login_challenge", account.id))?;
+        let challenge = account.login_challenge.as_deref().ok_or_else(|| {
+            eyre!(
+                "cokret account '{}' has key_ref but no login_challenge",
+                account.id
+            )
+        })?;
         let signer = load_ed25519_signer(key_ref, &account.principal_id, &vm)?;
         let principal = Did::new(account.principal_id.clone())
             .map_err(|err| eyre!("invalid principal_id: {err}"))?;
@@ -283,7 +285,10 @@ async fn run_account_subscribe_loop(
             return;
         }
         let initial = cursor.is_none();
-        match client.account_subscribe_stream(cursor.as_deref(), initial).await {
+        match client
+            .account_subscribe_stream(cursor.as_deref(), initial)
+            .await
+        {
             Ok(stream) => {
                 let outcome = consume_stream(
                     stream,
@@ -449,16 +454,19 @@ async fn send_account_message(
     let mut event = build_message_create_event(&request)?;
 
     if let Some(grant_path) = &account.grant_event_path {
-        let grant =
-            load_and_verify_grant(grant_path, &account.principal_id, account.default_realm_id.as_deref())
-                .await
-                .wrap_err_with(|| {
-                    format!(
-                        "cokret account '{}' failed to load capability grant {}",
-                        account.id,
-                        grant_path.display()
-                    )
-                })?;
+        let grant = load_and_verify_grant(
+            grant_path,
+            &account.principal_id,
+            account.default_realm_id.as_deref(),
+        )
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "cokret account '{}' failed to load capability grant {}",
+                account.id,
+                grant_path.display()
+            )
+        })?;
         if !grant.covers_action("ck.message.create") {
             bail!(
                 "cokret account '{}' capability grant {} does not cover ck.message.create",
@@ -577,7 +585,10 @@ mod tests {
         });
         let cfg = CokretChannelConfig::from_settings("cokret-account", &settings).expect("parse");
         assert_eq!(cfg.accounts.len(), 1);
-        assert_eq!(cfg.accounts[0].principal_id, "did:webvh:127.0.0.1%3A8008:agents:support");
+        assert_eq!(
+            cfg.accounts[0].principal_id,
+            "did:webvh:127.0.0.1%3A8008:agents:support"
+        );
         cfg.validate().expect("validate");
     }
 

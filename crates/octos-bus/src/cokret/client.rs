@@ -26,15 +26,14 @@ pub struct CokretHttpClient {
 
 /// Stream of [`AccountSubscribeFrame`] yielded by
 /// [`CokretHttpClient::account_subscribe_stream`].
-pub type CokretFrameStream =
-    Pin<Box<dyn Stream<Item = Result<AccountSubscribeFrame>> + Send>>;
+pub type CokretFrameStream = Pin<Box<dyn Stream<Item = Result<AccountSubscribeFrame>> + Send>>;
 
 impl CokretHttpClient {
     /// Build a new HTTP client bound to `base_url`, authenticated via the
     /// given bearer access token (typically a `ck.session.grant`).
     pub fn new(base_url: &str, access_token: &str) -> Result<Self> {
-        let url =
-            Url::parse(base_url).wrap_err_with(|| format!("invalid Cokret base_url: {base_url}"))?;
+        let url = Url::parse(base_url)
+            .wrap_err_with(|| format!("invalid Cokret base_url: {base_url}"))?;
         let inner = ClientBuilder::new(url)
             .auth(Auth::Bearer(access_token.to_owned()))
             .build()
@@ -61,8 +60,8 @@ impl CokretHttpClient {
         challenge: &str,
         audience: &str,
     ) -> Result<(Self, CokretSession)> {
-        let url =
-            Url::parse(base_url).wrap_err_with(|| format!("invalid Cokret base_url: {base_url}"))?;
+        let url = Url::parse(base_url)
+            .wrap_err_with(|| format!("invalid Cokret base_url: {base_url}"))?;
         let bootstrap = ClientBuilder::new(url.clone())
             .build()
             .map_err(|err| eyre!("bootstrap HTTP client: {err}"))?;
@@ -84,8 +83,8 @@ impl CokretHttpClient {
 
     /// Re-bind the bearer token in-place (after a re-login).
     pub fn refresh_bearer(&mut self, base_url: &str, access_token: &str) -> Result<()> {
-        let url =
-            Url::parse(base_url).wrap_err_with(|| format!("invalid Cokret base_url: {base_url}"))?;
+        let url = Url::parse(base_url)
+            .wrap_err_with(|| format!("invalid Cokret base_url: {base_url}"))?;
         self.inner = ClientBuilder::new(url)
             .auth(Auth::Bearer(access_token.to_owned()))
             .build()
