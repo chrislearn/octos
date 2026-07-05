@@ -12,7 +12,7 @@ pub mod namespace;
 pub mod outbound;
 pub mod transaction;
 
-pub use config::CokretAppletConfig;
+pub use config::{CokretAppletConfig, CokretAppletTrustedVerificationMethod};
 pub use ghost::{build_external_ref, build_ghost_profile_event, mint_ghost_did};
 pub use http::AppletState;
 pub use namespace::{AppletNamespaces, NamespacePattern, namespace_pattern_matches};

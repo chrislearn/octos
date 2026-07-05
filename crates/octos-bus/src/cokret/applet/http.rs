@@ -29,17 +29,21 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
-use cokret::{IdempotencyDecision, IdempotencyWindow};
+use cokret::http_signature::{
+    Component, HttpMessageVerificationError, SignaturePolicyError, SignatureVerificationPolicy,
+    parse_signature_input, public_key_from_bytes, verify_signed_http_message,
+};
+use cokret::{IdempotencyClaim, IdempotencyDirection, IdempotencyIdentity, IdempotencyWindow};
 use cokret_core::{
     AppletDescription, AppletPingOutcome, AppletTransactionOutcome, AppletTransactionRequestBody,
     Did, Hash, canonical,
 };
 use cokret_identifiers::RealmId;
-use eyre::{Result, WrapErr, eyre};
+use eyre::{Result, WrapErr, bail, eyre};
 use octos_core::{InboundMessage, MessageOrigin};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -48,19 +52,28 @@ use tracing::{debug, info, warn};
 
 use super::config::CokretAppletConfig;
 use super::outbound::{build_applet_message_event, sign_outbound_event};
-use super::transaction::{AppletEventOutcome, classify_inbound_event};
+use super::transaction::{AppletDispatchSkip, AppletEventOutcome, classify_inbound_event};
 use crate::cokret::client::CokretHttpClient;
+use crate::cokret::crypto_state::{
+    CokretDecryptOutcome, CokretEncryptOutcome, FileCokretCryptoStore,
+    extract_encrypted_payload_from_message_content,
+};
 use crate::cokret::signer::load_ed25519_signer;
 
 const TXN_DEDUPE_WINDOW: Duration = Duration::from_secs(300);
 const MAX_APPLET_TRANSACTION_BODY_BYTES: usize = 65_536;
 const EVENT_DEDUPE_MAX: usize = 4096;
+const SOURCE_SERVICE_DID_HEADER: &str = "source-service-did";
+const DESTINATION_SERVICE_DID_HEADER: &str = "destination-service-did";
+const APPLET_TRANSACTION_SIGNATURE_MAX_LIFETIME_SECS: i64 = 300;
+const APPLET_TRANSACTION_SIGNATURE_MAX_CLOCK_SKEW_SECS: i64 = 30;
 
 /// Shared applet runtime state held by a `CokretChannel` in applet mode.
 pub struct AppletState {
     config: CokretAppletConfig,
-    idempotency: Mutex<IdempotencyWindow>,
+    idempotency: IdempotencyWindow<AppletTransactionOutcome>,
     seq: cokret_bridge_runtime::SeqAllocator,
+    crypto_store: FileCokretCryptoStore,
     /// Bounded set of recently-dispatched `event_id`s (loop / retry guard).
     event_dedupe: Mutex<EventDedupe>,
 }
@@ -68,15 +81,30 @@ pub struct AppletState {
 impl AppletState {
     /// Build the runtime state with a restart-safe monotonic `actor_seq`
     /// allocator backed by `seq_path`.
-    pub fn new(config: CokretAppletConfig, seq_path: std::path::PathBuf) -> Result<Arc<Self>> {
+    pub fn new(
+        config: CokretAppletConfig,
+        seq_path: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
+    ) -> Result<Arc<Self>> {
         let store = crate::cokret::seq_store::FileSeqStore::shared(seq_path)
             .map_err(|e| eyre!("cokret applet seq store: {e}"))?;
         let key = format!("applet:{}:actor_seq", config.id);
         let seq = cokret_bridge_runtime::SeqAllocator::new(store, key);
+        let crypto_store = FileCokretCryptoStore::for_applet(&data_dir, &config.id);
+        if let Err(err) =
+            FileCokretCryptoStore::feature_report().and_then(|_| crypto_store.ensure_created())
+        {
+            warn!(
+                "cokret: applet '{}' crypto state unavailable at {}: {err:#}",
+                config.id,
+                crypto_store.path().display()
+            );
+        }
         Ok(Arc::new(Self {
             config,
-            idempotency: Mutex::new(IdempotencyWindow::new(TXN_DEDUPE_WINDOW)),
+            idempotency: IdempotencyWindow::new(TXN_DEDUPE_WINDOW),
             seq,
+            crypto_store,
             event_dedupe: Mutex::new(EventDedupe::new(EVENT_DEDUPE_MAX)),
         }))
     }
@@ -112,11 +140,14 @@ impl AppletState {
             let signer = load_ed25519_signer(key_ref, &cfg.bot_actor_id, &vm)?;
             let principal = Did::new(cfg.bot_actor_id.clone())
                 .map_err(|err| eyre!("invalid bot DID: {err}"))?;
-            let device = cokret_identifiers::DeviceId::new(format!(
-                "ck:device:applet-{}",
-                cfg.applet_id.trim_start_matches("ck:applet:")
-            ))
-            .map_err(|err| eyre!("synth device_id: {err}"))?;
+            let device_id = cfg.device_id.clone().unwrap_or_else(|| {
+                format!(
+                    "ck:device:applet-{}",
+                    cfg.applet_id.trim_start_matches("ck:applet:")
+                )
+            });
+            let device = cokret_identifiers::DeviceId::new(device_id)
+                .map_err(|err| eyre!("synth device_id: {err}"))?;
             let (client, _session) = CokretHttpClient::login(
                 &cfg.cokret_server_url,
                 &signer,
@@ -168,6 +199,7 @@ impl AppletState {
             thread_root_id: None,
         };
         let mut event = build_applet_message_event(&req)?;
+        apply_applet_outbound_encryption(&self.crypto_store, realm_id, &mut event)?;
 
         if let Some(key_ref) = &cfg.key_ref {
             let vm = cfg
@@ -218,6 +250,33 @@ impl AppletState {
                 );
                 None
             }
+        }
+    }
+}
+
+fn apply_applet_outbound_encryption(
+    crypto_store: &FileCokretCryptoStore,
+    realm_id: &str,
+    event: &mut cokret_core::Event,
+) -> Result<()> {
+    let Some(content_block) = event.content.get("content").cloned() else {
+        return Ok(());
+    };
+    match crypto_store.encrypt_content_block_for_realm(realm_id, &content_block)? {
+        CokretEncryptOutcome::PlaintextAllowed => Ok(()),
+        CokretEncryptOutcome::Encrypted(encrypted_content) => {
+            let object = event
+                .content
+                .as_object_mut()
+                .ok_or_else(|| eyre!("Cokret applet message content is not an object"))?;
+            object.remove("content");
+            object.insert("encrypted_content".to_owned(), encrypted_content);
+            Ok(())
+        }
+        CokretEncryptOutcome::MissingRequiredGroupState { realm_id, group_id } => {
+            bail!(
+                "Cokret realm '{realm_id}' requires E2EE but no local applet MLS group state exists for group '{group_id}'"
+            );
         }
     }
 }
@@ -316,19 +375,32 @@ fn err_json(status: StatusCode, code: &str, message: impl Into<String>) -> Respo
         .into_response()
 }
 
+#[derive(Debug, Clone)]
+struct VerifiedAppletHttpSignature {
+    source_service_did: String,
+    destination_service_did: String,
+    key_id: String,
+    source_key_state_digest: String,
+    content_digest: Option<String>,
+    covered_components: Vec<String>,
+    created: i64,
+    expires: i64,
+    canonical_message_digest: String,
+}
+
 /// Bearer-authenticate the request against the applet's configured token.
-fn check_auth(ctx: &HttpCtx, headers: &HeaderMap) -> std::result::Result<(), Response> {
+fn check_auth(ctx: &HttpCtx, headers: &HeaderMap) -> Option<Response> {
     let Some(token) = bearer_token(headers) else {
-        return Err(err_json(
+        return Some(err_json(
             StatusCode::UNAUTHORIZED,
             "missing_bearer_token",
             "Cokret applet endpoint requires Authorization: Bearer <token>",
         ));
     };
     if token_matches(ctx.state.config.cokret_bearer_token.as_deref(), &token) {
-        Ok(())
+        None
     } else {
-        Err(err_json(
+        Some(err_json(
             StatusCode::UNAUTHORIZED,
             "invalid_bearer_token",
             "Authorization token does not match this Cokret applet channel",
@@ -339,7 +411,7 @@ fn check_auth(ctx: &HttpCtx, headers: &HeaderMap) -> std::result::Result<(), Res
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 async fn applet_ping(State(ctx): State<HttpCtx>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&ctx, &headers) {
+    if let Some(resp) = check_auth(&ctx, &headers) {
         return resp;
     }
     let cfg = &ctx.state.config;
@@ -360,7 +432,7 @@ async fn applet_ping(State(ctx): State<HttpCtx>, headers: HeaderMap) -> Response
 }
 
 async fn applet_describe(State(ctx): State<HttpCtx>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&ctx, &headers) {
+    if let Some(resp) = check_auth(&ctx, &headers) {
         return resp;
     }
     let cfg = &ctx.state.config;
@@ -383,22 +455,36 @@ async fn applet_describe(State(ctx): State<HttpCtx>, headers: HeaderMap) -> Resp
         limits: json!({
             "max_events_per_transaction": 100,
             "max_body_bytes": MAX_APPLET_TRANSACTION_BODY_BYTES,
+            "e2ee": {
+                "encrypted_content": "decrypt_when_local_group_state_exists",
+                "outbound_policy": "encrypt_when_realm_requires_e2ee",
+                "plaintext_fallback": "only_when_realm_policy_allows_plaintext",
+                "device_id_configured": cfg.device_id.is_some(),
+                "crypto_store": ctx.state.crypto_store.path().display().to_string(),
+            },
         }),
         auth: json!({
             "type": "bearer",
             "controller_did": cfg.controller_did,
             "bot_actor_id": cfg.bot_actor_id,
+            "bot_device_id": cfg.device_id.as_deref(),
+            "http_message_signature": {
+                "required_when_trusted_keys_configured": true,
+                "trusted_verification_methods": cfg.trusted_verification_methods.len(),
+            },
         }),
     };
     (StatusCode::OK, Json(body)).into_response()
 }
 
 async fn applet_transactions(
+    method: Method,
+    uri: Uri,
     State(ctx): State<HttpCtx>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Response {
-    if let Err(resp) = check_auth(&ctx, &headers) {
+    if let Some(resp) = check_auth(&ctx, &headers) {
         return resp;
     }
     let Some(idempotency_key) = headers
@@ -432,7 +518,59 @@ async fn applet_transactions(
         }
     };
 
+    let request_headers = collect_headers(&headers);
+    let signature_path = uri
+        .path_and_query()
+        .map(|value| value.as_str().to_owned())
+        .unwrap_or_else(|| "/".to_owned());
+    let signature_authority = request_authority(&uri, &request_headers).ok();
+    let signature_target_uri = signature_authority
+        .as_deref()
+        .map(|authority| request_target_uri(&uri, &request_headers, authority, &signature_path));
+
     let source_service_did = body.source_service_did.as_str().to_owned();
+    if let Some(expected_source) = ctx.state.config.cokret_server_did.as_deref()
+        && source_service_did != expected_source
+    {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "invalid_source_service_did",
+            "Cokret applet transaction source_service_did does not match the trusted server DID",
+        );
+    }
+
+    let verified_http_signature = match verify_applet_transaction_http_signature(
+        &ctx.state,
+        method.as_str(),
+        signature_target_uri.as_deref(),
+        signature_authority.as_deref(),
+        &signature_path,
+        &request_headers,
+        raw.as_ref(),
+    ) {
+        Ok(verified) => verified,
+        Err(err) => {
+            warn!(
+                config_id = %ctx.state.config.id,
+                "applet: inbound HTTP message signature verification failed: {err:#}"
+            );
+            return err_json(
+                StatusCode::UNAUTHORIZED,
+                "invalid_signature",
+                "Cokret applet transaction HTTP message signature verification failed",
+            );
+        }
+    };
+    if let Some(signature) = verified_http_signature.as_ref()
+        && signature.source_service_did != source_service_did
+    {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "Cokret applet transaction source_service_did does not match signed source service DID",
+        );
+    }
+
     let body_hash = match canonical::canonical_sha256(&body).map(Hash::new) {
         Ok(Ok(h)) => h,
         Ok(Err(err)) => {
@@ -453,86 +591,111 @@ async fn applet_transactions(
         }
     };
 
-    // Idempotency check (SDK IdempotencyWindow).
+    let idempotency_key = idempotency_key.trim().to_owned();
+    let identity = IdempotencyIdentity::applet_transaction(
+        IdempotencyDirection::NodeToApplet,
+        source_service_did.clone(),
+        ctx.state.config.service_did.clone(),
+        idempotency_key.clone(),
+    );
+    let source_signature_evidence = if let Some(signature) = verified_http_signature.as_ref() {
+        json!({
+            "operation_id": cokret::APPLET_TRANSACTION_OPERATION_ID,
+            "direction": IdempotencyDirection::NodeToApplet.as_str(),
+            "source_service_did": &source_service_did,
+            "destination_service_did": &signature.destination_service_did,
+            "idempotency_key": &idempotency_key,
+            "auth_scheme": "http_message_signature+bearer",
+            "canonical_body_digest": body_hash.clone(),
+            "content_digest": &signature.content_digest,
+            "covered_components": &signature.covered_components,
+            "created": signature.created,
+            "expires": signature.expires,
+            "canonical_message_digest": &signature.canonical_message_digest,
+            "source_key_state_digest": &signature.source_key_state_digest,
+            "verification_method": &signature.key_id,
+        })
+    } else {
+        json!({
+            "operation_id": cokret::APPLET_TRANSACTION_OPERATION_ID,
+            "direction": IdempotencyDirection::NodeToApplet.as_str(),
+            "source_service_did": &source_service_did,
+            "destination_service_did": ctx.state.config.service_did.clone(),
+            "idempotency_key": &idempotency_key,
+            "auth_scheme": "bearer",
+            "content_digest": body_hash.clone(),
+        })
+    };
+    let source_signature_anchor = match canonical::canonical_json_string(&source_signature_evidence)
     {
-        let Ok(window) = ctx.state.idempotency.lock() else {
+        Ok(anchor) => anchor,
+        Err(err) => {
+            warn!("applet: source signature anchor construct failed: {err}");
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "state_unavailable",
-                "Cokret applet runtime state unavailable",
+                "idempotency_anchor_failed",
+                "failed to compute idempotency source signature anchor",
             );
-        };
-        window.gc();
-        match window.check(&source_service_did, &idempotency_key, &body_hash) {
-            IdempotencyDecision::Fresh => {
-                window.record(&source_service_did, &idempotency_key, body_hash.clone());
-            }
-            IdempotencyDecision::Duplicate { .. } => {
-                debug!(source_service_did, idempotency_key, "applet: duplicate txn");
-                return (
-                    StatusCode::OK,
-                    Json(AppletTransactionOutcome {
-                        ok: true,
-                        rejected: vec![],
-                        retry_after_ms: None,
-                    }),
-                )
-                    .into_response();
-            }
-            IdempotencyDecision::Conflict { .. } => {
-                warn!(
-                    source_service_did,
-                    idempotency_key, "applet: idempotency conflict"
-                );
-                return err_json(
-                    StatusCode::CONFLICT,
-                    "duplicate_conflict",
-                    "Idempotency-Key already used for a different request body",
-                );
-            }
+        }
+    };
+
+    ctx.state.idempotency.gc();
+    match ctx
+        .state
+        .idempotency
+        .claim(&identity, &body_hash, &source_signature_anchor)
+    {
+        IdempotencyClaim::Fresh => {}
+        IdempotencyClaim::Duplicate { outcome, .. } => {
+            debug!(
+                source_service_did,
+                idempotency_key, "applet: duplicate transaction; returning cached outcome"
+            );
+            return (StatusCode::OK, Json(outcome)).into_response();
+        }
+        IdempotencyClaim::DuplicateConflict { .. } => {
+            warn!(
+                source_service_did,
+                idempotency_key,
+                "applet: idempotency conflict with different body hash or source signature anchor"
+            );
+            return err_json(
+                StatusCode::CONFLICT,
+                "duplicate_conflict",
+                "Idempotency-Key already used for a different request body or signature anchor",
+            );
+        }
+        IdempotencyClaim::InFlight { .. } => {
+            return err_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "duplicate_in_flight",
+                "duplicate transaction is still being processed; retry to receive the outcome",
+            );
         }
     }
 
     // Classify events and dispatch the accepted ones.
     let mut rejected: Vec<Value> = Vec::new();
+    let mut dispatched_commands = Vec::new();
     let cfg = &ctx.state.config;
     for event in body.events.iter() {
         match classify_inbound_event(cfg, event) {
-            AppletEventOutcome::Dispatch(cmd) => {
+            AppletEventOutcome::Dispatch(cmd) => dispatched_commands.push(cmd),
+            AppletEventOutcome::Skip(reason) => {
+                if matches!(reason, AppletDispatchSkip::EncryptedContent)
+                    && let Some(cmd) = try_decrypt_applet_event(&ctx.state, event)
                 {
-                    let Ok(mut dedupe) = ctx.state.event_dedupe.lock() else {
-                        continue;
-                    };
-                    if !dedupe.insert(cmd.event_id.clone()) {
-                        continue;
-                    }
+                    dispatched_commands.push(cmd);
+                    continue;
                 }
-                let chat_id = super::super::encode_chat_id(&cmd.realm_id, cmd.flow_id.as_deref());
-                let inbound = InboundMessage {
-                    channel: super::super::CHANNEL_NAME.to_owned(),
-                    sender_id: cmd.sender_did.clone(),
-                    chat_id,
-                    content: cmd.body.clone(),
-                    timestamp: Utc::now(),
-                    media: vec![],
-                    metadata: json!({
-                        "cokret_mode": "applet",
-                        "realm_id": cmd.realm_id,
-                        "flow_id": cmd.flow_id,
-                        "thread_root_id": cmd.thread_root_id,
-                        "applet_id": cfg.applet_id,
-                    }),
-                    message_id: Some(cmd.event_id.clone()),
-                    origin: MessageOrigin::ExternalUser,
-                };
-                if ctx.inbound_tx.send(inbound).await.is_err() {
+                if matches!(reason, AppletDispatchSkip::EncryptedContent) {
                     warn!(
-                        "applet: inbound bus closed; dropping event {}",
-                        cmd.event_id
+                        config_id = %ctx.state.config.id,
+                        event_id = event.event_id.as_str(),
+                        realm_id = event.realm_id.as_str(),
+                        "cokret applet: encrypted inbound event rejected; no usable local MLS state"
                     );
                 }
-            }
-            AppletEventOutcome::Skip(reason) => {
                 rejected.push(json!({
                     "event_id": event.event_id.as_str(),
                     "reason_code": format!("{reason:?}"),
@@ -541,15 +704,385 @@ async fn applet_transactions(
         }
     }
 
-    (
-        StatusCode::OK,
-        Json(AppletTransactionOutcome {
-            ok: true,
-            rejected,
-            retry_after_ms: None,
-        }),
+    for cmd in dispatched_commands {
+        {
+            let Ok(mut dedupe) = ctx.state.event_dedupe.lock() else {
+                continue;
+            };
+            if !dedupe.insert(cmd.event_id.clone()) {
+                continue;
+            }
+        }
+        let chat_id = super::super::encode_chat_id(&cmd.realm_id, cmd.flow_id.as_deref());
+        let inbound = InboundMessage {
+            channel: super::super::CHANNEL_NAME.to_owned(),
+            sender_id: cmd.sender_did.clone(),
+            chat_id,
+            content: cmd.body.clone(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: json!({
+                "cokret_mode": "applet",
+                "realm_id": cmd.realm_id,
+                "flow_id": cmd.flow_id,
+                "thread_root_id": cmd.thread_root_id,
+                "applet_id": cfg.applet_id.clone(),
+            }),
+            message_id: Some(cmd.event_id.clone()),
+            origin: MessageOrigin::ExternalUser,
+        };
+        if ctx.inbound_tx.send(inbound).await.is_err() {
+            warn!(
+                "applet: inbound bus closed; dropping event {}",
+                cmd.event_id
+            );
+        }
+    }
+
+    let outcome = AppletTransactionOutcome {
+        ok: true,
+        rejected,
+        retry_after_ms: None,
+    };
+    if !ctx.state.idempotency.complete(&identity, outcome.clone()) {
+        warn!("applet: idempotency claim was not in-flight when completing transaction");
+    }
+
+    (StatusCode::OK, Json(outcome)).into_response()
+}
+
+fn verify_applet_transaction_http_signature(
+    state: &AppletState,
+    method: &str,
+    target_uri: Option<&str>,
+    authority: Option<&str>,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<Option<VerifiedAppletHttpSignature>> {
+    let has_signature_headers = header_value_from(headers, "signature-input").is_some()
+        || header_value_from(headers, "signature").is_some();
+    if state.config.trusted_verification_methods.is_empty() {
+        if has_signature_headers {
+            bail!(
+                "request carries HTTP Message Signature headers but no trusted verification methods are configured"
+            );
+        }
+        return Ok(None);
+    }
+
+    let expected_source = state.config.cokret_server_did.as_deref().ok_or_else(|| {
+        eyre!("trusted verification methods require cokret_server_did / trustedServerDid")
+    })?;
+    let signature_input_header = header_value_from(headers, "signature-input")
+        .ok_or_else(|| eyre!("Signature-Input header is required"))?;
+    let signature_input = parse_signature_input(&signature_input_header)
+        .map_err(|err| eyre!("parse Signature-Input: {err}"))?;
+    let trusted_method = state
+        .config
+        .trusted_verification_methods
+        .iter()
+        .find(|method| method.verification_method == signature_input.key_id)
+        .ok_or_else(|| {
+            eyre!(
+                "verification method '{}' is not trusted for applet '{}'",
+                signature_input.key_id,
+                state.config.id
+            )
+        })?;
+    let signer_did = verification_method_did(&signature_input.key_id)
+        .ok_or_else(|| eyre!("HTTP signature keyid has no DID fragment"))?;
+    if signer_did != expected_source {
+        bail!(
+            "HTTP signature keyid owner '{signer_did}' does not match trusted server DID '{expected_source}'"
+        );
+    }
+
+    let source = header_value_from(headers, SOURCE_SERVICE_DID_HEADER)
+        .ok_or_else(|| eyre!("{SOURCE_SERVICE_DID_HEADER} header is required"))?;
+    if source != expected_source {
+        bail!(
+            "HTTP signature source service DID '{source}' does not match trusted server DID '{expected_source}'"
+        );
+    }
+    let destination = header_value_from(headers, DESTINATION_SERVICE_DID_HEADER)
+        .ok_or_else(|| eyre!("{DESTINATION_SERVICE_DID_HEADER} header is required"))?;
+    if destination != state.config.service_did {
+        bail!(
+            "HTTP signature destination service DID '{destination}' does not match applet service DID '{}'",
+            state.config.service_did
+        );
+    }
+
+    let public_key_bytes = trusted_method
+        .public_key
+        .ed25519_bytes()
+        .map_err(|err| eyre!("trusted HTTP signature public key: {err}"))?;
+    let source_key_state_digest = canonical::canonical_digest(&public_key_bytes);
+    let public_key = public_key_from_bytes(&public_key_bytes)
+        .map_err(|err| eyre!("trusted HTTP signature public key: {err}"))?;
+    let authority = authority.ok_or_else(|| eyre!("request authority/Host is required"))?;
+    let target_uri =
+        target_uri.ok_or_else(|| eyre!("request target URI could not be constructed"))?;
+    let required_components = vec![
+        Component::Method,
+        Component::TargetUri,
+        Component::Authority,
+        Component::Header(SOURCE_SERVICE_DID_HEADER.to_owned()),
+        Component::Header(DESTINATION_SERVICE_DID_HEADER.to_owned()),
+        Component::Header("content-digest".to_owned()),
+        Component::Header("idempotency-key".to_owned()),
+    ];
+    let policy = SignatureVerificationPolicy::new(required_components)
+        .require_content_digest(true)
+        .max_clock_skew_seconds(APPLET_TRANSACTION_SIGNATURE_MAX_CLOCK_SKEW_SECS)
+        .max_validity_window_seconds(APPLET_TRANSACTION_SIGNATURE_MAX_LIFETIME_SECS);
+    let verified = verify_signed_http_message(
+        method,
+        target_uri,
+        authority,
+        path,
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        body,
+        &public_key,
+        &policy,
+        chrono::Utc::now().timestamp(),
     )
-        .into_response()
+    .map_err(map_http_signature_error)?;
+    let content_digest = verified
+        .content_digest
+        .as_ref()
+        .map(|digest| digest.wire_value.clone());
+    let covered_components = verified
+        .signature_input
+        .covered_components
+        .iter()
+        .map(Component::canonical_name)
+        .collect();
+    let canonical_message_digest = canonical::canonical_digest(&verified.canonical_message);
+    Ok(Some(VerifiedAppletHttpSignature {
+        source_service_did: source,
+        destination_service_did: destination,
+        key_id: verified.signature_input.key_id,
+        source_key_state_digest,
+        content_digest,
+        covered_components,
+        created: verified.signature_input.created,
+        expires: verified.signature_input.expires,
+        canonical_message_digest,
+    }))
+}
+
+fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.trim().to_owned()))
+        })
+        .collect()
+}
+
+fn header_value_from(headers: &[(String, String)], name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let values: Vec<&str> = headers
+        .iter()
+        .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(&lower))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(", "))
+    }
+}
+
+fn request_authority(uri: &Uri, headers: &[(String, String)]) -> Result<String> {
+    header_value_from(headers, "host")
+        .or_else(|| {
+            uri.authority()
+                .map(|authority| authority.as_str().to_owned())
+        })
+        .ok_or_else(|| eyre!("request authority/Host is required"))
+}
+
+fn request_target_uri(
+    uri: &Uri,
+    headers: &[(String, String)],
+    authority: &str,
+    path: &str,
+) -> String {
+    if uri.scheme().is_some() && uri.authority().is_some() {
+        return uri.to_string();
+    }
+    let scheme = header_value_from(headers, "x-forwarded-proto")
+        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_owned))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "http".to_owned());
+    format!("{scheme}://{authority}{path}")
+}
+
+fn verification_method_did(verification_method: &str) -> Option<&str> {
+    verification_method
+        .rsplit_once('#')
+        .map(|(did, _)| did)
+        .filter(|did| !did.is_empty())
+}
+
+fn map_http_signature_error(err: HttpMessageVerificationError) -> eyre::Report {
+    match err {
+        HttpMessageVerificationError::MissingHeader(header) => {
+            eyre!("required HTTP signature header '{header}' is missing")
+        }
+        HttpMessageVerificationError::Policy(
+            SignaturePolicyError::MissingContentDigest
+            | SignaturePolicyError::MissingRequiredCoveredComponent,
+        ) => eyre!("HTTP signature does not cover required applet transaction fields"),
+        HttpMessageVerificationError::Policy(SignaturePolicyError::InvalidValidityWindow) => {
+            eyre!("HTTP signature validity window is invalid")
+        }
+        HttpMessageVerificationError::Policy(
+            SignaturePolicyError::CreatedInFuture | SignaturePolicyError::Expired,
+        ) => eyre!("HTTP signature timestamp is outside the accepted window"),
+        HttpMessageVerificationError::Signature(err) => eyre!("{err}"),
+    }
+}
+
+fn try_decrypt_applet_event(
+    state: &AppletState,
+    event: &cokret_core::Event,
+) -> Option<super::transaction::AppletInboundCommand> {
+    let payload = extract_encrypted_payload_from_message_content(&event.content)?;
+    if let Some(device_id) = state.config.device_id.as_deref() {
+        match state.crypto_store.plan_bootstrap_for_payload(
+            &state.config.bot_actor_id,
+            device_id,
+            &payload,
+        ) {
+            Ok(plan) => debug!(
+                config_id = %state.config.id,
+                group_id = %plan.group_id,
+                required_epoch = plan.required_epoch,
+                local_epoch = ?plan.local_epoch,
+                action = ?plan.action,
+                "cokret applet: planned crypto bootstrap for encrypted event"
+            ),
+            Err(err) => warn!(
+                config_id = %state.config.id,
+                "cokret applet: failed to plan crypto bootstrap for encrypted event: {err:#}"
+            ),
+        }
+    }
+
+    match state.crypto_store.try_decrypt_content_block(&payload) {
+        Ok(CokretDecryptOutcome::Decrypted(content)) => {
+            let Some(body) = decrypted_text_body(&content) else {
+                warn!(
+                    config_id = %state.config.id,
+                    event_id = event.event_id.as_str(),
+                    "cokret applet: decrypted encrypted event but content is not displayable text"
+                );
+                return None;
+            };
+            Some(super::transaction::AppletInboundCommand {
+                event_id: event.event_id.as_str().to_owned(),
+                realm_id: event.realm_id.as_str().to_owned(),
+                flow_id: event
+                    .content
+                    .get("flow_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                sender_did: event.actor_id.as_str().to_owned(),
+                body,
+                thread_root_id: event
+                    .content
+                    .get("thread_root_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        }
+        Ok(CokretDecryptOutcome::MissingGroupState) => {
+            record_applet_unable_to_decrypt(
+                state,
+                event,
+                payload,
+                cokret::crypto_protocol::UnableToDecryptReason::NoSession,
+            );
+            None
+        }
+        Ok(CokretDecryptOutcome::UnsupportedScheme(scheme)) => {
+            warn!(
+                config_id = %state.config.id,
+                event_id = event.event_id.as_str(),
+                scheme,
+                "cokret applet: unsupported encrypted payload scheme"
+            );
+            record_applet_unable_to_decrypt(
+                state,
+                event,
+                payload,
+                cokret::crypto_protocol::UnableToDecryptReason::BadCiphertext,
+            );
+            None
+        }
+        Err(err) => {
+            warn!(
+                config_id = %state.config.id,
+                event_id = event.event_id.as_str(),
+                "cokret applet: encrypted event decrypt failed: {err:#}"
+            );
+            record_applet_unable_to_decrypt(
+                state,
+                event,
+                payload,
+                cokret::crypto_protocol::UnableToDecryptReason::BadCiphertext,
+            );
+            None
+        }
+    }
+}
+
+fn record_applet_unable_to_decrypt(
+    state: &AppletState,
+    event: &cokret_core::Event,
+    payload: cokret_core::EncryptedPayload,
+    reason: cokret::crypto_protocol::UnableToDecryptReason,
+) {
+    if let Err(err) = state.crypto_store.record_unable_to_decrypt(
+        event.event_id.as_str(),
+        event.realm_id.as_str(),
+        event.actor_id.as_str(),
+        payload,
+        reason,
+    ) {
+        warn!(
+            config_id = %state.config.id,
+            event_id = event.event_id.as_str(),
+            "cokret applet: failed to persist unable-to-decrypt record: {err:#}"
+        );
+    }
+}
+
+fn decrypted_text_body(content: &Value) -> Option<String> {
+    let block = content
+        .get("content")
+        .filter(|inner| inner.get("kind").is_some())
+        .unwrap_or(content);
+    let kind = block.get("kind").and_then(Value::as_str)?;
+    if kind != "ck.content.text" {
+        return None;
+    }
+    block
+        .get("body")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+        .map(str::to_owned)
 }
 
 async fn applet_actor(
@@ -557,7 +1090,7 @@ async fn applet_actor(
     headers: HeaderMap,
     Path(actor_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = check_auth(&ctx, &headers) {
+    if let Some(resp) = check_auth(&ctx, &headers) {
         return resp;
     }
     if !ctx.state.config.namespaces.actor_matches(&actor_id) {
@@ -584,7 +1117,7 @@ async fn applet_realm(
     headers: HeaderMap,
     Path(realm): Path<String>,
 ) -> Response {
-    if let Err(resp) = check_auth(&ctx, &headers) {
+    if let Some(resp) = check_auth(&ctx, &headers) {
         return resp;
     }
     if !ctx.state.config.namespaces.realm_matches(&realm) {
@@ -611,7 +1144,7 @@ async fn applet_protocol(
     headers: HeaderMap,
     Path(protocol): Path<String>,
 ) -> Response {
-    if let Err(resp) = check_auth(&ctx, &headers) {
+    if let Some(resp) = check_auth(&ctx, &headers) {
         return resp;
     }
     if !ctx.state.config.protocols.iter().any(|p| p == &protocol) {
@@ -639,7 +1172,7 @@ async fn applet_third_party_users(
     headers: HeaderMap,
     Query(fields): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(resp) = check_auth(&ctx, &headers) {
+    if let Some(resp) = check_auth(&ctx, &headers) {
         return resp;
     }
     let cfg = &ctx.state.config;
@@ -675,7 +1208,7 @@ async fn applet_third_party_locations(
     headers: HeaderMap,
     Query(fields): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(resp) = check_auth(&ctx, &headers) {
+    if let Some(resp) = check_auth(&ctx, &headers) {
         return resp;
     }
     let cfg = &ctx.state.config;
@@ -789,5 +1322,169 @@ impl EventDedupe {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cokret::http_signature::{
+        Component, ContentDigest, ContentDigestAlgorithm, SignedRequestParts, canonical_message,
+        parse_signature_input, sign_message, signing_key_from_seed,
+    };
+    use cokret::signatures::PublicKeyMaterial;
+    use serde_json::json;
+
+    use super::*;
+
+    fn valid_config_with_trusted_key(public_key: Vec<u8>) -> CokretAppletConfig {
+        let public_key_value =
+            serde_json::to_value(PublicKeyMaterial::Ed25519Raw { bytes: public_key })
+                .expect("public key should serialize");
+        let settings = json!({
+            "mode": "applet",
+            "appletId": "ck:applet:21532600-0000-7000-8000-000000000000",
+            "serviceDid": "did:web:bridge.example",
+            "controllerDid": "did:webvh:example.com:admin",
+            "baseUrl": "https://octos.example/applet-test",
+            "botActorId": "did:web:bridge.example:bot",
+            "cokretServerUrl": "https://cokret.example.org",
+            "cokretServerDid": "did:webvh:cokret.example.org",
+            "accessToken": "test-bearer",
+            "protocols": ["slack"],
+            "namespaces": {
+                "actors": [{"pattern": "did:web:bridge.example:ghost:*", "exclusive": true}],
+                "realms": [{"pattern": "ck:realm:*", "exclusive": true}],
+                "handles": []
+            },
+            "trustedVerificationMethods": [{
+                "verificationMethod": "did:webvh:cokret.example.org#key-1",
+                "publicKey": public_key_value,
+            }]
+        });
+        let cfg = CokretAppletConfig::from_settings("applet-test", &settings).expect("parse");
+        cfg.validate().expect("validate");
+        cfg
+    }
+
+    fn state_with_trusted_http_signature_key(public_key: Vec<u8>) -> Arc<AppletState> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = valid_config_with_trusted_key(public_key);
+        AppletState::new(
+            cfg,
+            tmp.path().join("seq").join("applet.seq"),
+            tmp.path().to_path_buf(),
+        )
+        .expect("state")
+    }
+
+    fn signed_transaction_headers(body: &[u8], seed: [u8; 32]) -> (Vec<(String, String)>, Vec<u8>) {
+        let signing_key = signing_key_from_seed(&seed);
+        let public_key = signing_key.verifying_key().to_bytes().to_vec();
+        let now = chrono::Utc::now().timestamp();
+        let content_digest = ContentDigest::compute(body, ContentDigestAlgorithm::Sha256);
+        let signature_input = format!(
+            "sig1=(\"@method\" \"@target-uri\" \"@authority\" \
+             \"source-service-did\" \"destination-service-did\" \
+             \"content-digest\" \"idempotency-key\");created={now};expires={};\
+             keyid=\"did:webvh:cokret.example.org#key-1\";alg=\"ed25519\"",
+            now + 300
+        );
+        let mut headers = vec![
+            ("host".to_owned(), "octos.example".to_owned()),
+            (
+                SOURCE_SERVICE_DID_HEADER.to_owned(),
+                "did:webvh:cokret.example.org".to_owned(),
+            ),
+            (
+                DESTINATION_SERVICE_DID_HEADER.to_owned(),
+                "did:web:bridge.example".to_owned(),
+            ),
+            (
+                "content-digest".to_owned(),
+                content_digest.wire_value.clone(),
+            ),
+            ("idempotency-key".to_owned(), "txn-1".to_owned()),
+            ("signature-input".to_owned(), signature_input.clone()),
+        ];
+        let parsed = parse_signature_input(&signature_input).expect("signature input should parse");
+        assert!(parsed.covers_all(&[
+            Component::Method,
+            Component::TargetUri,
+            Component::Authority,
+            Component::Header(SOURCE_SERVICE_DID_HEADER.to_owned()),
+            Component::Header(DESTINATION_SERVICE_DID_HEADER.to_owned()),
+            Component::Header("content-digest".to_owned()),
+            Component::Header("idempotency-key".to_owned()),
+        ]));
+        let request = SignedRequestParts {
+            method: "POST".to_owned(),
+            target_uri: "http://octos.example/_cokret/edge/applet/transactions".to_owned(),
+            authority: "octos.example".to_owned(),
+            path: "/_cokret/edge/applet/transactions".to_owned(),
+            headers: headers.clone(),
+            body_digest: Some(content_digest.wire_value),
+        };
+        let message = canonical_message(&request, &parsed).expect("canonical message");
+        let signature = sign_message(&message, &signing_key);
+        headers.push(("signature".to_owned(), format!("sig1=:{signature}:")));
+        (headers, public_key)
+    }
+
+    #[test]
+    fn verifies_trusted_http_message_signature() {
+        let body = serde_json::to_vec(&json!({
+            "transaction_id": "txn-1",
+            "source_service_did": "did:webvh:cokret.example.org",
+            "events": []
+        }))
+        .expect("body should serialize");
+        let (headers, public_key) = signed_transaction_headers(&body, [9u8; 32]);
+        let state = state_with_trusted_http_signature_key(public_key);
+        let verified = verify_applet_transaction_http_signature(
+            &state,
+            "POST",
+            Some("http://octos.example/_cokret/edge/applet/transactions"),
+            Some("octos.example"),
+            "/_cokret/edge/applet/transactions",
+            &headers,
+            &body,
+        )
+        .expect("signature should verify")
+        .expect("signature should be required");
+        assert_eq!(verified.source_service_did, "did:webvh:cokret.example.org");
+        assert_eq!(verified.destination_service_did, "did:web:bridge.example");
+        assert_eq!(verified.key_id, "did:webvh:cokret.example.org#key-1");
+        assert!(verified.content_digest.is_some());
+    }
+
+    #[test]
+    fn rejects_tampered_http_message_signature_body() {
+        let body = serde_json::to_vec(&json!({
+            "transaction_id": "txn-1",
+            "source_service_did": "did:webvh:cokret.example.org",
+            "events": []
+        }))
+        .expect("body should serialize");
+        let (headers, public_key) = signed_transaction_headers(&body, [9u8; 32]);
+        let state = state_with_trusted_http_signature_key(public_key);
+        let tampered = serde_json::to_vec(&json!({
+            "transaction_id": "txn-1",
+            "source_service_did": "did:webvh:cokret.example.org",
+            "events": [{"kind":"ck.message.create"}]
+        }))
+        .expect("tampered body should serialize");
+        let err = verify_applet_transaction_http_signature(
+            &state,
+            "POST",
+            Some("http://octos.example/_cokret/edge/applet/transactions"),
+            Some("octos.example"),
+            "/_cokret/edge/applet/transactions",
+            &headers,
+            &tampered,
+        )
+        .expect_err("tampered body must fail signature verification");
+        assert!(
+            err.to_string().contains("content-digest") || err.to_string().contains("signature")
+        );
     }
 }

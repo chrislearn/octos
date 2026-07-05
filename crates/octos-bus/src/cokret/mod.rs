@@ -21,6 +21,7 @@
 pub mod applet;
 pub mod client;
 pub mod config;
+pub mod crypto_state;
 pub mod grant;
 pub mod outbound;
 pub mod parse;
@@ -29,7 +30,7 @@ pub mod session;
 pub mod signer;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -40,7 +41,7 @@ use cokret_core::AccountSubscribeFrameKind;
 use cokret_identifiers::{DeviceId, Did};
 use eyre::{Result, WrapErr, bail, eyre};
 use octos_core::{InboundMessage, MessageOrigin, OutboundMessage};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -50,9 +51,16 @@ use crate::channel::{Channel, ChannelHealth};
 pub use applet::{AppletState, CokretAppletConfig};
 pub use client::{CokretFrameStream, CokretHttpClient};
 pub use config::{CokretAccountConfig, CokretChannelConfig};
+pub use crypto_state::{
+    CokretDecryptOutcome, CokretEncryptOutcome, FileCokretCryptoStore,
+    extract_encrypted_payload_from_message_content,
+};
 pub use grant::{CokretGrant, load_and_verify_grant};
 pub use outbound::{MessageCreateRequest, build_message_create_event, sign_outbound_event};
-pub use parse::{CokretInboundEvent, parse_delta_frame_for_account};
+pub use parse::{
+    CokretInboundEvent, CokretInboundSkipReason, CokretInboundSkippedEvent,
+    parse_delta_frame_for_account,
+};
 pub use signer::{CokretKeyRef, load_ed25519_signer};
 
 /// Channel routing name.
@@ -85,7 +93,10 @@ pub fn decode_chat_id(chat_id: &str) -> (String, Option<String>) {
 
 /// Operating mode of one `CokretChannel` instance.
 enum CokretMode {
-    Account(CokretChannelConfig),
+    Account {
+        config: CokretChannelConfig,
+        data_dir: PathBuf,
+    },
     Applet {
         state: Arc<AppletState>,
         bind_addr: String,
@@ -101,9 +112,13 @@ pub struct CokretChannel {
 impl CokretChannel {
     /// Build an account-mode channel from a validated [`CokretChannelConfig`].
     #[must_use]
-    pub fn new_account(config: CokretChannelConfig, shutdown: Arc<AtomicBool>) -> Self {
+    pub fn new_account(
+        config: CokretChannelConfig,
+        data_dir: PathBuf,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
         Self {
-            mode: CokretMode::Account(config),
+            mode: CokretMode::Account { config, data_dir },
             shutdown,
         }
     }
@@ -114,10 +129,11 @@ impl CokretChannel {
     pub fn new_applet(
         config: CokretAppletConfig,
         seq_path: PathBuf,
+        data_dir: PathBuf,
         bind_addr: String,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let state = AppletState::new(config, seq_path)?;
+        let state = AppletState::new(config, seq_path, data_dir)?;
         Ok(Self {
             mode: CokretMode::Applet { state, bind_addr },
             shutdown,
@@ -127,6 +143,7 @@ impl CokretChannel {
     async fn start_account(
         &self,
         config: &CokretChannelConfig,
+        data_dir: &Path,
         inbound_tx: mpsc::Sender<InboundMessage>,
     ) -> Result<()> {
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -136,10 +153,11 @@ impl CokretChannel {
             }
             let channel = config.clone();
             let account = account.clone();
+            let data_dir = data_dir.to_path_buf();
             let tx = inbound_tx.clone();
             let shutdown = Arc::clone(&self.shutdown);
             handles.push(tokio::spawn(async move {
-                run_account_subscribe_loop(channel, account, tx, shutdown).await;
+                run_account_subscribe_loop(channel, account, data_dir, tx, shutdown).await;
             }));
         }
         if handles.is_empty() {
@@ -164,7 +182,9 @@ impl Channel for CokretChannel {
 
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         match &self.mode {
-            CokretMode::Account(config) => self.start_account(config, inbound_tx).await,
+            CokretMode::Account { config, data_dir } => {
+                self.start_account(config, data_dir, inbound_tx).await
+            }
             CokretMode::Applet { state, bind_addr } => {
                 applet::http::serve(
                     Arc::clone(state),
@@ -180,9 +200,15 @@ impl Channel for CokretChannel {
     async fn send(&self, msg: &OutboundMessage) -> Result<()> {
         let (realm_id, flow_from_chat) = decode_chat_id(&msg.chat_id);
         match &self.mode {
-            CokretMode::Account(config) => {
-                send_account_message(config, &realm_id, flow_from_chat.as_deref(), &msg.content)
-                    .await
+            CokretMode::Account { config, data_dir } => {
+                send_account_message(
+                    config,
+                    data_dir,
+                    &realm_id,
+                    flow_from_chat.as_deref(),
+                    &msg.content,
+                )
+                .await
             }
             CokretMode::Applet { state, .. } => {
                 let flow = flow_from_chat.ok_or_else(|| {
@@ -259,15 +285,34 @@ enum StreamOutcome {
     Backoff,
 }
 
+struct AccountStreamContext<'a> {
+    channel: &'a CokretChannelConfig,
+    account: &'a CokretAccountConfig,
+    crypto_store: &'a FileCokretCryptoStore,
+    inbound_tx: &'a mpsc::Sender<InboundMessage>,
+    shutdown: &'a Arc<AtomicBool>,
+}
+
 async fn run_account_subscribe_loop(
     channel: CokretChannelConfig,
     account: CokretAccountConfig,
+    data_dir: PathBuf,
     inbound_tx: mpsc::Sender<InboundMessage>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = Duration::from_secs(1);
     let mut cursor: Option<String> = None;
     let mut dedupe = EventDedupe::new(ACCOUNT_EVENT_DEDUPE_MAX);
+    let crypto_store = FileCokretCryptoStore::for_account(&data_dir, &channel.id, &account.id);
+    if let Err(err) =
+        FileCokretCryptoStore::feature_report().and_then(|_| crypto_store.ensure_created())
+    {
+        warn!(
+            "cokret: account '{}' crypto state unavailable at {}: {err:#}",
+            account.id,
+            crypto_store.path().display()
+        );
+    }
 
     let client = match construct_account_client(&channel, &account).await {
         Ok(client) => client,
@@ -290,16 +335,14 @@ async fn run_account_subscribe_loop(
             .await
         {
             Ok(stream) => {
-                let outcome = consume_stream(
-                    stream,
-                    &channel,
-                    &account,
-                    &mut cursor,
-                    &mut dedupe,
-                    &inbound_tx,
-                    &shutdown,
-                )
-                .await;
+                let context = AccountStreamContext {
+                    channel: &channel,
+                    account: &account,
+                    crypto_store: &crypto_store,
+                    inbound_tx: &inbound_tx,
+                    shutdown: &shutdown,
+                };
+                let outcome = consume_stream(stream, context, &mut cursor, &mut dedupe).await;
                 match outcome {
                     StreamOutcome::Reconnect => backoff = Duration::from_secs(1),
                     StreamOutcome::ResetCursor => {
@@ -330,16 +373,13 @@ async fn run_account_subscribe_loop(
 
 async fn consume_stream(
     mut stream: CokretFrameStream,
-    channel: &CokretChannelConfig,
-    account: &CokretAccountConfig,
+    context: AccountStreamContext<'_>,
     cursor: &mut Option<String>,
     dedupe: &mut EventDedupe,
-    inbound_tx: &mpsc::Sender<InboundMessage>,
-    shutdown: &Arc<AtomicBool>,
 ) -> StreamOutcome {
     use futures::StreamExt;
     loop {
-        if shutdown.load(Ordering::Acquire) {
+        if context.shutdown.load(Ordering::Acquire) {
             return StreamOutcome::Reconnect;
         }
         let frame = match stream.next().await {
@@ -348,7 +388,7 @@ async fn consume_stream(
             Some(Err(err)) => {
                 debug!(
                     "cokret: stream read error on '{}/{}': {err}",
-                    channel.id, account.id
+                    context.channel.id, context.account.id
                 );
                 return StreamOutcome::Backoff;
             }
@@ -360,12 +400,59 @@ async fn consume_stream(
             AccountSubscribeFrameKind::Delta => {
                 if let Some(realms) = &frame.realms {
                     let realms_value = serde_json::to_value(realms).unwrap_or_default();
-                    let parsed = parse_delta_frame_for_account(&realms_value, account);
+                    match context
+                        .crypto_store
+                        .update_realm_policies_from_sync(&realms_value)
+                    {
+                        Ok(updated) if updated > 0 => {
+                            debug!(
+                                "cokret: '{}/{}' updated {updated} realm crypto policy record(s)",
+                                context.channel.id, context.account.id
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => warn!(
+                            "cokret: '{}/{}' failed to update realm crypto policy: {err:#}",
+                            context.channel.id, context.account.id
+                        ),
+                    }
+                    let parsed = parse_delta_frame_for_account(&realms_value, context.account);
+                    for skipped in parsed.skipped {
+                        match skipped.reason {
+                            CokretInboundSkipReason::EncryptedContent => {
+                                let decrypted = try_handle_encrypted_account_skip(
+                                    &skipped,
+                                    context.crypto_store,
+                                    context.account,
+                                    context.inbound_tx,
+                                )
+                                .await;
+                                if decrypted {
+                                    continue;
+                                }
+                                warn!(
+                                    account_id = %skipped.account_id,
+                                    event_id = skipped.event_id.as_deref().unwrap_or("<unknown>"),
+                                    realm_id = skipped.realm_id.as_deref().unwrap_or("<unknown>"),
+                                    "cokret: encrypted account message skipped; no usable local MLS state"
+                                );
+                            }
+                            reason => {
+                                debug!(
+                                    account_id = %skipped.account_id,
+                                    event_id = skipped.event_id.as_deref().unwrap_or("<unknown>"),
+                                    realm_id = skipped.realm_id.as_deref().unwrap_or("<unknown>"),
+                                    ?reason,
+                                    "cokret: account event skipped"
+                                );
+                            }
+                        }
+                    }
                     for event in parsed.events {
                         if !dedupe.insert(event.event_id.clone()) {
                             continue;
                         }
-                        if dispatch_account_event(account, event, inbound_tx)
+                        if dispatch_account_event(context.account, event, context.inbound_tx)
                             .await
                             .is_err()
                         {
@@ -375,17 +462,26 @@ async fn consume_stream(
                 }
             }
             AccountSubscribeFrameKind::CatchupComplete => {
-                debug!("cokret: '{}/{}' catchup complete", channel.id, account.id);
+                debug!(
+                    "cokret: '{}/{}' catchup complete",
+                    context.channel.id, context.account.id
+                );
             }
             AccountSubscribeFrameKind::Frontier | AccountSubscribeFrameKind::Heartbeat => {}
             AccountSubscribeFrameKind::Dropped | AccountSubscribeFrameKind::ResyncRequired => {
                 warn!(
                     "cokret: '{}/{}' stream dropped/resync — resyncing",
-                    channel.id, account.id
+                    context.channel.id, context.account.id
                 );
                 return StreamOutcome::ResetCursor;
             }
             AccountSubscribeFrameKind::Unauthorized => return StreamOutcome::Unauthorized,
+            _ => {
+                debug!(
+                    "cokret: '{}/{}' ignored unknown account subscribe frame kind",
+                    context.channel.id, context.account.id
+                );
+            }
         }
     }
 }
@@ -421,10 +517,155 @@ async fn dispatch_account_event(
     })
 }
 
+async fn try_handle_encrypted_account_skip(
+    skipped: &CokretInboundSkippedEvent,
+    crypto_store: &FileCokretCryptoStore,
+    account: &CokretAccountConfig,
+    inbound_tx: &mpsc::Sender<InboundMessage>,
+) -> bool {
+    let Some(payload) = skipped.encrypted_payload.as_ref() else {
+        return false;
+    };
+    match crypto_store.plan_bootstrap_for_payload(
+        &account.principal_id,
+        &account.device_id,
+        payload,
+    ) {
+        Ok(plan) => debug!(
+            account_id = %account.id,
+            group_id = %plan.group_id,
+            required_epoch = plan.required_epoch,
+            local_epoch = ?plan.local_epoch,
+            action = ?plan.action,
+            "cokret: planned crypto bootstrap for encrypted account event"
+        ),
+        Err(err) => warn!(
+            account_id = %account.id,
+            "cokret: failed to plan crypto bootstrap for encrypted account event: {err:#}"
+        ),
+    }
+
+    match crypto_store.try_decrypt_content_block(payload) {
+        Ok(CokretDecryptOutcome::Decrypted(content)) => {
+            let Some(body) = decrypted_text_body(&content) else {
+                warn!(
+                    account_id = %account.id,
+                    event_id = skipped.event_id.as_deref().unwrap_or("<unknown>"),
+                    "cokret: decrypted encrypted account event but content is not displayable text"
+                );
+                return false;
+            };
+            let Some(event_id) = skipped.event_id.clone() else {
+                return false;
+            };
+            let Some(realm_id) = skipped.realm_id.clone() else {
+                return false;
+            };
+            let Some(sender_did) = skipped.sender_did.clone() else {
+                return false;
+            };
+            dispatch_account_event(
+                account,
+                CokretInboundEvent {
+                    account_id: skipped.account_id.clone(),
+                    event_id,
+                    realm_id,
+                    flow_id: None,
+                    sender_did,
+                    body,
+                    thread_root_id: None,
+                },
+                inbound_tx,
+            )
+            .await
+            .is_ok()
+        }
+        Ok(CokretDecryptOutcome::MissingGroupState) => {
+            record_account_unable_to_decrypt(
+                crypto_store,
+                skipped,
+                payload.clone(),
+                cokret::crypto_protocol::UnableToDecryptReason::NoSession,
+            );
+            false
+        }
+        Ok(CokretDecryptOutcome::UnsupportedScheme(scheme)) => {
+            warn!(
+                account_id = %account.id,
+                event_id = skipped.event_id.as_deref().unwrap_or("<unknown>"),
+                scheme,
+                "cokret: encrypted account event uses unsupported encrypted payload scheme"
+            );
+            record_account_unable_to_decrypt(
+                crypto_store,
+                skipped,
+                payload.clone(),
+                cokret::crypto_protocol::UnableToDecryptReason::BadCiphertext,
+            );
+            false
+        }
+        Err(err) => {
+            warn!(
+                account_id = %account.id,
+                event_id = skipped.event_id.as_deref().unwrap_or("<unknown>"),
+                "cokret: failed to decrypt encrypted account event: {err:#}"
+            );
+            record_account_unable_to_decrypt(
+                crypto_store,
+                skipped,
+                payload.clone(),
+                cokret::crypto_protocol::UnableToDecryptReason::BadCiphertext,
+            );
+            false
+        }
+    }
+}
+
+fn record_account_unable_to_decrypt(
+    crypto_store: &FileCokretCryptoStore,
+    skipped: &CokretInboundSkippedEvent,
+    payload: cokret_core::EncryptedPayload,
+    reason: cokret::crypto_protocol::UnableToDecryptReason,
+) {
+    let (Some(event_id), Some(realm_id), Some(sender)) = (
+        skipped.event_id.as_deref(),
+        skipped.realm_id.as_deref(),
+        skipped.sender_did.as_deref(),
+    ) else {
+        return;
+    };
+    if let Err(err) =
+        crypto_store.record_unable_to_decrypt(event_id, realm_id, sender, payload, reason)
+    {
+        warn!(
+            event_id,
+            realm_id, "cokret: failed to persist unable-to-decrypt record: {err:#}"
+        );
+    }
+}
+
+fn decrypted_text_body(content: &Value) -> Option<String> {
+    let block = content
+        .get("content")
+        .filter(|inner| inner.get("kind").is_some())
+        .unwrap_or(content);
+    let kind = block.get("kind").and_then(Value::as_str)?;
+    if kind != "ck.content.text" {
+        return None;
+    }
+    block
+        .get("body")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+        .map(str::to_owned)
+}
+
 /// Build, sign, and submit a `ck.message.create` reply as the account that
 /// owns `realm_id`.
 async fn send_account_message(
     config: &CokretChannelConfig,
+    data_dir: &Path,
     realm_id: &str,
     flow_id: Option<&str>,
     body: &str,
@@ -452,6 +693,8 @@ async fn send_account_message(
         thread_root_id: None,
     };
     let mut event = build_message_create_event(&request)?;
+    let crypto_store = FileCokretCryptoStore::for_account(data_dir, &config.id, &account.id);
+    apply_account_outbound_encryption(&crypto_store, realm_id, &mut event)?;
 
     if let Some(grant_path) = &account.grant_event_path {
         let grant = load_and_verify_grant(
@@ -505,6 +748,33 @@ async fn send_account_message(
         response.duplicate.len()
     );
     Ok(())
+}
+
+fn apply_account_outbound_encryption(
+    crypto_store: &FileCokretCryptoStore,
+    realm_id: &str,
+    event: &mut cokret_core::Event,
+) -> Result<()> {
+    let Some(content_block) = event.content.get("content").cloned() else {
+        return Ok(());
+    };
+    match crypto_store.encrypt_content_block_for_realm(realm_id, &content_block)? {
+        CokretEncryptOutcome::PlaintextAllowed => Ok(()),
+        CokretEncryptOutcome::Encrypted(encrypted_content) => {
+            let object = event
+                .content
+                .as_object_mut()
+                .ok_or_else(|| eyre!("Cokret message content is not an object"))?;
+            object.remove("content");
+            object.insert("encrypted_content".to_owned(), encrypted_content);
+            Ok(())
+        }
+        CokretEncryptOutcome::MissingRequiredGroupState { realm_id, group_id } => {
+            bail!(
+                "Cokret realm '{realm_id}' requires E2EE but no local MLS group state exists for group '{group_id}'"
+            );
+        }
+    }
 }
 
 async fn sleep_with_backoff(backoff: &mut Duration) {

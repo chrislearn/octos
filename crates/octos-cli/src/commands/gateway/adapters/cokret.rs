@@ -48,8 +48,14 @@ pub fn register(
         let seq_path = data_dir
             .join("cokret-applet-seq")
             .join(format!("{}.seq", sanitize_id(&id)));
-        let channel = CokretChannel::new_applet(config, seq_path, bind_addr, shutdown.clone())
-            .wrap_err_with(|| format!("cokret applet channel '{id}' failed to initialize"))?;
+        let channel = CokretChannel::new_applet(
+            config,
+            seq_path,
+            data_dir.to_path_buf(),
+            bind_addr,
+            shutdown.clone(),
+        )
+        .wrap_err_with(|| format!("cokret applet channel '{id}' failed to initialize"))?;
         channel_mgr.register(Arc::new(channel));
         return Ok(());
     }
@@ -62,7 +68,7 @@ pub fn register(
     if !config.accounts.iter().any(|a| a.listen || a.send) {
         bail!("cokret channel '{id}': no account is configured to listen or send");
     }
-    let channel = CokretChannel::new_account(config, shutdown.clone());
+    let channel = CokretChannel::new_account(config, data_dir.to_path_buf(), shutdown.clone());
     channel_mgr.register(Arc::new(channel));
     Ok(())
 }

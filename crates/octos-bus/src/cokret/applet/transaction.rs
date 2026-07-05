@@ -8,6 +8,7 @@
 
 use cokret_core::Event;
 
+use super::super::crypto_state::message_content_has_encrypted_carrier;
 use super::config::CokretAppletConfig;
 
 /// One dispatchable command extracted from an inbound applet transaction.
@@ -37,6 +38,9 @@ pub enum AppletDispatchSkip {
     RealmNotInNamespace,
     /// The event's `kind` is not `ck.message.create`.
     KindNotMessageCreate,
+    /// The event carries encrypted content. The HTTP runtime must attempt MLS
+    /// decrypt or fail closed and record unable-to-decrypt state.
+    EncryptedContent,
     /// `content.kind` is not `ck.content.text`.
     ContentKindUnsupported,
     /// `content.body` is missing or empty.
@@ -74,10 +78,16 @@ pub fn classify_inbound_event(cfg: &CokretAppletConfig, event: &Event) -> Applet
     }
 
     let content = &event.content;
+    if message_content_has_encrypted_carrier(content) {
+        return AppletEventOutcome::Skip(AppletDispatchSkip::EncryptedContent);
+    }
     let content_kind = content
         .get("content")
         .and_then(|c| c.get("kind"))
         .and_then(|k| k.as_str());
+    if content_kind == Some("ck.content.encrypted") {
+        return AppletEventOutcome::Skip(AppletDispatchSkip::EncryptedContent);
+    }
     if content_kind != Some("ck.content.text") {
         return AppletEventOutcome::Skip(AppletDispatchSkip::ContentKindUnsupported);
     }
