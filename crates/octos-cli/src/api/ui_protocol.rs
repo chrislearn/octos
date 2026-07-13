@@ -5967,7 +5967,7 @@ struct RawAgentOutputParams {
     #[serde(default)]
     profile_id: Option<String>,
     #[serde(default)]
-    cursor: Option<Value>,
+    cursor: Option<OutputCursor>,
     #[serde(default)]
     limit: Option<usize>,
 }

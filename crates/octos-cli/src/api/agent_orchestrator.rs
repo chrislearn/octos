@@ -63,7 +63,6 @@ const SELF_PACED_DEFAULT_DELAY_SECONDS: u64 = 60 * 15;
 const MAX_OBJECTIVE_BYTES: usize = 8_192;
 const MAX_LOOP_PROMPT_BYTES: usize = 8_192;
 const MAX_LOOPS_PER_SESSION: usize = 16;
-const AGENT_OUTPUT_CURSOR_INVALID: &str = "agent_output_cursor_invalid";
 const AGENT_ARTIFACT_SELECTOR_INVALID: &str = "agent_artifact_selector_invalid";
 const AUTONOMY_RECORD_KIND: &str = "autonomy_record_kind";
 const AUTONOMY_RECORD_GOAL: &str = "goal";
@@ -131,7 +130,7 @@ pub(crate) struct AgentOutputRequest {
     pub(crate) agent_id: String,
     pub(crate) session_id: Option<SessionKey>,
     pub(crate) profile_id: String,
-    pub(crate) cursor: Option<Value>,
+    pub(crate) cursor: Option<OutputCursor>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -2378,13 +2377,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 profile_id,
             },
         )?;
-        let window = agent_output_window(
-            &agent.output,
-            cursor.as_ref(),
-            limit,
-            &agent.session_id,
-            &agent.profile_id,
-        )?;
+        let window = agent_output_window(&agent.output, cursor.as_ref(), limit);
         Ok(json!({
             "agent_id": agent.agent_id,
             "session_id": agent.session_id,
@@ -5253,50 +5246,34 @@ struct AgentOutputWindow {
 
 fn agent_output_window(
     text: &str,
-    cursor: Option<&Value>,
+    cursor: Option<&OutputCursor>,
     limit: Option<usize>,
-    session_id: &SessionKey,
-    profile_id: &str,
-) -> Result<AgentOutputWindow, RpcError> {
-    let start_offset = agent_output_cursor_offset(cursor, text, session_id, profile_id)?;
+) -> AgentOutputWindow {
+    let start_offset = agent_output_cursor_offset(cursor, text);
     let limit = limit.unwrap_or(usize::MAX);
     let mut end_offset = start_offset.saturating_add(limit).min(text.len());
     while end_offset > start_offset && !text.is_char_boundary(end_offset) {
         end_offset -= 1;
     }
 
-    Ok(AgentOutputWindow {
+    AgentOutputWindow {
         start_offset,
         end_offset,
         text: text[start_offset..end_offset].to_owned(),
-    })
+    }
 }
 
-fn agent_output_cursor_offset(
-    cursor: Option<&Value>,
-    text: &str,
-    session_id: &SessionKey,
-    profile_id: &str,
-) -> Result<usize, RpcError> {
+fn agent_output_cursor_offset(cursor: Option<&OutputCursor>, text: &str) -> usize {
     let Some(cursor) = cursor else {
-        return Ok(0);
+        return 0;
     };
-    let Some(offset) = cursor.get("offset").and_then(Value::as_u64) else {
-        return Err(agent_invalid_params_error(
-            AGENT_OUTPUT_CURSOR_INVALID,
-            "agent output cursor must be an object with numeric offset",
-            Some(session_id),
-            Some(profile_id),
-            None,
-        ));
-    };
-    let mut offset = usize::try_from(offset)
+    let mut offset = usize::try_from(cursor.offset)
         .unwrap_or(usize::MAX)
         .min(text.len());
     while offset < text.len() && !text.is_char_boundary(offset) {
         offset += 1;
     }
-    Ok(offset)
+    offset
 }
 
 fn ensure_loop_scope(
@@ -6375,7 +6352,7 @@ mod tests {
                 agent_id: "agent-output".into(),
                 session_id: Some(session_id.clone()),
                 profile_id: "tenant-a".into(),
-                cursor: Some(json!({ "offset": 6 })),
+                cursor: Some(OutputCursor { offset: 6 }),
                 limit: Some(5),
             })
             .expect("windowed output");

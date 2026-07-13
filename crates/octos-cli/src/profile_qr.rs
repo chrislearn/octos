@@ -23,6 +23,9 @@ use std::io::{Read, Write};
 use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::config::{EmbeddingConfig, MemoryConfig};
+use crate::profiles::LlmProfileConfig;
+
 /// Plain-format prefix.
 pub const PREFIX_PLAIN: &str = "OCTOS1:";
 /// PIN-encrypted-format prefix.
@@ -38,7 +41,7 @@ const NONCE_LEN: usize = 12;
 
 /// The versioned wire payload. `BTreeMap` keeps secrets ordering (and the
 /// whole encoding) deterministic for tests and diffing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProfileQrPayload {
     /// Format version — bump on breaking layout changes.
     pub v: u32,
@@ -53,14 +56,14 @@ pub struct ProfileQrPayload {
     /// Bearer credential for the endpoint (a normal session/API token).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
-    /// The profile's structured LLM contract, verbatim.
+    /// The profile's structured LLM contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub llm: Option<serde_json::Value>,
-    /// Memory / embedding / voice blocks, verbatim (server-shaped JSON).
+    pub llm: Option<LlmProfileConfig>,
+    /// Memory / embedding / voice blocks using the server configuration schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<serde_json::Value>,
+    pub memory: Option<MemoryConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding: Option<serde_json::Value>,
+    pub embedding: Option<EmbeddingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_default: Option<String>,
     /// Provider API keys by env-var name. Only present when the caller
@@ -324,11 +327,22 @@ mod tests {
         let mut p = ProfileQrPayload::new("dspfac");
         p.name = Some("DSP Factory".into());
         p.endpoint = Some("https://ada.crew.ominix.io".into());
-        p.llm = Some(serde_json::json!({
-            "primary": {"family_id": "deepseek", "model_id": "deepseek-v4-pro",
-                         "route": {"api_key_env": "DEEPSEEK_API_KEY"}}
-        }));
-        p.memory = Some(serde_json::json!({"max_inject_tokens": 2500}));
+        p.llm = Some(LlmProfileConfig {
+            primary: Some(crate::profiles::LlmModelSelectionConfig {
+                family_id: Some("deepseek".into()),
+                model_id: Some("deepseek-v4-pro".into()),
+                route: Some(crate::profiles::LlmRouteConfig {
+                    api_key_env: Some("DEEPSEEK_API_KEY".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            fallbacks: Vec::new(),
+        });
+        p.memory = Some(MemoryConfig {
+            max_inject_tokens: Some(2500),
+            ..Default::default()
+        });
         if with_secrets {
             p.auth_token = Some(format!("octs_{}", "A".repeat(43)));
             p.secrets
