@@ -12,8 +12,9 @@ use eyre::{Result, WrapErr, eyre};
 use octos_agent::compaction::CompactionRunner;
 use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, ConversationResponse,
-    HookExecutor, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolRegistry,
-    UserQuestionOutcome, UserQuestionRequest, UserQuestionRequester, read_workspace_policy,
+    HookExecutor, ProgressReporter, SilentReporter, ToolApprovalDecision, ToolApprovalRequest,
+    ToolApprovalRequester, ToolRegistry, UserQuestionOutcome, UserQuestionRequest,
+    UserQuestionRequester, read_workspace_policy,
 };
 use octos_core::ui_protocol::UserQuestionAnswer;
 use octos_core::{AgentId, Message, MessageRole, SessionScope};
@@ -58,6 +59,13 @@ pub struct ChatCommand {
     #[arg(long)]
     pub base_url: Option<String>,
 
+    /// API wire protocol to speak to `--base-url` (overrides config's
+    /// `api_type`): `anthropic`, `openai`, or `responses`. Use this for a
+    /// custom endpoint that speaks a known protocol (e.g. a z.ai/GLM Anthropic
+    /// endpoint) instead of overloading `--provider` with a vendor name.
+    #[arg(long = "api-type", visible_alias = "api-style")]
+    pub api_type: Option<String>,
+
     /// Maximum tool-call iterations per message (default: 20).
     #[arg(long, default_value = "20")]
     pub max_iterations: u32,
@@ -74,10 +82,27 @@ pub struct ChatCommand {
     #[arg(short, long)]
     pub message: Option<String>,
 
+    /// Emit the result as a single JSON object on stdout (logs + UI go to
+    /// stderr); intended for scripting / one-shot `--message` use. Requires
+    /// `--message`: interactive `--json` is rejected (a REPL cannot keep
+    /// stdout pure). On any runtime error a `{"error": "..."}` object is
+    /// printed to stdout and the process exits non-zero, so stdout is always
+    /// parseable — for a valid invocation. (Argument errors and `--help` are
+    /// handled by the arg parser and follow normal CLI conventions: usage/help
+    /// text and a non-zero exit, not a JSON object.)
+    #[arg(long)]
+    pub json: bool,
+
     /// Runtime profile to apply at startup (M8.3). Accepts a built-in name
     /// (`coding`, `coding-full`, `swarm`), a user-dir id under
     /// `~/.octos/profiles/<id>/`, or an explicit path to a profile
     /// JSON/TOML file.
+    ///
+    /// If the id names a stored serve/onboarding profile (one created by
+    /// `octos serve` or octos-tui, saved as `~/.octos/profiles/<id>.json`),
+    /// its LLM provider/model, route, and API key (`env_vars`) are reused too —
+    /// so you don't re-enter a model or key that a profile already holds.
+    /// `--config`, `--provider`, and `--model` still override.
     ///
     /// Defaults to `coding`, the lean core-coding tool surface (files,
     /// shell, search, memory, spawn, user questions). Use `coding-full`
@@ -111,6 +136,33 @@ pub struct ChatCommand {
     /// boundary instead of prompting.
     #[arg(long, value_enum)]
     pub ask_for_approval: Option<ChatApprovalMode>,
+
+    /// Reasoning effort for thinking models: `low`, `medium`, `high`, or
+    /// `max` (claude/codex parity). Overrides the config
+    /// `gateway.reasoning_effort`; non-thinking models ignore it, and
+    /// providers without a distinct `max` tier clamp it to `high`.
+    #[arg(long, value_enum)]
+    pub effort: Option<ChatEffort>,
+
+    /// Do NOT persist this run as an episode (ephemeral). Mirrors
+    /// `claude --no-session-persistence`: by default a completed turn is
+    /// saved to the episode store for future recall; this skips that write.
+    ///
+    /// This also lets many `octos chat` agents run CONCURRENTLY against one
+    /// `--data-dir` (hence one shared `--profile`): a normal run takes an
+    /// exclusive lock on the data dir's episode DB, but an ephemeral run falls
+    /// back to an in-memory episode handle when the lock is already held,
+    /// instead of failing. Pass this to fan out parallel agents on a single
+    /// profile — e.g. review agents over one repo, or edit agents each in
+    /// their own `--cwd`.
+    #[arg(long)]
+    pub no_session_persistence: bool,
+
+    /// One-shot PROMPT (positional): `octos chat "…"` runs a single turn and
+    /// exits, matching `claude -p "…"`. Sugar for `--message`; supplying the
+    /// prompt both positionally and via `--message` is an error.
+    #[arg(value_name = "PROMPT")]
+    pub prompt: Option<String>,
 }
 
 /// `--sandbox` choices, mirroring codex's sandbox modes and octos's
@@ -130,6 +182,48 @@ pub enum ChatSandboxMode {
     DangerFullAccess,
 }
 
+/// Host-managed paths used by a chat session.
+///
+/// `--sandbox read-only` constrains both agent tools and Octos's own startup
+/// work: bundled-skill bootstrap and spawned-worker deliverables must not
+/// create `cwd/.octos`. Existing project state remains readable for local
+/// plugins and bootstrap prompt files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatRuntimePaths {
+    /// Existing workspace-local state, read-only in a read-only session.
+    project_dir: PathBuf,
+    /// Root for host-generated bundled skills.
+    bootstrap_dir: PathBuf,
+    /// Per-chat root for spawn deliverables.
+    spawn_deliverable_dir: PathBuf,
+}
+
+fn resolve_chat_runtime_paths(
+    cwd: &std::path::Path,
+    data_dir: &std::path::Path,
+    permissions: octos_agent::EffectivePermissions,
+    run_id: &str,
+) -> ChatRuntimePaths {
+    let project_dir = cwd.join(".octos");
+    if permissions.file_access.allows_write() {
+        return ChatRuntimePaths {
+            bootstrap_dir: project_dir.clone(),
+            spawn_deliverable_dir: project_dir.join("spawn-deliverables"),
+            project_dir,
+        };
+    }
+
+    // Bootstrap performs direct filesystem writes. Keep every read-only chat
+    // in a private runtime subtree so concurrent sessions cannot race over
+    // generated bundled skills or see each other's plugin state.
+    let run_dir = data_dir.join("runtime").join("runs").join(run_id);
+    ChatRuntimePaths {
+        project_dir,
+        bootstrap_dir: run_dir.join("bootstrap"),
+        spawn_deliverable_dir: run_dir.join("spawn-deliverables"),
+    }
+}
+
 /// `--ask-for-approval` choices, mirroring codex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -138,6 +232,77 @@ pub enum ChatApprovalMode {
     Ask,
     /// Never prompt; risky commands fail closed at the tool boundary.
     Never,
+}
+
+/// `--effort` choices, mirroring claude/codex reasoning-effort tiers. Maps
+/// 1:1 to [`octos_llm::ReasoningEffort`]. For these single-word variants
+/// clap's default `ValueEnum` naming and serde's `kebab-case` agree
+/// (`low`/`medium`/`high`/`max`), so a `config.cli.chat.effort` round-trips
+/// losslessly — matching [`ChatSandboxMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChatEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl From<ChatEffort> for octos_llm::ReasoningEffort {
+    fn from(effort: ChatEffort) -> Self {
+        match effort {
+            ChatEffort::Low => octos_llm::ReasoningEffort::Low,
+            ChatEffort::Medium => octos_llm::ReasoningEffort::Medium,
+            ChatEffort::High => octos_llm::ReasoningEffort::High,
+            ChatEffort::Max => octos_llm::ReasoningEffort::Max,
+        }
+    }
+}
+
+/// `claude -p "…"` parity: fold a positional PROMPT into `--message`. The two
+/// are two spellings of the same one-shot prompt, so supplying both is
+/// contradictory — fail closed. Returns the single effective one-shot message,
+/// or `None` for interactive mode (neither given).
+fn reconcile_one_shot_prompt(
+    message: Option<String>,
+    prompt: Option<String>,
+) -> Result<Option<String>> {
+    match (message, prompt) {
+        (Some(_), Some(_)) => Err(eyre!(
+            "provide the prompt positionally OR via --message/-m, not both"
+        )),
+        (Some(message), None) => Ok(Some(message)),
+        (None, prompt) => Ok(prompt),
+    }
+}
+
+/// Apply the "explicit `--provider` detaches the inherited route" rule.
+///
+/// When the CLI names a provider that DIFFERS from the one already resolved
+/// into `config` (typically inherited from a `--profile`), the sibling route
+/// fields carried by that config — `base_url`, `api_key_env`, `api_type` — are
+/// cleared so the *new* provider's defaults (or an explicit `--base-url` /
+/// `--api-type` / key env) apply instead of a stale, mismatched route. Without
+/// this, `octos chat --profile p --provider anthropic` keeps `p`'s openai
+/// key-env + endpoint + wire protocol and builds an incoherent client
+/// (anthropic name talking to openai's URL with openai's key). Naming the SAME
+/// provider — or naming none, or having no inherited provider to detach from —
+/// leaves the route untouched.
+///
+/// The model is deliberately NOT cleared: some providers mark the model as
+/// required (`create_provider_with_api_type` bails when it is missing), so
+/// blanking it would turn a provider swap into a hard error. Callers complete a
+/// cross-provider switch by also passing `--model`.
+fn detach_route_on_provider_override(config: &mut Config, cli_provider: Option<&str>) {
+    let detaches = matches!(
+        (cli_provider, config.provider.as_deref()),
+        (Some(cli), Some(cfg)) if cli != cfg
+    );
+    if detaches {
+        config.base_url = None;
+        config.api_key_env = None;
+        config.api_type = None;
+    }
 }
 
 /// Resolve the chat session's [`EffectivePermissions`] from the CLI flags.
@@ -519,19 +684,128 @@ async fn process_chat_turn(
     .await
 }
 
+/// Machine-readable result envelope for `octos chat --json --message`.
+///
+/// Serialized as a single JSON object — the ONLY thing `--json` writes to
+/// stdout on success. Deliberately limited to the fields the completed
+/// [`ConversationResponse`] reports as ground truth (final text, answering
+/// model, token usage). Turn telemetry — a real terminal stop reason, the loop
+/// iteration count, the executed tool-call count — is intentionally omitted:
+/// `ConversationResponse` does not carry those, and deriving them from the
+/// message list is wrong in edge cases (budget / max-token cutoffs mislabel the
+/// stop reason; the loop detector inserts synthetic tool-result rows that
+/// overstate tool calls). Surfacing them correctly needs an octos-agent change
+/// to populate them at every turn return site — deferred to a follow-up.
+#[derive(Debug, serde::Serialize)]
+struct ChatJsonResult {
+    /// Final assistant text for this turn.
+    text: String,
+    /// Model that actually produced the answer (e.g. `glm-5.2`). Taken from the
+    /// final reply's provider provenance, so adaptive failover to a fallback
+    /// lane is reported honestly.
+    model: String,
+    /// Prompt tokens consumed across the turn.
+    input_tokens: u32,
+    /// Completion tokens produced across the turn.
+    output_tokens: u32,
+    // NOTE: intentionally limited to fields `ConversationResponse` reports as
+    // ground truth. Turn telemetry (a real terminal `stop_reason`, the loop
+    // iteration count, executed tool-call count) is deferred to a follow-up:
+    // `ConversationResponse` does not carry those, and deriving them from
+    // `messages` is wrong in edge cases (budget/max-token cutoffs mislabel the
+    // stop reason; the loop detector inserts synthetic tool-result rows that
+    // overstate tool calls). Surfacing them correctly needs an octos-agent
+    // change to populate them at every turn return site.
+}
+
+impl ChatJsonResult {
+    /// Build the envelope from a completed turn. `fallback_model` is the
+    /// configured model id, used only when the reply carries no provider
+    /// provenance.
+    fn from_response(response: &ConversationResponse, fallback_model: &str) -> Self {
+        // Prefer the provenance of the FINAL reply: adaptive failover can answer
+        // from a different lane than the primary provider, and the caller should
+        // see the model that actually produced the text.
+        let model = response
+            .provider_metadata
+            .as_ref()
+            .map(|m| m.model.clone())
+            .unwrap_or_else(|| fallback_model.to_string());
+        Self {
+            text: response.content.clone(),
+            model,
+            input_tokens: response.token_usage.input_tokens,
+            output_tokens: response.token_usage.output_tokens,
+        }
+    }
+
+    /// Serialize to a single-line JSON string (nice for piping). This fixed
+    /// string/number-only struct cannot realistically fail to serialize; if it
+    /// ever did, fall back to a valid JSON error object so stdout stays
+    /// parseable.
+    fn to_json_line(&self) -> String {
+        serde_json::to_string(self)
+            .unwrap_or_else(|_| "{\"error\":\"failed to serialize chat result\"}".to_string())
+    }
+}
+
+/// Emit `{"error": "<message>"}` on stdout (so a `--json` caller can always
+/// parse stdout) and flush. Used on the `--json` error paths before a
+/// non-zero exit; `serde_json` handles all string escaping.
+fn print_json_error(message: &str) {
+    let obj = serde_json::json!({ "error": message });
+    println!("{obj}");
+    let _ = io::stdout().flush();
+}
+
 impl Executable for ChatCommand {
     fn execute(self) -> Result<()> {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(8 * 1024 * 1024) // 8MB stack for deep agent futures
-            .build()
-            .wrap_err("failed to create tokio runtime")?
-            .block_on(self.run_async())
+        // Capture before `self` is moved: in `--json` mode ANY failure —
+        // provider/config bootstrap or the turn itself — must surface as a
+        // `{"error": ...}` object on stdout with a non-zero exit, so a caller
+        // can always parse stdout instead of hitting an empty stream + an eyre
+        // report on stderr.
+        let json = self.json;
+        // Build the runtime and run the turn inside one fallible block so that
+        // EVERY failure — including a runtime-build failure — is caught by the
+        // `--json` arm below rather than escaping as a bare `?` before it.
+        let outcome = (|| -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(8 * 1024 * 1024) // 8MB stack for deep agent futures
+                .build()
+                .wrap_err("failed to create tokio runtime")?;
+            runtime.block_on(self.run_async())
+        })();
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(error) if json => {
+                print_json_error(&error.to_string());
+                std::process::exit(1);
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
 impl ChatCommand {
-    async fn run_async(self) -> Result<()> {
+    async fn run_async(mut self) -> Result<()> {
+        // `claude -p "…"` parity: fold a positional PROMPT into `--message` up
+        // front so every downstream `self.message` check (the `--json` guard
+        // just below and the one-shot dispatch) sees a single source of truth.
+        self.message = reconcile_one_shot_prompt(self.message.take(), self.prompt.take())?;
+
+        // `--json` is a one-shot, machine-readable mode: exactly one JSON
+        // object on stdout, and it requires `--message`. An interactive REPL
+        // cannot keep stdout pure (the readline prompt and per-turn framing
+        // would interleave with the JSON), so reject `--json` without
+        // `--message` up front — emitted as a JSON error so even this failure
+        // is parseable on stdout — before doing any provider/agent bootstrap.
+        if self.json && self.message.is_none() {
+            print_json_error("--json requires --message (interactive --json is not supported)");
+            std::process::exit(2);
+        }
+
         let cwd = match self.cwd {
             Some(p) => p,
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
@@ -542,12 +816,28 @@ impl ChatCommand {
         let ctx = super::resolve_command_context(self.data_dir)?;
         let data_dir = ctx.data_dir.clone();
 
-        // Load config
-        let config = if let Some(config_path) = &self.config {
+        // Load config. Precedence: an explicit `--config` wins; otherwise a
+        // stored serve/onboarding profile named by `--profile <id>` supplies its
+        // LLM provider/model + route + `env_vars` API key (so `octos chat
+        // --profile <id>` reuses an octos-tui / `serve` profile without a
+        // separate flat config or a duplicated key); otherwise the ambient
+        // config context.
+        let serve_profile_config = load_serve_profile_config(self.profile.as_deref(), &data_dir)?;
+        let profile_is_serve = serve_profile_config.is_some();
+        let mut config = if let Some(config_path) = &self.config {
             Config::from_file(config_path)?
+        } else if let Some(profile_config) = serve_profile_config {
+            profile_config
         } else {
             Config::load_with_context(&cwd, &ctx)?
         };
+
+        // An explicit `--provider` that names a DIFFERENT provider than the
+        // inherited one does a clean switch: detach the profile's route so the
+        // new provider's defaults (or explicit `--base-url`/`--api-type`/key)
+        // apply, instead of silently keeping the old provider's key-env +
+        // endpoint. No-op when the provider matches or is unset.
+        detach_route_on_provider_override(&mut config, self.provider.as_deref());
 
         let model = self.model.or(config.model.clone());
         let base_url = self.base_url.or(config.base_url.clone());
@@ -566,9 +856,18 @@ impl ChatCommand {
                 )
             })?;
 
-        // Create LLM provider (with optional failover chain)
+        // Create LLM provider (with optional failover chain). `--api-type`
+        // (alias `--api-style`) overrides config's `api_type` so a custom
+        // `--base-url` can pick the wire protocol without pretending to be a
+        // vendor via `--provider`.
+        let api_type = self.api_type.as_deref().or(config.api_type.as_deref());
         let base_provider: Arc<dyn LlmProvider> =
-            create_provider(&provider_name, &config, model, base_url)?;
+            create_provider_with_api_type(&provider_name, &config, model, base_url, api_type)?;
+        // Status line goes to stderr; suppress it entirely in `--json` mode to
+        // keep even stderr quiet for scripting.
+        if !self.json {
+            eprintln!("{}: {}", "Model".green(), base_provider.model_id());
+        }
         let model_id = base_provider.model_id().to_string();
 
         let llm: Arc<dyn LlmProvider> = if self.no_retry {
@@ -613,11 +912,32 @@ impl ChatCommand {
             }
         };
 
-        let memory = Arc::new(
+        // Episode store. Normally strict-open (the canonical single writer of
+        // `episodes.redb`, which takes an exclusive process lock). But an
+        // ephemeral run (`--no-session-persistence`) isn't going to save
+        // episodes anyway, so it opens via `open_or_degraded`: if another
+        // `octos chat` already holds the lock on this data dir, this run falls
+        // back to an in-memory episode handle instead of failing. That lets
+        // many ephemeral `octos chat` agents run concurrently against ONE
+        // `--data-dir` (hence one shared `--profile`) — e.g. a fan-out of
+        // review/edit agents — without the redb lock serializing them.
+        let memory = Arc::new(if self.no_session_persistence {
+            let store = EpisodeStore::open_or_degraded(&data_dir)
+                .await
+                .wrap_err("failed to open episode store")?;
+            if store.is_degraded() {
+                tracing::info!(
+                    "episode store on this data dir is held by another process; \
+                     running with an in-memory episode handle (no persistence/recall) \
+                     — expected when running concurrent `octos chat` agents"
+                );
+            }
+            store
+        } else {
             EpisodeStore::open(&data_dir)
                 .await
-                .wrap_err("failed to open episode store")?,
-        );
+                .wrap_err("failed to open episode store")?
+        });
 
         // Resolve the runtime profile (M8.3). Order:
         //   1. --profile CLI arg, if present;
@@ -627,7 +947,28 @@ impl ChatCommand {
         // The resolved profile's tool filter is applied after the full
         // registry has been assembled, preserving the existing bootstrap
         // path (plugins, MCP, pipelines etc. all register first).
-        let (profile, profile_source_label) = resolve_profile(&self.profile)?;
+        // Tool surface: normal runtime-profile resolution. A stored serve profile
+        // (named by `--profile`, whose LLM config was loaded above) has no runtime
+        // tool-surface definition, so fall back to the default `coding` surface
+        // instead of erroring — gated on `profile_is_serve` so an actually-unknown
+        // profile name still fails loudly.
+        let (profile, profile_source_label) = match resolve_profile(&self.profile) {
+            Ok(resolved) => resolved,
+            Err(_) if profile_is_serve => {
+                tracing::info!(
+                    profile = self.profile.as_deref().unwrap_or_default(),
+                    "serve profile has no runtime tool-surface definition; \
+                     using the default `coding` tool surface"
+                );
+                (
+                    octos_agent::profile::ProfileDefinition::load("coding")
+                        .wrap_err("failed to load built-in coding profile")?
+                        .0,
+                    "coding (serve-profile default)",
+                )
+            }
+            Err(err) => return Err(err),
+        };
         tracing::info!(
             "profile resolved: name={} source={}",
             profile.name,
@@ -651,6 +992,12 @@ impl ChatCommand {
             self.sandbox,
             self.ask_for_approval,
         )?;
+        let runtime_paths = resolve_chat_runtime_paths(
+            &cwd,
+            &data_dir,
+            permissions,
+            &uuid::Uuid::now_v7().to_string(),
+        );
         if permissions.is_dangerous() {
             // Codex-style one-line RED warning on stderr.
             eprintln!(
@@ -700,11 +1047,16 @@ impl ChatCommand {
         let mut spawn_tool =
             octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
                 .with_worker_prompt(worker_prompt)
+                .with_workspace_write_access(permissions.file_access.allows_write())
                 // #1607 (codex-review follow-up): thread the same sandbox the
                 // parent registry was built from so the spawn/agent_mcp child
                 // completion path confines workspace-declared `Command`
                 // validators instead of running them on the host.
                 .with_sandbox(effective_sandbox_config.clone());
+        if !permissions.file_access.allows_write() {
+            spawn_tool =
+                spawn_tool.with_deliverable_root(runtime_paths.spawn_deliverable_dir.clone());
+        }
         if let Some(ref embedder) = embedder {
             // Workers save episodes by default; without the embedder those
             // episodes are stored vectorless and worker recall skips.
@@ -742,13 +1094,13 @@ impl ChatCommand {
         }
 
         // Bootstrap bundled app-skill binaries (deep_search, deep_crawl, etc.)
-        // Must happen BEFORE plugin loading so PluginLoader picks them up.
-        let project_dir = cwd.join(".octos");
-        let n = octos_agent::bootstrap::bootstrap_bundled_skills(&project_dir);
+        // before plugin loading. In a read-only chat this targets the data-dir
+        // runtime root; the workspace's existing `.octos` remains read-only.
+        let n = octos_agent::bootstrap::bootstrap_bundled_skills(&runtime_paths.bootstrap_dir);
         if n > 0 {
             eprintln!("Bootstrapped {n} app-skills");
         }
-        let n = octos_agent::bootstrap::bootstrap_platform_skills(&project_dir);
+        let n = octos_agent::bootstrap::bootstrap_platform_skills(&runtime_paths.bootstrap_dir);
         if n > 0 {
             eprintln!("Bootstrapped {n} platform skills");
         }
@@ -764,11 +1116,18 @@ impl ChatCommand {
             eprintln!("Bootstrapped {n} bundled pipelines");
         }
 
-        // Load plugins (includes app-skills from .octos/skills/).
+        // Load existing project plugins plus bundled skills from the host
+        // runtime root. Preserve project precedence so an operator-installed
+        // skill still wins over an Octos bundled fallback.
         // Section B (codex review P1.1): honour `plugins.require_signed`
         // from the resolved Config so an operator who opts into strict
         // signing has it enforced on `octos chat` too.
-        let plugin_dirs = Config::plugin_dirs_from_project(&cwd.join(".octos"));
+        let mut plugin_dirs = Config::plugin_dirs_from_project(&runtime_paths.project_dir);
+        for runtime_dir in Config::plugin_dirs_from_project(&runtime_paths.bootstrap_dir) {
+            if !plugin_dirs.contains(&runtime_dir) {
+                plugin_dirs.push(runtime_dir);
+            }
+        }
         let mut plugin_result = octos_agent::PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
             match octos_agent::PluginLoader::load_into_with_options(
@@ -904,13 +1263,27 @@ impl ChatCommand {
             .filter(|cfg| cfg.enabled)
             .map(|cfg| Arc::new(octos_llm::ContentClassifier::new(cfg.clone())));
 
-        // Create agent
-        let reporter = Arc::new(ConsoleReporter::new().with_verbose(self.verbose));
+        // Create agent. In `--json` mode nothing may reach stdout except the
+        // final result object, so silence the console reporter — its spinner,
+        // `◆` answer preview, streamed chunks, and tool-progress lines all
+        // print to stdout.
+        let reporter: Arc<dyn ProgressReporter> = if self.json {
+            Arc::new(SilentReporter)
+        } else {
+            Arc::new(ConsoleReporter::new().with_verbose(self.verbose))
+        };
         let agent_config = AgentConfig {
             max_iterations: self.max_iterations,
-            save_episodes: true,
+            // `--no-session-persistence` (claude parity): skip the episode write.
+            save_episodes: !self.no_session_persistence,
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
-            reasoning_effort: config.gateway.as_ref().and_then(|g| g.reasoning_effort),
+            // `--effort` (claude/codex parity) overrides `gateway.reasoning_effort`.
+            reasoning_effort: self
+                .effort
+                .map(octos_llm::ReasoningEffort::from)
+                .or_else(|| config.gateway.as_ref().and_then(|g| g.reasoning_effort)),
+            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
+            format_after_edit: config.format_after_edit,
             ..Default::default()
         };
         // M8.2: load sub-agent manifests from `<cwd>/agents/` layered on
@@ -1071,9 +1444,9 @@ impl ChatCommand {
             }
         }
 
-        // Load bootstrap files (AGENTS.md, SOUL.md, etc.) from project .octos/ directory
-        let project_dir = cwd.join(".octos");
-        let bootstrap = super::load_bootstrap_files(&project_dir);
+        // Load operator-provided bootstrap files from the project state. The
+        // runtime bootstrap root only holds generated bundled skills.
+        let bootstrap = super::load_bootstrap_files(&runtime_paths.project_dir);
         if !bootstrap.is_empty() {
             agent.append_system_prompt(&bootstrap);
         }
@@ -1111,6 +1484,21 @@ impl ChatCommand {
             agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
         }
 
+        // #1768: opt-in git-backed workspace snapshots before mutating
+        // tools. Uses a SEPARATE git dir under `<data_dir>/snapshots/` —
+        // the user's own repo/index is never touched. Silently unavailable
+        // when no git binary is on PATH (`SnapshotManager::new` returns
+        // `None` and logs once).
+        if let Some(snapshot_cfg) = config.snapshots.as_ref().filter(|cfg| cfg.enabled) {
+            if let Some(manager) = octos_agent::SnapshotManager::new(
+                data_dir.join("snapshots"),
+                cwd.clone(),
+                snapshot_cfg.keep_last,
+            ) {
+                agent = agent.with_snapshot_manager(Arc::new(manager));
+            }
+        }
+
         if let Some(ref embedder) = embedder {
             agent = agent.with_embedder(embedder.clone());
         }
@@ -1146,10 +1534,22 @@ impl ChatCommand {
         let approval_requester: Arc<dyn ToolApprovalRequester> =
             Arc::new(CliApprovalRequester::default());
 
-        // Single-message mode: send one message and exit
+        // Single-message mode: send one message and exit.
         if let Some(msg) = self.message {
             let response =
                 process_chat_turn(&agent, &msg, &[], Arc::clone(&approval_requester)).await?;
+            if self.json {
+                // JSON mode: emit exactly one machine-readable result object on
+                // stdout (the reporter is silent and every status line goes to
+                // stderr). A turn failure propagates via `?` and is rendered as
+                // a JSON error at the `execute` boundary.
+                println!(
+                    "{}",
+                    ChatJsonResult::from_response(&response, &model_id).to_json_line()
+                );
+                let _ = io::stdout().flush();
+                return Ok(());
+            }
             if !response.streamed {
                 println!("{}", response.content);
             }
@@ -1344,6 +1744,51 @@ pub(crate) fn resolve_profile(
     Ok((def, "default"))
 }
 
+/// Load the LLM config from a stored serve/onboarding profile so
+/// `octos chat --profile <id>` can reuse an octos-tui / `serve` profile's
+/// provider, model, route (base URL + API type), API key (`config.env_vars`),
+/// and fallbacks — without a separate flat config or a duplicated key.
+///
+/// Returns `Ok(None)` when no `--profile` is given, the arg is a path (a runtime
+/// [`octos_agent::profile::ProfileDefinition`] file, left to [`resolve_profile`]),
+/// or the id does not name a stored profile (e.g. a built-in runtime profile like
+/// `coding`) — leaving the caller on its normal config path. An explicit
+/// `--config` still takes precedence (handled by the caller), and CLI
+/// `--provider`/`--model`/… continue to override the profile's values downstream.
+///
+/// [`ProfileStore::get`](crate::profiles::ProfileStore::get) is a lock-free JSON
+/// read, so this is safe to call while a `serve` process holds the same data dir.
+fn load_serve_profile_config(
+    profile_arg: Option<&str>,
+    data_dir: &std::path::Path,
+) -> Result<Option<Config>> {
+    let Some(id) = profile_arg else {
+        return Ok(None);
+    };
+    // A path-form `--profile` names a runtime ProfileDefinition file, not a stored
+    // serve-profile id; leave those to `resolve_profile`.
+    if id.contains('/') || id.contains(std::path::MAIN_SEPARATOR) {
+        return Ok(None);
+    }
+    let store = crate::profiles::ProfileStore::open_unified(data_dir)
+        .wrap_err("failed to open profile store")?;
+    let Some(profile) = store.get(id)? else {
+        return Ok(None);
+    };
+    // Apply parent inheritance + global profile-defaults exactly like serve's
+    // per-profile loop, then flatten `llm.primary` into the flat provider/model/
+    // route fields the chat provider builder reads.
+    let resolved = store.resolve_runtime_profile(&profile);
+    let config = crate::profiles::config_from_profile(&resolved, None, None);
+    tracing::info!(
+        profile = id,
+        provider = config.provider.as_deref().unwrap_or("<unset>"),
+        model = config.model.as_deref().unwrap_or("<unset>"),
+        "using LLM config from stored profile",
+    );
+    Ok(Some(config))
+}
+
 /// Find the matching provider-specific tool policy for the active model.
 /// Checks model ID first (e.g. "claude-sonnet-4-20250514"), then provider name (e.g. "gemini").
 pub(crate) fn resolve_provider_policy(
@@ -1368,6 +1813,78 @@ pub(crate) fn resolve_provider_policy(
 /// Create an embedding provider from config, if configured.
 pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvider>> {
     let cfg = config.embedding.as_ref()?;
+
+    // In-process llama.cpp GGUF provider (every platform, feature `embed-llama`).
+    // `provider = "llamacpp"` + `model_path = "<file.gguf>"`; `dimensions`
+    // truncates the output via Matryoshka (MRL). Unlike the MLX provider below
+    // this is NOT Apple-only, and it runs any GGUF embedding model rather than
+    // one hand-ported architecture — with a CPU backend that is a legitimate
+    // choice, not a fallback.
+    if cfg.provider.eq_ignore_ascii_case("llamacpp") || cfg.provider.eq_ignore_ascii_case("llama") {
+        #[cfg(feature = "embed-llama")]
+        {
+            let path = cfg.model_path.as_deref().or(cfg.model.as_deref());
+            let Some(path) = path else {
+                tracing::error!(
+                    "embedding.provider=\"llamacpp\" requires `model_path` (the .gguf file)"
+                );
+                return None;
+            };
+            // Offload everything when built with an accelerator; the CPU build
+            // ignores this.
+            let n_gpu_layers = if cfg!(any(
+                feature = "embed-llama-metal",
+                feature = "embed-llama-cuda"
+            )) {
+                99
+            } else {
+                0
+            };
+            match octos_embed_llama::LlamaEmbedder::from_model_file(path, n_gpu_layers) {
+                Ok(mut e) => {
+                    if let Some(d) = cfg.dimensions {
+                        e = e.with_output_dim(d as usize);
+                    }
+                    tracing::info!(
+                        model_path = %path,
+                        dimension = e.dimension(),
+                        n_gpu_layers,
+                        "loaded in-process llama.cpp embedder"
+                    );
+                    return Some(Arc::new(e));
+                }
+                Err(err) => {
+                    tracing::error!(%err, model_path = %path, "failed to load llama.cpp embedder");
+                    return None;
+                }
+            }
+        }
+        #[cfg(not(feature = "embed-llama"))]
+        {
+            tracing::warn!(
+                "embedding.provider=\"llamacpp\" needs a build with `--features embed-llama`; \
+                 ignoring and disabling embeddings"
+            );
+            return None;
+        }
+    }
+
+    // `provider = "mlx"` was the Apple-Silicon-only in-process backend. It has
+    // been replaced by `"llamacpp"` above, which is cross-platform and measured
+    // at parity or better. Fail LOUDLY rather than falling through to the
+    // remote-provider path below, where "mlx" would be treated as an API
+    // provider name and produce a baffling credential error.
+    if cfg.provider.eq_ignore_ascii_case("mlx") {
+        tracing::error!(
+            "embedding.provider=\"mlx\" has been removed — use \"llamacpp\" with a \
+             .gguf `model_path`. NOTE: the two backends' vectors are not \
+             interchangeable (~0.96-0.99 cosine), so stored episode embeddings \
+             must be regenerated after switching; until then recall degrades to \
+             BM25-only for those episodes."
+        );
+        return None;
+    }
+
     // `api_key_env` was declared on EmbeddingConfig but never honored —
     // it wins over the provider-default var name, resolving through the
     // SAME credential chain as every other key (auth store, env_vars +
@@ -1487,6 +2004,208 @@ pub(crate) fn build_run_pipeline_tool(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    /// A profile-derived config carrying a full openai route.
+    fn openai_route_config() -> Config {
+        Config {
+            provider: Some("openai".into()),
+            model: Some("gpt-4o".into()),
+            base_url: Some("https://fake.example/v1".into()),
+            api_key_env: Some("MYFAKE_PROFILE_KEY".into()),
+            api_type: Some("openai".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explicit_provider_override_detaches_inherited_route() {
+        // Switching to a DIFFERENT provider must drop the profile's route
+        // siblings so the new provider's defaults / explicit flags apply —
+        // otherwise `--profile p --provider anthropic` builds an incoherent
+        // anthropic client still pointed at openai's key-env + endpoint.
+        let mut config = openai_route_config();
+        detach_route_on_provider_override(&mut config, Some("anthropic"));
+        assert_eq!(config.base_url, None, "base_url must detach");
+        assert_eq!(config.api_key_env, None, "api_key_env must detach");
+        assert_eq!(config.api_type, None, "api_type must detach");
+        // The model is intentionally left inherited (some providers require one;
+        // blanking it would turn a swap into a hard error). Complete the switch
+        // with `--model`.
+        assert_eq!(config.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn same_provider_override_keeps_the_route() {
+        // Re-naming the SAME provider is a no-op re-affirmation; keep the route.
+        let mut config = openai_route_config();
+        detach_route_on_provider_override(&mut config, Some("openai"));
+        assert_eq!(config.base_url.as_deref(), Some("https://fake.example/v1"));
+        assert_eq!(config.api_key_env.as_deref(), Some("MYFAKE_PROFILE_KEY"));
+        assert_eq!(config.api_type.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn absent_cli_provider_keeps_the_route() {
+        // No `--provider` at all — pure profile reuse — keeps the whole route.
+        let mut config = openai_route_config();
+        detach_route_on_provider_override(&mut config, None);
+        assert_eq!(config.base_url.as_deref(), Some("https://fake.example/v1"));
+        assert_eq!(config.api_key_env.as_deref(), Some("MYFAKE_PROFILE_KEY"));
+        assert_eq!(config.api_type.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn provider_override_without_inherited_provider_keeps_route() {
+        // No inherited provider identity to detach from (unusual ambient config
+        // with a bare route): leave it alone rather than clobber it.
+        let mut config = Config {
+            provider: None,
+            base_url: Some("https://amb.example/v1".into()),
+            api_key_env: Some("AMBIENT_KEY".into()),
+            ..Default::default()
+        };
+        detach_route_on_provider_override(&mut config, Some("anthropic"));
+        assert_eq!(config.base_url.as_deref(), Some("https://amb.example/v1"));
+        assert_eq!(config.api_key_env.as_deref(), Some("AMBIENT_KEY"));
+    }
+
+    #[test]
+    fn read_only_runtime_paths_keep_host_state_outside_workspace() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let data_dir = PathBuf::from("/tmp/octos-data");
+        let permissions =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
+
+        let paths = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-123");
+
+        assert_eq!(paths.project_dir, workspace.join(".octos"));
+        assert_eq!(
+            paths.bootstrap_dir,
+            data_dir
+                .join("runtime")
+                .join("runs")
+                .join("run-123")
+                .join("bootstrap")
+        );
+        assert_eq!(
+            paths.spawn_deliverable_dir,
+            data_dir
+                .join("runtime")
+                .join("runs")
+                .join("run-123")
+                .join("spawn-deliverables")
+        );
+    }
+
+    #[test]
+    fn read_only_runtime_paths_are_isolated_per_chat_run() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let data_dir = PathBuf::from("/tmp/octos-data");
+        let permissions =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
+
+        let first = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-a");
+        let second = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-b");
+
+        assert_ne!(first.bootstrap_dir, second.bootstrap_dir);
+        assert_ne!(first.spawn_deliverable_dir, second.spawn_deliverable_dir);
+        assert!(first.bootstrap_dir.starts_with(&data_dir));
+        assert!(second.bootstrap_dir.starts_with(&data_dir));
+    }
+
+    #[test]
+    fn workspace_write_runtime_paths_preserve_project_state_locations() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let data_dir = PathBuf::from("/tmp/octos-data");
+        let permissions =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::WorkspaceWrite), None).unwrap();
+
+        let paths = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-123");
+
+        assert_eq!(paths.project_dir, workspace.join(".octos"));
+        assert_eq!(paths.bootstrap_dir, workspace.join(".octos"));
+        assert_eq!(
+            paths.spawn_deliverable_dir,
+            workspace.join(".octos").join("spawn-deliverables")
+        );
+    }
+
+    #[test]
+    fn chat_profile_loads_llm_config_from_stored_serve_profile() {
+        use crate::profiles::{
+            LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig, ProfileStore,
+            UserProfile,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let profile = UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("moonshot".to_string()),
+                        model_id: Some("kimi-k2.5".to_string()),
+                        route: Some(LlmRouteConfig {
+                            base_url: Some("https://api.kimi.com/coding/v1".to_string()),
+                            api_key_env: Some("KIMI_API_KEY".to_string()),
+                            api_type: Some("openai".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: vec![],
+                }),
+                env_vars: [("KIMI_API_KEY".to_string(), "sk-from-profile".to_string())].into(),
+                ..Default::default()
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.save(&profile).unwrap();
+
+        // `--profile dev` names a stored serve profile → flattened LLM config,
+        // including the API key carried in the profile's own `env_vars` (so the
+        // chat run reuses the profile's model AND key with no separate setup).
+        let config = load_serve_profile_config(Some("dev"), dir.path())
+            .unwrap()
+            .expect("stored profile should produce a config");
+        assert_eq!(config.provider.as_deref(), Some("moonshot"));
+        assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://api.kimi.com/coding/v1")
+        );
+        assert_eq!(config.api_type.as_deref(), Some("openai"));
+        assert_eq!(config.api_key_env.as_deref(), Some("KIMI_API_KEY"));
+        assert_eq!(
+            config.env_vars.get("KIMI_API_KEY").map(String::as_str),
+            Some("sk-from-profile")
+        );
+
+        // A built-in runtime-profile name, a path-form arg, and an absent arg all
+        // fall through (Ok(None)) so the caller keeps its normal config path.
+        assert!(
+            load_serve_profile_config(Some("coding"), dir.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_serve_profile_config(Some("./some/path.json"), dir.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_serve_profile_config(None, dir.path())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     // ---- yolo GAP #3: chat permission flags → EffectivePermissions ----
 
@@ -1612,6 +2331,182 @@ mod tests {
         assert!(!bare.dangerously_bypass_approvals_and_sandbox);
         assert_eq!(bare.sandbox, None);
         assert_eq!(bare.ask_for_approval, None);
+    }
+
+    #[test]
+    fn should_map_chat_effort_to_reasoning_effort() {
+        use octos_llm::ReasoningEffort;
+        assert_eq!(ReasoningEffort::from(ChatEffort::Low), ReasoningEffort::Low);
+        assert_eq!(
+            ReasoningEffort::from(ChatEffort::Medium),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            ReasoningEffort::from(ChatEffort::High),
+            ReasoningEffort::High
+        );
+        assert_eq!(ReasoningEffort::from(ChatEffort::Max), ReasoningEffort::Max);
+    }
+
+    #[test]
+    fn should_reconcile_positional_prompt_with_message() {
+        // Positional-only → used as the one-shot message.
+        assert_eq!(
+            reconcile_one_shot_prompt(None, Some("hi".into())).unwrap(),
+            Some("hi".to_string())
+        );
+        // --message-only → passthrough.
+        assert_eq!(
+            reconcile_one_shot_prompt(Some("hi".into()), None).unwrap(),
+            Some("hi".to_string())
+        );
+        // Neither → interactive (None).
+        assert_eq!(reconcile_one_shot_prompt(None, None).unwrap(), None);
+        // Both → contradictory, fail closed.
+        let err = reconcile_one_shot_prompt(Some("a".into()), Some("b".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn should_parse_effort_no_persistence_and_positional_prompt_via_clap() {
+        // `claude -p` parity: --effort, --no-session-persistence, and a bare
+        // positional PROMPT all parse into the expected fields.
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            chat: ChatCommand,
+        }
+
+        let full = Wrap::parse_from([
+            "prog",
+            "--effort",
+            "max",
+            "--no-session-persistence",
+            "Review the diff",
+        ])
+        .chat;
+        assert_eq!(full.effort, Some(ChatEffort::Max));
+        assert!(full.no_session_persistence);
+        // The positional prompt lands in `prompt`, distinct from `--message`.
+        assert_eq!(full.prompt.as_deref(), Some("Review the diff"));
+        assert_eq!(full.message, None);
+
+        // Every effort tier parses (clap's default kebab/lower naming).
+        for (arg, want) in [
+            ("low", ChatEffort::Low),
+            ("medium", ChatEffort::Medium),
+            ("high", ChatEffort::High),
+            ("max", ChatEffort::Max),
+        ] {
+            let c = Wrap::parse_from(["prog", "--effort", arg]).chat;
+            assert_eq!(c.effort, Some(want));
+        }
+
+        // Defaults: no effort, persistence ON, no positional prompt.
+        let bare = Wrap::parse_from(["prog"]).chat;
+        assert_eq!(bare.effort, None);
+        assert!(!bare.no_session_persistence);
+        assert_eq!(bare.prompt, None);
+    }
+
+    #[test]
+    fn should_parse_api_type_flag_and_its_api_style_alias() {
+        // `--api-type` (and its `--api-style` alias) picks the wire protocol
+        // for a custom `--base-url`, independent of the vendor `--provider`.
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            chat: ChatCommand,
+        }
+
+        let via_type = Wrap::parse_from(["prog", "--api-type", "anthropic"]).chat;
+        assert_eq!(via_type.api_type.as_deref(), Some("anthropic"));
+
+        let via_alias = Wrap::parse_from(["prog", "--api-style", "openai"]).chat;
+        assert_eq!(via_alias.api_type.as_deref(), Some("openai"));
+
+        // Honest form: a real vendor name + an explicit protocol, no overload.
+        let combined =
+            Wrap::parse_from(["prog", "--provider", "zai", "--api-type", "anthropic"]).chat;
+        assert_eq!(combined.provider.as_deref(), Some("zai"));
+        assert_eq!(combined.api_type.as_deref(), Some("anthropic"));
+
+        // Absent by default (falls back to config's api_type at runtime).
+        assert_eq!(Wrap::parse_from(["prog"]).chat.api_type, None);
+    }
+
+    // ---- `--json` result envelope ----
+
+    #[test]
+    fn should_serialize_chat_json_result_with_expected_shape() {
+        // The `--json` envelope is a single-line object with every documented
+        // key, in declaration order, so an agent/script can parse it directly.
+        let result = ChatJsonResult {
+            text: "hello world".to_string(),
+            model: "glm-5.2".to_string(),
+            input_tokens: 4582,
+            output_tokens: 7,
+        };
+        let json = serde_json::to_string(&result).expect("envelope must serialize");
+        assert_eq!(
+            json,
+            r#"{"text":"hello world","model":"glm-5.2","input_tokens":4582,"output_tokens":7}"#
+        );
+
+        // And it parses back to the exact fields/values a caller reads.
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["text"], "hello world");
+        assert_eq!(value["model"], "glm-5.2");
+        assert_eq!(value["input_tokens"], 4582);
+        assert_eq!(value["output_tokens"], 7);
+    }
+
+    #[test]
+    fn should_build_envelope_from_conversation_response() {
+        // The envelope carries ground-truth fields only: text + token usage pass
+        // through, and `model` comes from the final reply's provider provenance
+        // so adaptive failover is reported honestly — falling back to the
+        // configured id only when the reply carries no provenance.
+        let build = |provider_metadata: Option<octos_llm::ProviderMetadata>| ConversationResponse {
+            content: "final answer".to_string(),
+            reasoning_content: None,
+            provider_metadata,
+            token_usage: octos_core::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            estimated_spend_usd: None,
+            files_modified: vec![],
+            files_to_send: vec![],
+            streamed: false,
+            messages: vec![],
+            tool_results: vec![],
+            synthesized_from_spawn_only: false,
+            pending_approval: None,
+        };
+
+        // No provenance → fall back to the configured model id.
+        let fallback = build(None);
+        let envelope = ChatJsonResult::from_response(&fallback, "glm-5.2");
+        assert_eq!(envelope.text, "final answer");
+        assert_eq!(envelope.model, "glm-5.2");
+        assert_eq!(envelope.input_tokens, 100);
+        assert_eq!(envelope.output_tokens, 5);
+
+        // Failover: the reply came from a different lane than the configured id
+        // → report the model that actually answered, not the fallback.
+        let routed = build(Some(octos_llm::ProviderMetadata::new(
+            "zai", "glm-4.7", None,
+        )));
+        let envelope = ChatJsonResult::from_response(&routed, "glm-5.2");
+        assert_eq!(envelope.model, "glm-4.7");
     }
 
     // ---- #1570: [y/s/N] approval prompt + numbered user-question prompt ----
@@ -2143,7 +3038,12 @@ pub(crate) fn create_provider(
 ///
 /// Does NOT print to stdout — callers that want a log line should print
 /// after calling this function.
-pub(crate) fn create_provider_with_api_type(
+///
+/// Exposed as `pub` (was `pub(crate)`) so the `octos-ffi` C-ABI crate can
+/// reuse the exact provider-construction path (auth store → env_vars → env
+/// key resolution, timeout overrides, anthropic/responses api_type bypasses)
+/// instead of re-implementing a drift-prone parallel factory.
+pub fn create_provider_with_api_type(
     name: &str,
     config: &Config,
     model: Option<String>,

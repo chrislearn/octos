@@ -112,6 +112,13 @@ pub(crate) const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
     "/tmp",
     "/var/tmp",
     "/etc", // system config (needed for DNS resolution, etc.)
+    // macOS `/etc` is a symlink to `/private/etc`, and SBPL subpath rules match
+    // the CANONICAL path — so the `/etc` entry above never covers a real read of
+    // `/private/etc/...`. Without this, TLS clients that resolve via the symlink
+    // (system `curl`/LibreSSL reading `/etc/ssl/openssl.cnf` + `cert.pem`) fail at
+    // init with a confusing "Operation not permitted" — very visible now that
+    // network is allowed by default. Mirrors the `/tmp` + `/private/tmp` pairing.
+    "/private/etc",
     "/dev/null",
     "/dev/urandom",
     "/dev/random",
@@ -329,6 +336,43 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             }
         }
         SandboxMode::Auto => create_auto_sandbox(config),
+    }
+}
+
+/// Which backend [`SandboxMode::Auto`] would select on this host — a stable
+/// human-readable label plus whether that selection actually sandboxes
+/// (`false` = [`NoSandbox`]). Runs the SAME availability probes as
+/// [`create_auto_sandbox`] (on Linux `bwrap_works` actually runs
+/// `bwrap --version`), reported instead of instantiated. Used by
+/// `octos doctor` so its sandbox row reflects the real runtime selection
+/// rather than a PATH existence guess; the boolean keeps callers from
+/// sniffing the label text for status.
+pub fn auto_sandbox_kind() -> (&'static str, bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if which_exists("sandbox-exec") {
+            return ("macOS Seatbelt (sandbox-exec)", true);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if bwrap_works() {
+            return ("bubblewrap (bwrap)", true);
+        }
+        if linux_container_sandbox_available() {
+            return ("Linux container helper (Landlock/seccomp)", true);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if has_sandbox_helper() {
+            return ("Windows AppContainer", true);
+        }
+    }
+    if which_exists("docker") {
+        ("Docker", true)
+    } else {
+        ("none — shell commands would run UNSANDBOXED", false)
     }
 }
 

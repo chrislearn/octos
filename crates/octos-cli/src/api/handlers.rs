@@ -593,6 +593,15 @@ pub async fn list_sessions(
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     connection_profile_id: Option<&str>,
+    // Per-project (`appui.sessions_in_cwd`) session-store root, already
+    // resolved to `<cwd>/.octos` and gated by the WS handler (flag on +
+    // `session.workspace_cwd.v1` negotiated + canonicalized cwd). When
+    // `Some`, the listing is scoped to that project's store ONLY — the
+    // per-profile / global / gateway merge below is skipped, because the
+    // client asked for "this project's conversations", not every scope.
+    // `None` (the default, and always when the flag is off) → byte-identical
+    // legacy behavior.
+    cwd_sessions_root: Option<std::path::PathBuf>,
 ) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
@@ -606,6 +615,16 @@ pub async fn list_sessions(
         Ok(pid) => pid,
         Err(response) => return response,
     };
+
+    // Per-project listing short-circuit (`appui.sessions_in_cwd`). The
+    // authorization gate above still runs (the connection must be allowed to
+    // list at all); we then scope the listing to the cwd's `<cwd>/.octos`
+    // store instead of the profile/global stores. Runs BEFORE the legacy
+    // merge so a project session list never bleeds in another scope's rows.
+    if let Some(cwd_root) = cwd_sessions_root {
+        let cwd_sessions = list_profile_sessions(&cwd_root);
+        return Json(cwd_sessions).into_response();
+    }
 
     // M11-F per-profile SessionManager listing. Mirrors the
     // `session_messages` fix in commit 10cc9378d (`fix(api): route
@@ -650,6 +669,13 @@ pub async fn list_sessions(
     // — Layer-2 authorization still applies, and a parent viewing a
     // sub-account subdomain still lists the routed profile's sessions.
     let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
+    // A localhost / stdio UI Protocol connection has no routed profile
+    // header, but its authenticated profile is frozen onto the connection.
+    // Use that scope for every legacy fallback below; defaulting to `_main`
+    // here leaks solo/admin session metadata into an ordinary user's list.
+    let connection_scoped_profile_id =
+        connection_profile_id.filter(|_| routed_profile_id.is_none());
+    let effective_profile_id = connection_scoped_profile_id.unwrap_or(&profile_id);
     let profile_data_dir = match connection_profile_id {
         Some(pid) if routed_profile_id.is_none() => {
             resolve_profile_data_dir_by_id(&state, pid).ok()
@@ -671,7 +697,7 @@ pub async fn list_sessions(
 
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
-        let prefix = format!("{profile_id}:api:");
+        let prefix = format!("{effective_profile_id}:api:");
         // Use `list_top_level_sessions` (skips `child-*` and `*.tasks` at the
         // directory walk) so a user dir with tens of thousands of spawn
         // children does not turn this listing into an O(N) hang. The
@@ -706,9 +732,22 @@ pub async fn list_sessions(
     // #995 follow-up — routed_profile_id used to walk the per-profile
     // gateway is authorized above; the `resolve_api_port_authorized`
     // call re-checks header authorization belt-and-suspenders.
-    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
-        Ok(port) => port,
-        Err(response) => return response,
+    let api_port = if let Some(profile_id) = connection_scoped_profile_id {
+        // The frozen connection scope is authoritative on localhost. Never
+        // fall back to the first running gateway, which may belong to a
+        // different profile.
+        match state.process_manager.as_ref() {
+            Some(pm) => pm
+                .api_port(profile_id)
+                .await
+                .map(|port| (profile_id.to_string(), port)),
+            None => None,
+        }
+    } else {
+        match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+            Ok(port) => port,
+            Err(response) => return response,
+        }
     };
     if let Some((_profile_id, port)) = api_port {
         let proxy_resp = super::webhook_proxy::api_get_proxy(&state, port, "/sessions").await;
@@ -4634,6 +4673,7 @@ mod tests {
             HeaderMap::new(),
             Some(Extension(AuthIdentity::Admin)),
             None,
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4645,6 +4685,102 @@ mod tests {
         assert!(
             list.iter().any(|s| s.id == "web-legacy-1"),
             "admin legacy path must still surface profiled sessions: {ids:?}"
+        );
+    }
+
+    /// A user-authenticated localhost WebSocket has no routed profile header;
+    /// its frozen `connection_profile_id` is the tenant boundary. The legacy
+    /// process-wide store must use that profile prefix instead of `_main`, or
+    /// the launcher exposes the solo/admin session titles while message reads
+    /// correctly remain scoped to the user's own profile.
+    #[tokio::test]
+    async fn list_sessions_user_connection_does_not_merge_main_profile_sessions() {
+        use crate::profiles::{ProfileStore, UserProfile};
+
+        let home = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(home.path()).unwrap();
+        let tenant_data_dir = home.path().join("tenant-data");
+        store
+            .save(&UserProfile {
+                id: "tenant-user".into(),
+                name: "Tenant User".into(),
+                enabled: true,
+                data_dir: Some(tenant_data_dir.to_string_lossy().into_owned()),
+                parent_id: None,
+                public_subdomain: None,
+                config: Default::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        {
+            let mut tenant_sessions = octos_bus::SessionManager::open(&tenant_data_dir).unwrap();
+            tenant_sessions
+                .add_message(
+                    &SessionKey("web-own-profile".into()),
+                    Message::user("tenant-owned profile chat"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let legacy_data_dir = tempfile::tempdir().unwrap();
+        let legacy_sessions = Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(legacy_data_dir.path()).unwrap(),
+        ));
+        {
+            let mut sessions = legacy_sessions.lock().await;
+            sessions
+                .add_message(
+                    &SessionKey::with_profile(MAIN_PROFILE_ID, "api", "web-admin-private"),
+                    Message::user("solo admin chat"),
+                )
+                .await
+                .unwrap();
+            sessions
+                .add_message(
+                    &SessionKey::with_profile("tenant-user", "api", "web-tenant-legacy"),
+                    Message::user("tenant legacy chat"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let state = Arc::new(AppState {
+            profile_store: Some(Arc::new(store)),
+            sessions: Some(legacy_sessions),
+            ..AppState::empty_for_tests()
+        });
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            Some(Extension(AuthIdentity::User {
+                id: "tenant-user".into(),
+                role: UserRole::User,
+            })),
+            Some("tenant-user"),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sessions: Vec<SessionInfo> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
+        assert!(
+            ids.contains(&"web-own-profile"),
+            "own profile missing: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"web-tenant-legacy"),
+            "tenant legacy session missing: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"web-admin-private"),
+            "main/solo session metadata leaked into tenant list: {ids:?}"
         );
     }
 
@@ -4666,7 +4802,7 @@ mod tests {
         use crate::profiles::{ProfileStore, UserProfile};
 
         let home = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(home.path()).unwrap();
+        let store = ProfileStore::open_unified(home.path()).unwrap();
 
         // A profile whose sessions live at an explicit data dir — the
         // directory the running solo/stdio session persists turns to.
@@ -4710,7 +4846,7 @@ mod tests {
 
         // connection_profile_id = "dev", empty headers, no identity — the
         // frozen scope a solo stdio connection carries.
-        let response = list_sessions(State(state), HeaderMap::new(), None, Some("dev")).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, Some("dev"), None).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -5500,7 +5636,7 @@ mod tests {
             ..AppState::empty_for_tests()
         });
 
-        let response = list_sessions(State(state), HeaderMap::new(), None, None).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, None, None).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -5558,7 +5694,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let response = list_sessions(State(state), HeaderMap::new(), None, None).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, None, None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -6023,7 +6159,7 @@ mod tests {
     /// tests with a profile_store containing the listed profiles.
     fn state_with_profiles(profiles: &[(&str, Option<&str>)]) -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().unwrap();
-        let ps = ProfileStore::open(dir.path()).unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
         for (id, parent) in profiles {
             ps.save(&make_profile(id, *parent)).unwrap();
         }

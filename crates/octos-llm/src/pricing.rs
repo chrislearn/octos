@@ -20,6 +20,40 @@ static PRICING_CATALOG: RwLock<Option<HashMap<String, ModelPricing>>> = RwLock::
 /// Called at startup alongside context::seed_from_catalog().
 pub fn seed_pricing_catalog(entries: &[(String, f64, f64)]) {
     let mut map = HashMap::new();
+    // A bare model id can be shared by several catalog rows — the native
+    // provider (`moonshot/kimi-k2.5`) and its re-hosts
+    // (`openrouter/moonshotai/kimi-k2.5`, `nvidia/…`). A plain last-writer-wins
+    // insert would let a re-host clobber the native rate under the shared bare
+    // alias `kimi-k2.5`, mispricing direct requests (which look up the bare id).
+    // Award the bare alias to the row with the FEWEST path segments (the most
+    // canonical/native), so the result is deterministic and order-independent.
+    // On an EQUAL segment count the more-native HOST wins: compare the provider
+    // prefix (segment before the first `/`) FIRST, then the full lowercased key —
+    // `minimax/MiniMax-M3` ($0.15/$1.5) and `r9s/minimax-m3` ($0.5/$2) both have
+    // one slash, so without a tie-breaker the bare `minimax-m3` rate would depend
+    // on which row the router exported first. Comparing the provider prefix
+    // (rather than the raw key) keeps a native `zai/…` row ahead of a
+    // `zai-coding/…` re-host, whose `-` would otherwise sort before the native
+    // row's `/` (mirrors `context::build_catalog_map`). (Tracking the owner's key
+    // rather than only its depth is what lets the tie-break compare keys.)
+    //
+    // The bare alias is LOWERCASED (`catalog_pricing` lowercases the requested id
+    // before lookup) so a case-variant native key like `minimax/MiniMax-M2.5` is
+    // still reachable via `minimax-m2.5`. The full provider-qualified key,
+    // however, is stored in its ORIGINAL case: lowercasing it would drop it into
+    // the bare model-ID namespace, where a re-host's `model_id()` can exact-hit
+    // it — `minimax/MiniMax-M2.5` (native, $0.50) lowercased to
+    // `minimax/minimax-m2.5` is exactly what `OpenRouterProvider::model_id()`
+    // returns for the re-hosted `openrouter/minimax/minimax-m2.5` ($0.29), so an
+    // OpenRouter cost lookup would exact-select the native rate. NOTE: a bare
+    // shared model name still resolves to the native (fewest-segments) rate for
+    // COST ESTIMATION; distinguishing a re-host lane's own rate needs the
+    // caller's provider family, which the `model_pricing(model_id)` API does not
+    // carry (7 catalog model-ids are re-hosted by 2+ providers at different
+    // rates, so a key-only heuristic cannot disambiguate them). That is a
+    // deliberate, documented estimation limitation, not something this seeding
+    // can fix on its own.
+    let mut bare_owner: HashMap<String, (usize, String)> = HashMap::new();
     for (key, cost_in, cost_out) in entries {
         if *cost_in > 0.0 || *cost_out > 0.0 {
             let pricing = ModelPricing {
@@ -28,7 +62,29 @@ pub fn seed_pricing_catalog(entries: &[(String, f64, f64)]) {
             };
             map.insert(key.clone(), pricing);
             if let Some(model) = key.split('/').next_back() {
-                map.insert(model.to_string(), pricing);
+                let bare = model.to_lowercase();
+                let segments = key.matches('/').count();
+                // Lowercased only for the deterministic tie-break comparison; the
+                // full key itself is inserted above in its original case.
+                let key_lower = key.to_lowercase();
+                let take = match bare_owner.get(&bare) {
+                    None => true,
+                    Some((owned_seg, owner_key)) => {
+                        segments < *owned_seg
+                            || (segments == *owned_seg
+                                && (
+                                    crate::context::provider_prefix(&key_lower),
+                                    key_lower.as_str(),
+                                ) < (
+                                    crate::context::provider_prefix(owner_key),
+                                    owner_key.as_str(),
+                                ))
+                    }
+                };
+                if take {
+                    map.insert(bare.clone(), pricing);
+                    bare_owner.insert(bare, (segments, key_lower));
+                }
             }
         }
     }
@@ -239,7 +295,16 @@ pub fn model_pricing(model_id: &str) -> Option<ModelPricing> {
         });
     }
 
-    // Kimi / Moonshot
+    // Kimi / Moonshot — NOTE: kimi-k3 MUST be checked before the generic
+    // kimi-k2/moonshot branch: the full provider key ("moonshot/kimi-k3")
+    // contains both substrings. K3 official rates: $3.00/M input (cache
+    // miss) / $15.00/M output.
+    if m.contains("kimi-k3") {
+        return Some(ModelPricing {
+            input_per_million: 3.00,
+            output_per_million: 15.0,
+        });
+    }
     if m.contains("kimi-k2") || m.contains("moonshot") {
         return Some(ModelPricing {
             input_per_million: 0.60,
@@ -352,6 +417,22 @@ mod tests {
     }
 
     #[test]
+    fn should_price_kimi_k3_before_generic_moonshot_branch() {
+        // kimi-k3 ($3.00/M in, $15.00/M out) must match before the generic
+        // kimi-k2/moonshot branch — the full provider key contains BOTH
+        // "kimi-k3" and "moonshot", and last-writer semantics would misprice
+        // it at the k2 rates ($0.60/$2.40).
+        for id in ["kimi-k3", "moonshot/kimi-k3"] {
+            let p = model_pricing(id).unwrap();
+            assert!((p.input_per_million - 3.0).abs() < f64::EPSILON, "{id}");
+            assert!((p.output_per_million - 15.0).abs() < f64::EPSILON, "{id}");
+        }
+        // The k2 family keeps its own rates.
+        let k2 = model_pricing("kimi-k2.6").unwrap();
+        assert!((k2.input_per_million - 0.60).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn test_nvidia_model_pricing() {
         // Llama models should have pricing
         let llama = model_pricing("meta/llama-3.3-70b-instruct").unwrap();
@@ -404,6 +485,54 @@ mod tests {
         ]);
         let sup = model_pricing("octestfam-7").unwrap();
         assert!((sup.input_per_million - 5.0).abs() < f64::EPSILON);
+
+        // Section 4: a bare model id shared by a native provider and a re-host
+        // resolves to the NATIVE (fewest-segments) rate. Re-host listed FIRST to
+        // prove the award is order-independent, not last-writer-wins.
+        seed_pricing_catalog(&[
+            ("octrehost/octvendor/octshared-9".to_string(), 9.0, 9.0), // 2 segments
+            ("octnative/octshared-9".to_string(), 1.5, 2.5),           // 1 segment (native)
+        ]);
+        let bare = model_pricing("octshared-9").unwrap();
+        assert!(
+            (bare.input_per_million - 1.5).abs() < f64::EPSILON,
+            "native provider wins the bare alias, not the re-host"
+        );
+        assert!((bare.output_per_million - 2.5).abs() < f64::EPSILON);
+        // The re-host's fully-qualified key still resolves to its own rate.
+        let rehost = model_pricing("octrehost/octvendor/octshared-9").unwrap();
+        assert!((rehost.input_per_million - 9.0).abs() < f64::EPSILON);
+
+        // Section 5: case-variant bare ids. The native key is capitalized
+        // (`OctCap-9`) and the re-host is lowercase (`octcap-9`); since the
+        // lookup lowercases, the award must still go to the native rate rather
+        // than splitting into two distinct aliases.
+        seed_pricing_catalog(&[
+            ("octrehost/octvendor/octcap-9".to_string(), 9.0, 9.0), // lowercase, 2 seg
+            ("octnative/OctCap-9".to_string(), 1.5, 2.5),           // Capitalized, 1 seg (native)
+        ]);
+        let cap = model_pricing("OctCap-9").unwrap();
+        assert!(
+            (cap.input_per_million - 1.5).abs() < f64::EPSILON,
+            "native rate wins the bare alias despite case variance"
+        );
+
+        // Section 6: two providers at EQUAL depth (both one segment) share a bare
+        // id, so segment count can't break the tie. The lexicographically-smaller
+        // lowercased full key wins — mirroring the real `minimax/MiniMax-M3`
+        // ($0.15/$1.5) vs `r9s/minimax-m3` ($0.5/$2) collision. Listed
+        // larger-key-first to prove the award is order-independent rather than
+        // first-writer-wins.
+        seed_pricing_catalog(&[
+            ("octzeta/octtie-9".to_string(), 9.0, 9.0), // 1 seg, larger key
+            ("octalpha/octtie-9".to_string(), 1.5, 2.5), // 1 seg, smaller key wins
+        ]);
+        let tie = model_pricing("octtie-9").unwrap();
+        assert!(
+            (tie.input_per_million - 1.5).abs() < f64::EPSILON,
+            "equal-depth bare alias resolves to the lexicographically-smaller key, deterministically"
+        );
+        assert!((tie.output_per_million - 2.5).abs() < f64::EPSILON);
 
         // Restore an empty catalog so parallel tests keep hitting the
         // hardcoded ladder exactly as before this test ran.

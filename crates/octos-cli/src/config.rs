@@ -48,6 +48,15 @@ pub struct Config {
     #[serde(default)]
     pub env_vars: std::collections::HashMap<String, String>,
 
+    /// When true, [`Config::get_api_key`] skips the global `AuthStore` lookup so
+    /// an explicitly-supplied key (e.g. the `env_vars`-injected key the
+    /// `octos-ffi` embedding API passes) is authoritative and cannot be silently
+    /// shadowed by a host's `octos auth login` credentials for the same
+    /// provider. Internal, not (de)serialized; default `false` preserves the
+    /// CLI / gateway resolution order.
+    #[serde(skip)]
+    pub bypass_auth_store: bool,
+
     /// Override auto-detected model behavior hints for the OpenAI provider.
     /// Useful for custom/unknown models behind OpenAI-compatible proxies.
     #[serde(default)]
@@ -76,6 +85,15 @@ pub struct Config {
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
 
+    /// Workspace snapshot-undo configuration (#1768). Opt-in: when
+    /// `snapshots.enabled` is true, the agent records a git-backed
+    /// snapshot of the workspace (into a separate git dir under
+    /// `<data_dir>/snapshots/`, never the user's own `.git`) before each
+    /// mutating tool batch. Absent or `enabled: false` (the default) =
+    /// feature off.
+    #[serde(default)]
+    pub snapshots: Option<octos_agent::SnapshotConfig>,
+
     /// Tool access policy (allow/deny lists with group and wildcard support).
     #[serde(default)]
     pub tool_policy: Option<octos_agent::ToolPolicy>,
@@ -101,6 +119,15 @@ pub struct Config {
     /// Maximum agent iterations per message (overridden by --max-iterations).
     #[serde(default)]
     pub max_iterations: Option<u32>,
+
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the file's language
+    /// formatter (rustfmt / prettier / black / gofmt) and returns the
+    /// formatted content in the tool result. Formatters run file-scoped with
+    /// a sanitized environment and a hard 5s timeout; a missing binary or a
+    /// formatter failure never fails the edit. Default: false (opt-in).
+    #[serde(default)]
+    pub format_after_edit: bool,
 
     /// Lifecycle hooks for agent events.
     #[serde(default)]
@@ -266,10 +293,13 @@ pub struct PluginsConfig {
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
 ///
-/// All fields are optional; an empty `[appui]` section preserves the
-/// historical behavior (no server-side default cwd, every session falls
-/// through Tier-3 of the `session_tool_registry` chain unchanged).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Both fields are optional. `default_session_cwd` defaults to `None` (no
+/// server-side default cwd; sessions fall through Tier-3 of the
+/// `session_tool_registry` chain unchanged), but `sessions_in_cwd` defaults
+/// to `true` — see its field doc for the coexistence trade-off — so an
+/// absent or empty `[appui]` section now enables per-project session storage
+/// for cwd-hinted launches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppUiConfig {
     /// Optional default workspace cwd for AppUi sessions. When set, every
@@ -283,6 +313,51 @@ pub struct AppUiConfig {
     /// `config.json`.
     #[serde(default)]
     pub default_session_cwd: Option<PathBuf>,
+
+    /// Relocate AppUi/stdio "coding-agent" session storage from the global
+    /// per-profile store (`<data_dir>/sessions/`) to a **per-project** store
+    /// at `<cwd>/.octos/sessions/`, so `resume` / `session/list` show the
+    /// conversations that belong to the folder the client launched in.
+    ///
+    /// Scope: only sessions opened with a `cwd`/`workspace_hint` (the
+    /// AppUi/coding-agent path). No-hint web-chat and every gateway session
+    /// stay on the per-profile store regardless of this flag — the
+    /// sessions-root resolver returns `profile.data_dir` when there is no
+    /// hint, so per-cwd storage is inert for those paths by construction.
+    ///
+    /// Default `true`: a bare launch in a folder resumes that folder's own
+    /// conversations, which is the launch-flow contract (`launch/resolve` +
+    /// the sticky `active-profile` marker record their per-project store).
+    /// An operator can still force the legacy global store by setting
+    /// `sessions_in_cwd = false`.
+    ///
+    /// Coexistence trade-off (this flip is NOT a migration): cwd-hinted
+    /// coding sessions created before the default flipped live under the old
+    /// per-profile store and do NOT appear in a per-project `session/list`
+    /// for their folder — their cwd was never persisted, so they cannot be
+    /// relocated. They remain reachable via a no-`cwd` `session/list` (which
+    /// still resolves to `profile.data_dir`). No-hint web-chat and every
+    /// gateway session are unaffected: they never used per-cwd storage, so
+    /// flipping the default is inert for those paths by construction.
+    #[serde(default = "default_sessions_in_cwd")]
+    pub sessions_in_cwd: bool,
+}
+
+/// Default for [`AppUiConfig::sessions_in_cwd`] — `true` so a bare launch in
+/// a folder resumes that folder's own conversations. Kept in sync with the
+/// manual [`Default`] impl below (serde uses this for a present `[appui]`
+/// missing the key; `Default` covers an absent `[appui]` section).
+fn default_sessions_in_cwd() -> bool {
+    true
+}
+
+impl Default for AppUiConfig {
+    fn default() -> Self {
+        Self {
+            default_session_cwd: None,
+            sessions_in_cwd: default_sessions_in_cwd(),
+        }
+    }
 }
 
 /// Top-level credential-pool configuration for `chat` / `serve`. Mirrors
@@ -548,6 +623,13 @@ pub struct EmbeddingConfig {
     /// output differs or its vectors are dropped to BM25-only.
     #[serde(default)]
     pub dimensions: Option<u32>,
+
+    /// Path to the local `.gguf` file for the in-process `llamacpp` provider
+    /// (feature `embed-llama`; add `embed-llama-metal` / `embed-llama-cuda` to
+    /// offload). Any GGUF embedding model works, e.g.
+    /// `ggml-org/embeddinggemma-300M-GGUF`. Ignored by remote providers.
+    #[serde(default)]
+    pub model_path: Option<String>,
 }
 
 fn default_embedding_provider() -> String {
@@ -1631,7 +1713,16 @@ impl Config {
         //    legacy path differs from config_home (so we don't double-check the
         //    same file). Explicit/tenant contexts never reach here.
         if is_default {
-            if let Some(home) = dirs::home_dir() {
+            // Prefer an explicit `HOME` before the OS profile dir so the legacy
+            // `~/.octos` lookup is testable and user-overridable on Windows,
+            // where `dirs::home_dir()` reads FOLDERID_Profile and ignores
+            // `HOME`/`USERPROFILE`. On Unix `dirs::home_dir()` already consults
+            // `HOME`, so this is behaviour-preserving there.
+            let legacy_home = std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir);
+            if let Some(home) = legacy_home {
                 let legacy_config = home.join(".octos").join("config.json");
                 if legacy_config != home_config && legacy_config.exists() {
                     tracing::info!(
@@ -1768,14 +1859,22 @@ impl Config {
             // provider's default var name (a redundant-but-legal config),
             // the full provider chain — auth store included — still
             // applies, preserving pre-existing login-based setups.
-            Some(var) if Some(var) != Self::provider_default_env_var(provider).as_deref() => {
-                self.resolve_env_var_only(var)
+            // A registry-known key name (the provider's `api_key_env` OR any
+            // declared `key_env_aliases`, e.g. KIMI_API_KEY for moonshot) is
+            // NOT a custom override: run the FULL chain (auth store + sibling
+            // expansion) via `resolve_api_key`, so `octos doctor`, the dashboard,
+            // and embedding config agree with what `get_api_key` accepts. Without
+            // this, an init-generated Moonshot config (api_key_env=KIMI_API_KEY)
+            // would be misclassified as custom and skip the MOONSHOT_API_KEY
+            // fallback + auth store.
+            Some(var) if Self::provider_knows_key_env(provider, var) => {
+                self.resolve_api_key(provider, var.to_string())
             }
-            // Default-name override: the FULL chain (auth store included)
-            // but with THE GIVEN var — get_api_key would re-apply the
-            // top-level Config.api_key_env, which in mixed-provider
-            // configs points at the PRIMARY provider's key (codex R4).
-            Some(var) => self.resolve_api_key(provider, var.to_string()),
+            // A genuinely custom var means "use this variable": the
+            // provider-scoped auth store must not win, or a stored `octos auth
+            // login -p openai` token would be sent to the custom
+            // OpenAI-compatible endpoint the override targets.
+            Some(var) => self.resolve_env_var_only(var),
             None => self.get_api_key(provider),
         }
     }
@@ -1790,6 +1889,17 @@ impl Config {
         )
     }
 
+    /// Whether `name` is one of `provider`'s known key env var names — its
+    /// registry `api_key_env` or a declared `key_env_alias`. For a provider not
+    /// in the registry, falls back to the conventional `{PROVIDER}_API_KEY`.
+    /// Case-sensitive (Unix env names are case-sensitive).
+    pub(crate) fn provider_knows_key_env(provider: &str, name: &str) -> bool {
+        match octos_llm::registry::lookup(provider) {
+            Some(entry) => entry.is_known_key_env(name),
+            None => name == format!("{}_API_KEY", provider.to_uppercase()),
+        }
+    }
+
     /// Resolve a key from an explicit env-var name WITHOUT provider-scoped
     /// auth-store lookup: secret registration → `env_vars` map (keychain-
     /// resolved) → process env.
@@ -1800,8 +1910,14 @@ impl Config {
         }) {
             return Ok(value);
         }
-        std::env::var(env_var)
-            .wrap_err_with(|| format!("{env_var} not set (explicit embedding api_key_env)"))
+        // Treat an empty value as unset, matching `resolve_api_key`, so status
+        // reporting and resolution agree and an empty Bearer key is never sent.
+        match std::env::var(env_var) {
+            Ok(value) if !value.is_empty() => Ok(value),
+            _ => Err(eyre::eyre!(
+                "{env_var} not set or empty (explicit embedding api_key_env)"
+            )),
+        }
     }
 
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
@@ -1827,31 +1943,64 @@ impl Config {
     /// Shared resolution body: auth store → env_vars (keychain) → process
     /// env, with the var name secret-registered first.
     fn resolve_api_key(&self, provider: &str, env_var: String) -> Result<String> {
-        octos_agent::register_secret_env_names([env_var.as_str()]);
+        // Candidate env-var names. A provider may declare sibling key vars in
+        // the registry (e.g. Moonshot accepts MOONSHOT_API_KEY or KIMI_API_KEY).
+        // We only expand to those siblings when the configured var is ITSELF one
+        // of the provider's known key names — an arbitrary custom `api_key_env`
+        // override (e.g. a proxy key) stays exclusive so a missing override
+        // never falls back to an unrelated ambient credential.
+        let mut candidates = vec![env_var.clone()];
+        if let Some(entry) = octos_llm::registry::lookup(provider) {
+            // Only expand to sibling key vars when the configured var is itself
+            // a declared key name (case-sensitive — see `is_known_key_env`).
+            if entry.is_known_key_env(&env_var) {
+                for k in entry.key_env_names() {
+                    if !candidates.iter().any(|c| c == k) {
+                        candidates.push(k.to_string());
+                    }
+                }
+            }
+        }
+        octos_agent::register_secret_env_names(candidates.iter());
 
         // Check auth store first. Auth is GLOBAL: it lives under the resolver's
         // `auth_home` (OCTOS_CONFIG_DIR if set, else the XDG default). This is
         // independent of `--data-dir`, so per-profile gateways keep the host's
         // shared `octos auth login` credentials. We resolve the context with no
         // cli_data_dir because auth_home never depends on it.
-        let auth_home = crate::config_context::resolve_config_context(None).auth_home;
-        if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
-            if let Some(cred) = store.get(provider) {
-                if !cred.is_expired() {
-                    return Ok(cred.access_token.clone());
+        //
+        // `bypass_auth_store` opts out (used by octos-ffi): a caller that passed
+        // an explicit key must have it win over any ambient login credential.
+        if !self.bypass_auth_store {
+            let auth_home = crate::config_context::resolve_config_context(None).auth_home;
+            if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
+                if let Some(cred) = store.get(provider) {
+                    if !cred.is_expired() {
+                        return Ok(cred.access_token.clone());
+                    }
                 }
             }
         }
 
-        if let Some(value) = self.env_vars.get(&env_var).and_then(|value| {
-            crate::auth::keychain::resolve_value(&env_var, value).filter(|value| !value.is_empty())
-        }) {
-            return Ok(value);
+        for name in &candidates {
+            if let Some(value) = self.env_vars.get(name).and_then(|value| {
+                crate::auth::keychain::resolve_value(name, value).filter(|value| !value.is_empty())
+            }) {
+                return Ok(value);
+            }
         }
 
-        std::env::var(&env_var).wrap_err_with(|| {
-            format!("{env_var} not set. Run `octos auth login -p {provider}` or set the env var")
-        })
+        for name in &candidates {
+            if let Ok(value) = std::env::var(name) {
+                if !value.is_empty() {
+                    return Ok(value);
+                }
+            }
+        }
+
+        Err(eyre::eyre!(
+            "{env_var} not set or empty. Run `octos auth login -p {provider}` or set the env var"
+        ))
     }
 
     /// Validate the configuration, returning any warnings.
@@ -2002,6 +2151,26 @@ mod tests {
     use crate::config_context::TEST_ENV_LOCK as HOME_ENV_LOCK;
 
     #[test]
+    fn should_parse_snapshots_config_and_default_to_off_when_absent() {
+        // Absent → None (feature off, #1768 opt-in contract).
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.snapshots.is_none());
+
+        let config: Config =
+            serde_json::from_str(r#"{"snapshots": {"enabled": true, "keep_last": 7}}"#).unwrap();
+        let snapshots = config.snapshots.expect("snapshots block parsed");
+        assert!(snapshots.enabled);
+        assert_eq!(snapshots.keep_last, 7);
+
+        // Partial block keeps the documented defaults.
+        let config: Config = serde_json::from_str(r#"{"snapshots": {"enabled": true}}"#).unwrap();
+        assert_eq!(
+            config.snapshots.unwrap().keep_last,
+            octos_agent::DEFAULT_SNAPSHOT_KEEP_LAST
+        );
+    }
+
+    #[test]
     fn write_mutation_creates_file_with_pretty_json() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
@@ -2129,6 +2298,39 @@ mod tests {
         let json = r#"{"channels": [{"type": "cli"}]}"#;
         let gw: GatewayConfig = serde_json::from_str(json).unwrap();
         assert_eq!(gw.max_history, 50);
+    }
+
+    #[test]
+    fn appui_sessions_in_cwd_defaults_on_and_can_be_disabled() {
+        // Absent `[appui]` → the `#[serde(default)]` on the parent field calls
+        // `AppUiConfig::default()` → per-project storage ON.
+        let absent: Config = serde_json::from_str(r#"{"provider": "anthropic"}"#).unwrap();
+        assert!(
+            absent.appui.sessions_in_cwd,
+            "an absent [appui] section must default sessions_in_cwd on",
+        );
+
+        // Present `[appui]` missing the key → the field-level
+        // `#[serde(default = \"default_sessions_in_cwd\")]` path → ON.
+        let empty: Config =
+            serde_json::from_str(r#"{"provider": "anthropic", "appui": {}}"#).unwrap();
+        assert!(
+            empty.appui.sessions_in_cwd,
+            "an empty [appui] section must default sessions_in_cwd on",
+        );
+
+        // Explicit opt-out → the legacy global per-profile store is honored.
+        let disabled: Config = serde_json::from_str(
+            r#"{"provider": "anthropic", "appui": {"sessions_in_cwd": false}}"#,
+        )
+        .unwrap();
+        assert!(
+            !disabled.appui.sessions_in_cwd,
+            "an operator can still force the legacy global store off",
+        );
+
+        // The programmatic Default agrees with both serde paths.
+        assert!(AppUiConfig::default().sessions_in_cwd);
     }
 
     #[test]
@@ -2493,6 +2695,142 @@ mod tests {
         );
     }
 
+    /// Run `f` with HOME pointed at an empty temp dir (so the global auth store
+    /// is empty) and the config/XDG env vars cleared, plus the Moonshot key vars
+    /// the credential tests assert against removed from the ambient process env
+    /// (so a dev machine that happens to export one can't flip the result).
+    /// Serialized on the shared env lock; all vars restored afterwards.
+    #[allow(unsafe_code)]
+    fn with_isolated_home<T>(f: impl FnOnce() -> T) -> T {
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = [
+            "HOME",
+            "OCTOS_HOME",
+            "OCTOS_CONFIG_DIR",
+            "XDG_CONFIG_HOME",
+            "MOONSHOT_API_KEY",
+            "KIMI_API_KEY",
+            "MY_PROXY_KEY",
+            "kimi_api_key",
+        ];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            for k in &keys[1..] {
+                std::env::remove_var(k);
+            }
+        }
+        let out = f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn custom_api_key_env_override_stays_exclusive() {
+        // Regression: an explicit custom `api_key_env` must NOT fall back to a
+        // provider's sibling key vars — otherwise a missing proxy key would leak
+        // an ambient KIMI_API_KEY to a custom endpoint.
+        with_isolated_home(|| {
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("MY_PROXY_KEY".to_string()),
+                env_vars: std::collections::HashMap::from([(
+                    "KIMI_API_KEY".to_string(),
+                    "ambient-kimi".to_string(),
+                )]),
+                ..Default::default()
+            };
+            // MY_PROXY_KEY is unset; resolution must fail, not return the
+            // unrelated KIMI credential.
+            assert!(cfg.get_api_key("moonshot").is_err());
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn custom_api_key_env_matching_alias_case_insensitively_stays_exclusive() {
+        // Regression (codex P1): env var names are case-sensitive on Unix, so a
+        // genuinely custom `kimi_api_key` (lowercase) is NOT the declared
+        // KIMI_API_KEY and must stay exclusive — it must not fall back to an
+        // ambient MOONSHOT_API_KEY and leak it to a custom endpoint.
+        with_isolated_home(|| {
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "ambient-moonshot") };
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("kimi_api_key".to_string()),
+                ..Default::default()
+            };
+            assert!(cfg.get_api_key("moonshot").is_err());
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn moonshot_accepts_either_declared_key_name() {
+        // Regression (symmetry): an init-generated config uses api_key_env =
+        // KIMI_API_KEY, but a user who set MOONSHOT_API_KEY must still resolve,
+        // because both are declared key names for the provider.
+        with_isolated_home(|| {
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("KIMI_API_KEY".to_string()),
+                env_vars: std::collections::HashMap::from([(
+                    "MOONSHOT_API_KEY".to_string(),
+                    "mkey".to_string(),
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(cfg.get_api_key("moonshot").unwrap(), "mkey");
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn moonshot_kimi_config_resolves_moonshot_var_from_process_env() {
+        // Regression: the headline scenario — init writes api_key_env=KIMI_API_KEY
+        // but the user exports MOONSHOT_API_KEY in their shell — resolves via the
+        // process-env candidate loop (not the env_vars map).
+        with_isolated_home(|| {
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "from-shell") };
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("KIMI_API_KEY".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(cfg.get_api_key("moonshot").unwrap(), "from-shell");
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn get_api_key_with_env_alias_agrees_with_get_api_key() {
+        // Regression (codex P1): the explicit-env entry point must treat a
+        // declared alias (KIMI_API_KEY) as a known name and run the full chain,
+        // so doctor/dashboard/embedding agree with chat runtime — resolving the
+        // sibling MOONSHOT_API_KEY rather than misclassifying KIMI as custom.
+        with_isolated_home(|| {
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "from-shell") };
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.get_api_key_with_env("moonshot", Some("KIMI_API_KEY"))
+                    .unwrap(),
+                "from-shell"
+            );
+        });
+    }
+
     #[test]
     fn test_embedding_config_deserialize() {
         let json = r#"{
@@ -2540,6 +2878,21 @@ mod tests {
         let json = r#"{"provider": "anthropic"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.tool_policy_by_provider.is_empty());
+    }
+
+    #[test]
+    fn should_default_format_after_edit_to_false_when_absent() {
+        // #1774: post-edit formatting is strictly opt-in.
+        let json = r#"{"provider": "anthropic"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.format_after_edit);
+    }
+
+    #[test]
+    fn should_deserialize_format_after_edit_opt_in() {
+        let json = r#"{"provider": "anthropic", "format_after_edit": true}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.format_after_edit);
     }
 
     #[test]
