@@ -84,7 +84,7 @@ use super::agent_orchestrator::{
     AgentRequest, AgentUpsert, GoalSessionRequest, GoalSetRequest, LoopControlKind,
     LoopControlRequest, LoopCreateRequest, LoopListRequest, NativeSpecialistAppUiEvent,
     NativeSpecialistLaunchRequest, default_agent_orchestrator, master_continuation_prompt,
-    master_continuation_reason_name, upsert_background_task_agent,
+    master_continuation_reason_name, parse_agent_output_cursor, upsert_background_task_agent,
 };
 #[cfg(test)]
 use super::agent_orchestrator::{
@@ -5967,7 +5967,7 @@ struct RawAgentOutputParams {
     #[serde(default)]
     profile_id: Option<String>,
     #[serde(default)]
-    cursor: Option<OutputCursor>,
+    cursor: Option<Value>,
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -8955,11 +8955,13 @@ fn raw_autonomy_rpc_with_orchestrator(
                 params.profile_id.as_deref(),
                 connection_profile_id,
             )?;
+            let cursor =
+                parse_agent_output_cursor(params.cursor, params.session_id.as_ref(), &profile_id)?;
             orchestrator.read_agent_output(AgentOutputRequest {
                 agent_id: params.agent_id,
                 session_id: params.session_id,
                 profile_id,
-                cursor: params.cursor,
+                cursor,
                 limit: params.limit,
             })
         }
@@ -37964,6 +37966,53 @@ ignore = []
             .map(|(_, _, expected_call)| (*expected_call).to_owned())
             .collect::<Vec<_>>();
         assert_eq!(calls, expected);
+    }
+
+    #[test]
+    fn agent_output_read_preserves_recoverable_cursor_error_shape() {
+        let features = ConnectionUiFeatures::stdio_defaults();
+        let session_id = SessionKey::new("tenant-a", "cursor-error");
+        let orchestrator = RecordingOrchestrator::default();
+
+        for malformed_cursor in [
+            json!({}),
+            json!({ "offset": "not-a-number" }),
+            json!({ "offset": -1 }),
+        ] {
+            let request = RpcRequest::new(
+                "read-output",
+                methods::AGENT_OUTPUT_READ,
+                json!({
+                    "agent_id": "agent-1",
+                    "session_id": session_id.clone(),
+                    "profile_id": "tenant-a",
+                    "cursor": malformed_cursor,
+                }),
+            );
+            let error = raw_autonomy_rpc_with_orchestrator(&request, features, None, &orchestrator)
+                .expect_err("malformed cursor must retain the domain error");
+            let data = error.data.expect("cursor error data");
+
+            assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+            assert_eq!(
+                error.message,
+                "agent output cursor must be an object with numeric offset"
+            );
+            assert_eq!(data["kind"], "agent_output_cursor_invalid");
+            assert_eq!(data["policy_id"], "coding-autonomy-v1");
+            assert_eq!(data["profile_id"], "tenant-a");
+            assert_eq!(data["session_id"], json!(session_id));
+            assert_eq!(data["recoverable"], true);
+        }
+
+        assert!(
+            orchestrator
+                .calls
+                .lock()
+                .expect("recorded calls")
+                .is_empty(),
+            "invalid cursors must fail before orchestrator dispatch"
+        );
     }
 
     /// Codex P1 follow-up to #1094: `task/artifact/list` and

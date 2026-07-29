@@ -980,13 +980,15 @@ pub(crate) fn payload_from_user_profile(
     profile: &crate::profiles::UserProfile,
     include_secrets: bool,
 ) -> eyre::Result<crate::profile_qr::ProfileQrPayload> {
+    use eyre::WrapErr;
+
     let mut payload = crate::profile_qr::ProfileQrPayload::new(&profile.id);
     payload.name = Some(profile.name.clone());
     if let Some(ref llm) = profile.config.llm {
-        payload.llm = Some(llm.clone());
+        payload.llm = Some(serde_json::to_value(llm).wrap_err("serialize llm config")?);
     }
     if let Some(ref memory) = profile.config.memory {
-        payload.memory = Some(memory.clone());
+        payload.memory = Some(serde_json::to_value(memory).wrap_err("serialize memory config")?);
     }
     payload.voice_default = profile.config.voice_default.clone();
 

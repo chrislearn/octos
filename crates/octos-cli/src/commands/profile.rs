@@ -16,7 +16,6 @@ use eyre::{Result, WrapErr, bail};
 use super::Executable;
 use crate::config::Config;
 use crate::profile_qr::{self, ProfileQrPayload};
-use crate::profiles::{LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig};
 
 /// Portable profile export (QR) and payload inspection.
 #[derive(Debug, Args)]
@@ -129,27 +128,22 @@ pub(crate) fn payload_from_config(
     if let Some(provider) = provider {
         // Emit the SAME structured contract as the server-profile export
         // (`LlmProfileConfig`): one shape for scanning clients (codex P2).
-        payload.llm = Some(LlmProfileConfig {
-            primary: Some(LlmModelSelectionConfig {
-                family_id: Some(provider.to_owned()),
-                model_id: config.model.clone(),
-                route: config
-                    .api_key_env
-                    .as_ref()
-                    .map(|api_key_env| LlmRouteConfig {
-                        api_key_env: Some(api_key_env.clone()),
-                        ..Default::default()
-                    }),
-                ..Default::default()
-            }),
-            fallbacks: Vec::new(),
-        });
+        let mut primary = serde_json::Map::new();
+        primary.insert("family_id".into(), provider.into());
+        if let Some(ref model) = config.model {
+            primary.insert("model_id".into(), model.as_str().into());
+        }
+        if let Some(ref var) = config.api_key_env {
+            primary.insert("route".into(), serde_json::json!({ "api_key_env": var }));
+        }
+        payload.llm = Some(serde_json::json!({ "primary": primary }));
     }
     if let Some(ref memory) = config.memory {
-        payload.memory = Some(memory.clone());
+        payload.memory = Some(serde_json::to_value(memory).wrap_err("serialize memory config")?);
     }
     if let Some(ref embedding) = config.embedding {
-        payload.embedding = Some(embedding.clone());
+        payload.embedding =
+            Some(serde_json::to_value(embedding).wrap_err("serialize embedding config")?);
     }
     payload.voice_default = config.voice.as_ref().map(|v| v.default_voice.clone());
 
@@ -321,16 +315,9 @@ mod tests {
         let payload = payload_from_config(&config, "local", false).unwrap();
         assert_eq!(payload.id, "local");
         let llm = payload.llm.as_ref().expect("llm block");
-        let primary = llm.primary.as_ref().expect("primary model");
-        assert_eq!(primary.family_id.as_deref(), Some("deepseek"));
-        assert_eq!(primary.model_id.as_deref(), Some("deepseek-v4-pro"));
-        assert_eq!(
-            primary
-                .route
-                .as_ref()
-                .and_then(|route| route.api_key_env.as_deref()),
-            Some("DEEPSEEK_API_KEY")
-        );
+        assert_eq!(llm["primary"]["family_id"], "deepseek");
+        assert_eq!(llm["primary"]["model_id"], "deepseek-v4-pro");
+        assert_eq!(llm["primary"]["route"]["api_key_env"], "DEEPSEEK_API_KEY");
         assert!(payload.secrets.is_empty());
         assert!(!payload.has_secrets());
     }

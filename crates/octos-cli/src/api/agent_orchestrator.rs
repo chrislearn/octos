@@ -63,6 +63,7 @@ const SELF_PACED_DEFAULT_DELAY_SECONDS: u64 = 60 * 15;
 const MAX_OBJECTIVE_BYTES: usize = 8_192;
 const MAX_LOOP_PROMPT_BYTES: usize = 8_192;
 const MAX_LOOPS_PER_SESSION: usize = 16;
+const AGENT_OUTPUT_CURSOR_INVALID: &str = "agent_output_cursor_invalid";
 const AGENT_ARTIFACT_SELECTOR_INVALID: &str = "agent_artifact_selector_invalid";
 const AUTONOMY_RECORD_KIND: &str = "autonomy_record_kind";
 const AUTONOMY_RECORD_GOAL: &str = "goal";
@@ -2367,7 +2368,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     fn read_agent_output(&self, request: AgentOutputRequest) -> Result<Value, RpcError> {
         let state = self.state();
         let profile_id = request.profile_id.clone();
-        let cursor = request.cursor.clone();
+        let cursor = request.cursor;
         let limit = request.limit;
         let agent = get_agent(
             &state,
@@ -3685,6 +3686,26 @@ fn agent_invalid_params_error(
         data.insert(key.into(), json!(value));
     }
     RpcError::invalid_params(message).with_data(Value::Object(data))
+}
+
+pub(crate) fn parse_agent_output_cursor(
+    cursor: Option<Value>,
+    session_id: Option<&SessionKey>,
+    profile_id: &str,
+) -> Result<Option<OutputCursor>, RpcError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let Some(offset) = cursor.get("offset").and_then(Value::as_u64) else {
+        return Err(agent_invalid_params_error(
+            AGENT_OUTPUT_CURSOR_INVALID,
+            "agent output cursor must be an object with numeric offset",
+            session_id,
+            Some(profile_id),
+            None,
+        ));
+    };
+    Ok(Some(OutputCursor { offset }))
 }
 
 fn session_controls_target(requested: &SessionKey, target: &SessionKey) -> bool {
