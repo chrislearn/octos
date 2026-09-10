@@ -5467,19 +5467,29 @@ impl SessionActor {
                     goal_id = %snapshot.goal_id,
                     "sentinel goal completion not verified: {outcome}"
                 );
-                let note = format!("goal completion not verified — {outcome}");
-                {
-                    let mut handle = self.session_handle.lock().await;
-                    handle.push_message_in_memory(octos_core::Message::system(note.clone()));
+                // merged-review 2026-09-10 Fix 2: a REPLAYED failure is the
+                // same failure event re-surfaced, not a new one — the
+                // durable/in-memory note is appended only on a FRESH
+                // verdict. The warn above still fires every time, and the
+                // replay semantics (attempts==0) remain the caller's
+                // feedback; goal status/charging/TTL live in the wrapper
+                // and are untouched. Changed evidence produces a fresh
+                // digest → a new non-replayed verdict → a new note.
+                if !outcome.replayed {
+                    let note = format!("goal completion not verified — {outcome}");
+                    {
+                        let mut handle = self.session_handle.lock().await;
+                        handle.push_message_in_memory(octos_core::Message::system(note.clone()));
+                    }
+                    // Canonical durable append (per-key lock → fresh open →
+                    // seq'd write), mirroring `persist_assistant_message`.
+                    let _ = octos_bus::session::persist_message_through_canonical_path(
+                        &self.data_dir,
+                        &self.session_key,
+                        octos_core::Message::system(note),
+                    )
+                    .await;
                 }
-                // Canonical durable append (per-key lock → fresh open →
-                // seq'd write), mirroring `persist_assistant_message`.
-                let _ = octos_bus::session::persist_message_through_canonical_path(
-                    &self.data_dir,
-                    &self.session_key,
-                    octos_core::Message::system(note),
-                )
-                .await;
             }
         }
         // Re-queue another continuation only if we are still idle AND

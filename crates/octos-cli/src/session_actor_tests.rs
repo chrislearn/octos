@@ -10802,3 +10802,271 @@ async fn session_actor_sentinel_reports_verifier_failure_kind() {
     );
     drop(guard);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// merged-review 2026-09-10 Fix 2: a REPLAYED verifier failure must not
+// re-append the durable structured note (same evidence re-checked across
+// turns is a replay, not a new failure event). A NEW failure after changed
+// evidence still appends. Real `maybe_advance_goal_runtime_after_turn`
+// + real durable session files.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_actor_replayed_failure_does_not_duplicate_durable_note() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let task_store = SessionTaskQueryStore::default();
+    let (factory, _out_tx, _out_rx) =
+        build_minimal_actor_factory(&dir, task_store, Some("replay-note-prof".to_owned())).await;
+
+    let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+    let key = octos_core::SessionKey("replay-note-prof:api:replay-note-actor".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "replay-note-prof".to_owned(),
+            objective: "one note per distinct failure".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+
+    // Wire the verifier through the REAL factory field the actor reads.
+    struct EmptyReplyVerifier;
+    #[async_trait::async_trait]
+    impl LlmProvider for EmptyReplyVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    // Actor with a claimed completion in its (durable-backed) history.
+    let mut session_handle = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    session_handle
+        .session_mut()
+        .messages
+        .push(octos_core::Message::assistant(
+            "All tasks complete. <goal:complete>",
+        ));
+    let handle = Arc::new(tokio::sync::Mutex::new(session_handle));
+    let (proxy_tx, _proxy_rx) = mpsc::channel(64);
+    let (_inbox_tx, inbox_rx) = mpsc::channel(8);
+    let (self_tx, _self_rx) = mpsc::channel(8);
+    let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+    let memory = factory.memory.clone();
+    let agent = Arc::new(octos_agent::Agent::new(
+        AgentId::new("replay-note-agent"),
+        factory.llm.clone(),
+        tools,
+        memory,
+    ));
+    let actor = crate::session_actor::tests::session_actor_for_goal_test(
+        key.clone(),
+        agent,
+        handle,
+        proxy_tx,
+        inbox_rx,
+        self_tx,
+        dir.path().to_path_buf(),
+        Some(Arc::new(EmptyReplyVerifier)),
+    );
+
+    // Count durable structured notes in the REAL session file.
+    let durable_note_count = |dir: &tempfile::TempDir, key: &octos_core::SessionKey| -> usize {
+        let handle = octos_bus::session::SessionHandle::open(dir.path(), key);
+        handle
+            .session()
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == octos_core::MessageRole::System
+                    && m.content.contains("goal completion not verified")
+            })
+            .count()
+    };
+
+    let mut actor = actor;
+    // First turn: fresh failure → exactly ONE durable note.
+    actor
+        .maybe_advance_goal_runtime_after_turn("replay-note-prof", None, std::time::Instant::now())
+        .await;
+    assert_eq!(
+        durable_note_count(&dir, &key),
+        1,
+        "fresh failure appends one note"
+    );
+
+    // Same evidence again: the wrapper REPLAYS the stored verdict — the
+    // durable note must NOT duplicate (and the actor's in-memory history
+    // stays at one structured note too).
+    actor
+        .maybe_advance_goal_runtime_after_turn("replay-note-prof", None, std::time::Instant::now())
+        .await;
+    assert_eq!(
+        durable_note_count(&dir, &key),
+        1,
+        "replayed failure must not re-append the durable note"
+    );
+    {
+        let h = actor.session_handle.lock().await;
+        let in_memory = h
+            .session()
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == octos_core::MessageRole::System
+                    && m.content.contains("goal completion not verified")
+            })
+            .count();
+        assert_eq!(
+            in_memory, 1,
+            "replayed failure must not duplicate the in-memory note either"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_actor_new_evidence_failure_appends_fresh_note() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let task_store = SessionTaskQueryStore::default();
+    let (factory, _out_tx, _out_rx) =
+        build_minimal_actor_factory(&dir, task_store, Some("fresh-note-prof".to_owned())).await;
+
+    let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+    let key = octos_core::SessionKey("fresh-note-prof:api:fresh-note-actor".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "fresh-note-prof".to_owned(),
+            objective: "fresh note on new failure".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+
+    // Scripted provider: first call EMPTY (fresh failure), then the SAME
+    // evidence replays without consuming more script, and after we change
+    // the session history (new evidence tail), the next call fails again.
+    struct EmptyAlwaysVerifier;
+    #[async_trait::async_trait]
+    impl LlmProvider for EmptyAlwaysVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    let mut session_handle = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    session_handle
+        .session_mut()
+        .messages
+        .push(octos_core::Message::assistant(
+            "Step one done. <goal:complete>",
+        ));
+    let handle = Arc::new(tokio::sync::Mutex::new(session_handle));
+    let (proxy_tx, _proxy_rx) = mpsc::channel(64);
+    let (_inbox_tx, inbox_rx) = mpsc::channel(8);
+    let (self_tx, _self_rx) = mpsc::channel(8);
+    let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+    let memory = factory.memory.clone();
+    let agent = Arc::new(octos_agent::Agent::new(
+        AgentId::new("fresh-note-agent"),
+        factory.llm.clone(),
+        tools,
+        memory,
+    ));
+    let mut actor = crate::session_actor::tests::session_actor_for_goal_test(
+        key.clone(),
+        agent,
+        handle,
+        proxy_tx,
+        inbox_rx,
+        self_tx,
+        dir.path().to_path_buf(),
+        Some(Arc::new(EmptyAlwaysVerifier)),
+    );
+
+    let durable_note_count = |dir: &tempfile::TempDir, key: &octos_core::SessionKey| -> usize {
+        let handle = octos_bus::session::SessionHandle::open(dir.path(), key);
+        handle
+            .session()
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == octos_core::MessageRole::System
+                    && m.content.contains("goal completion not verified")
+            })
+            .count()
+    };
+
+    actor
+        .maybe_advance_goal_runtime_after_turn("fresh-note-prof", None, std::time::Instant::now())
+        .await;
+    assert_eq!(durable_note_count(&dir, &key), 1, "first failure appends");
+
+    // CHANGED evidence: a different assistant tail → new digest → fresh
+    // (non-replayed) failure → a SECOND durable note.
+    {
+        let mut h = actor.session_handle.lock().await;
+        h.session_mut()
+            .messages
+            .push(octos_core::Message::assistant(
+                "Step two also done now. <goal:complete>",
+            ));
+    }
+    actor
+        .maybe_advance_goal_runtime_after_turn("fresh-note-prof", None, std::time::Instant::now())
+        .await;
+    assert_eq!(
+        durable_note_count(&dir, &key),
+        2,
+        "new evidence failure appends a fresh note"
+    );
+}
