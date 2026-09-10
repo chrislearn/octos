@@ -5467,28 +5467,60 @@ impl SessionActor {
                     goal_id = %snapshot.goal_id,
                     "sentinel goal completion not verified: {outcome}"
                 );
-                // merged-review 2026-09-10 Fix 2: a REPLAYED failure is the
-                // same failure event re-surfaced, not a new one — the
-                // durable/in-memory note is appended only on a FRESH
-                // verdict. The warn above still fires every time, and the
-                // replay semantics (attempts==0) remain the caller's
-                // feedback; goal status/charging/TTL live in the wrapper
-                // and are untouched. Changed evidence produces a fresh
-                // digest → a new non-replayed verdict → a new note.
-                if !outcome.replayed {
-                    let note = format!("goal completion not verified — {outcome}");
-                    {
+                // evening 2026-09-10 (PR #2283 follow-up): the note is
+                // persisted IDEMPOTENTLY under a stable per-verdict identity
+                // — goal id + the same evidence digest the wrapper gates on
+                // (objective ‖ evidence ‖ revision). The `!replayed` gate is
+                // GONE: a replay whose note never landed (crash window or a
+                // previous persist failure) now recovers it, while an
+                // already-persisted note is returned as-is (original
+                // timestamp/content) and never duplicated. RAM mirrors ONLY
+                // the durable row the helper returns — a failed append
+                // leaves no phantom. Goal status, charging and TTL live in
+                // the wrapper and are untouched.
+                let digest = crate::autonomy::agent_orchestrator::verifier_evidence_digest(
+                    &snapshot.objective,
+                    &assistant_tail,
+                    snapshot.revision,
+                );
+                let note_id = format!("goal-verifier-note:v1:{}:{digest}", snapshot.goal_id);
+                match octos_bus::session::persist_system_note_once_through_canonical_path(
+                    &self.data_dir,
+                    &self.session_key,
+                    octos_core::Message::system(format!(
+                        "goal completion not verified — {outcome}"
+                    )),
+                    &note_id,
+                )
+                .await
+                {
+                    Ok(durable_row) => {
+                        // Mirror the durable row into RAM only when this
+                        // actor's mirror lacks a System row with the same
+                        // note id (covers: fresh append, disk-had-it-but-
+                        // RAM-didn't repair, and the no-duplicate case).
                         let mut handle = self.session_handle.lock().await;
-                        handle.push_message_in_memory(octos_core::Message::system(note.clone()));
+                        let mirrored = handle.session().messages.iter().any(|m| {
+                            m.role == octos_core::MessageRole::System
+                                && m.client_message_id.as_deref() == Some(note_id.as_str())
+                        });
+                        if !mirrored {
+                            handle.push_message_in_memory(durable_row);
+                        }
                     }
-                    // Canonical durable append (per-key lock → fresh open →
-                    // seq'd write), mirroring `persist_assistant_message`.
-                    let _ = octos_bus::session::persist_message_through_canonical_path(
-                        &self.data_dir,
-                        &self.session_key,
-                        octos_core::Message::system(note),
-                    )
-                    .await;
+                    Err(error) => {
+                        // Fail-closed: record and leave RAM untouched. The
+                        // next same-evidence verification (replay) retries
+                        // the same note id naturally — no background loop,
+                        // no charging/TTL changes.
+                        tracing::error!(
+                            session_id = %self.session_key,
+                            goal_id = %snapshot.goal_id,
+                            note_id = %note_id,
+                            error = %error,
+                            "goal verifier failure note persist failed; will retry on next verification"
+                        );
+                    }
                 }
             }
         }

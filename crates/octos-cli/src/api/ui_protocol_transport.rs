@@ -32305,8 +32305,9 @@ fn goal_verifier_failure_warning(
     // merged-review 2026-09-10 Fix 1: the WarningEvent carries the WIRE
     // session id. Goal lookups keep the scoped key; this shared
     // constructor is the single production boundary that strips the
-    // `\0~cwd-…` scope suffix, so every caller (interactive :36723 and
-    // tests) routes through the SAME normalization.
+    // `\0~cwd-…` scope suffix, so every caller (the interactive sentinel
+    // consumer in `run_standalone_turn` and the tests) routes through the
+    // SAME normalization.
     UiNotification::Warning(octos_core::ui_protocol::WarningEvent {
         session_id: crate::autonomy::agent_orchestrator::wire_key_from_goal_key(session_id),
         turn_id: None,

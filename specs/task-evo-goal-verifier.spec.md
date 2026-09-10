@@ -33,6 +33,8 @@ Native goal completion verifier 的 `NotDone { reason }` 把基础设施故障�
 
 ### Allowed Changes
 
+crates/octos-bus/src/session.rs
+crates/octos-bus/src/session_tests.rs
 crates/octos-cli/src/autonomy/goal_loop_runtime.rs
 crates/octos-cli/src/autonomy/agent_orchestrator.rs
 crates/octos-cli/src/goal_tool.rs
@@ -446,6 +448,104 @@ Scenario: 变更证据后的新失败追加新注记
   Given 回放态之后 assistant tail 变化（digest 改变）
   When 再次验证产生非回放的新失败
   Then durable 结构化 note 计数增至 2（fresh 边界保持可追加）
+
+### Rule: review-followup-note-recovery — 判词重放修复缺失注记
+
+Scenario: 判词已落账但注记缺失时新 actor 恢复
+  Test:
+    Package: octos-cli
+    Filter: session_actor_restart_with_ledger_verdict_but_missing_note_appends_it
+  Given 判词 ledger 已落盘但尚未写 note，真实 claim 先落盘再由新 SessionHandle 加载
+  When 新 actor 对同一证据再次验证
+  Then provider 调用计数不变；canonical transcript 恰有一条 note
+
+Scenario: 注记持久化失败无内存幻影且可重试
+  Test:
+    Package: octos-cli
+    Filter: session_actor_note_persist_failure_no_phantom_and_retry_recovers
+  Given canonical JSONL 路径被目录占据且 verifier ledger 路径可写
+  When 真实 verifier 判词产生后 note 写入失败，恢复 JSONL 后重试同证据
+  Then 失败后 RAM note 为零；恢复后 durable note 恰一条且 provider 不再调用
+
+Scenario: 磁盘有注记但旧内存镜像缺失时修复
+  Test:
+    Package: octos-cli
+    Filter: session_actor_missing_ram_note_mirrors_existing_durable_row
+  Given 第二个 handle 在第一个 actor 写 note 前打开，磁盘已有 note 而旧 handle 尚无 note
+  When 第二个 actor 重放相同验证
+  Then RAM 补入一条已持久化 note，磁盘仍恰一条
+
+Scenario: 同注记身份返回原始行
+  Test:
+    Package: octos-bus
+    Filter: system_note_once_same_id_returns_original_row_without_duplicate
+  Given 同一 note_id 的首条 note 已写入
+  When 以不同内容再次提交相同 note_id
+  Then 返回首条内容与 timestamp，重开 reader 仅一条
+
+Scenario: 并发相同注记身份只落一行
+  Test:
+    Package: octos-bus
+    Filter: system_note_once_concurrent_same_id_single_durable_row
+  Given 八个并发写入使用相同 note_id
+  When 在 canonical per-key persist lock 内检查并追加
+  Then 所有调用成功且重开 reader 恰一条 durable note
+
+Scenario: 零字节日志初始化失败可恢复
+  Test:
+    Package: octos-bus
+    Filter: system_note_once_zero_byte_file_recovers_and_stays_idempotent
+  Given 真实 canonical 文件已创建但为零字节
+  When 写入 note 后重试相同 note_id
+  Then 初始化合法日志且仅一条 note，重开 reader 可读且重试保留原内容和时间
+
+Scenario: 坏 header 拒绝且字节不变
+  Test:
+    Package: octos-bus
+    Filter: system_note_once_bad_header_fails_closed_file_untouched
+  Given 日志 header 非法但 body 与尾换行完整
+  When 尝试追加 note
+  Then 返回错误且文件每个字节保持不变
+
+Scenario: 坏 body 拒绝
+  Test:
+    Package: octos-bus
+    Filter: system_note_once_bad_body_line_fails_closed
+  Given 日志 body 存在无法解析的行
+  When 尝试追加 note
+  Then 返回错误
+
+Scenario: 缺尾换行拒绝追加
+  Test:
+    Package: octos-bus
+    Filter: system_note_once_missing_trailing_newline_fails_closed
+  Given 非空日志末行缺换行
+  When 尝试追加 note
+  Then 返回错误以免拼接损坏末行
+
+Scenario: 只有 meta 且无尾换行拒绝
+  Test:
+    Package: octos-bus
+    Filter: system_note_once_meta_only_no_newline_fails_closed_bytes_unchanged
+  Given 日志仅 meta 行且无尾换行
+  When 尝试追加 note
+  Then 返回错误且文件字节不变
+
+Scenario: JSON 字符串内部非法 UTF-8 拒绝
+  Test:
+    Package: octos-bus
+    Filter: system_note_once_invalid_utf8_fails_closed_bytes_unchanged
+  Given 合法 Message JSON 字符串内部含非法 UTF-8，lossy 解码仍可解析为 Message
+  When 尝试追加 note
+  Then 严格 UTF-8 校验返回错误且文件字节不变
+
+Scenario: 日志目标为目录拒绝
+  Test:
+    Package: octos-bus
+    Filter: system_note_once_target_is_directory_fails_closed
+  Given canonical JSONL 路径为真实空目录
+  When 尝试追加 note
+  Then 返回错误且目录内容不变
 
 ## Out of Scope
 
