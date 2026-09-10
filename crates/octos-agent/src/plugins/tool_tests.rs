@@ -3406,17 +3406,19 @@ async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
     );
 
     // Registry-rebound work_dir mirrors the hinted-workspace path.
-    let hinted_work_dir = tempfile::tempdir().expect("hinted work dir");
-    let script_path = hinted_work_dir.path().join("script.sh");
+    let hinted_workspace = tempfile::tempdir().expect("hinted workspace");
+    let hinted_work_dir = hinted_workspace.path().join("skill-output");
+    let script_path = hinted_workspace.path().join("script.sh");
     write_test_script(
         &script_path,
-        "#!/bin/sh\nDIR=$(pwd)\nprintf '{\"output\":\"%s\",\"success\":true}' \"$DIR\"\n",
+        "#!/bin/sh\nprintf 'generated report' > report.md\nDIR=$(pwd)\nprintf '{\"output\":\"%s\",\"success\":true}' \"$DIR\"\n",
     );
 
     let def = make_tool_def("hint_cwd", "echo CWD");
     let tool = PluginTool::new("plug".into(), def, script_path)
-        .with_work_dir(hinted_work_dir.path().to_path_buf())
+        .with_work_dir(hinted_work_dir.clone())
         .with_timeout(TEST_PLUGIN_TIMEOUT);
+    assert!(!hinted_work_dir.exists(), "binding must leave output lazy");
 
     let ctx = ctx_with_scope(scope);
     let result = crate::tools::TOOL_CTX
@@ -3427,11 +3429,15 @@ async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
     assert!(result.success, "hinted execute should succeed");
     let actual =
         std::fs::canonicalize(result.output.trim()).expect("CWD echoed by plugin should resolve");
-    let expected =
-        std::fs::canonicalize(hinted_work_dir.path()).expect("hinted work_dir should resolve");
+    let expected = std::fs::canonicalize(&hinted_work_dir).expect("hinted work_dir should resolve");
     assert_eq!(
         actual, expected,
         "registry-rebound self.work_dir MUST win over scope.workspace()"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hinted_work_dir.join("report.md")).unwrap(),
+        "generated report",
+        "first plugin execution must create its output directory and artifact"
     );
     // Defence in depth: the scope workspace must STILL be absent
     // because Phase 2-B did NOT redirect the spawn there.
