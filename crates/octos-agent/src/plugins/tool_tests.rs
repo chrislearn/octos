@@ -3381,7 +3381,7 @@ async fn plugin_refuses_absolute_escape_in_hinted_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
     // Codex P1 pin (Phase 2-B): when `SessionRuntime::bootstrap`
     // honours a `workspace_hint`, it calls
@@ -3408,11 +3408,21 @@ async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
     // Registry-rebound work_dir mirrors the hinted-workspace path.
     let hinted_workspace = tempfile::tempdir().expect("hinted workspace");
     let hinted_work_dir = hinted_workspace.path().join("skill-output");
+    #[cfg(unix)]
     let script_path = hinted_workspace.path().join("script.sh");
+    #[cfg(unix)]
     write_test_script(
         &script_path,
         "#!/bin/sh\nprintf 'generated report' > report.md\nDIR=$(pwd)\nprintf '{\"output\":\"%s\",\"success\":true}' \"$DIR\"\n",
     );
+    #[cfg(windows)]
+    let script_path = hinted_workspace.path().join("script.cmd");
+    #[cfg(windows)]
+    std::fs::write(
+        &script_path,
+        "@echo off\r\necho generated report>report.md\r\necho {\"output\":\"%CD:\\=/%\",\"success\":true}\r\n",
+    )
+    .expect("write plugin script");
 
     let def = make_tool_def("hint_cwd", "echo CWD");
     let tool = PluginTool::new("plug".into(), def, script_path)
@@ -3420,7 +3430,8 @@ async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
         .with_timeout(TEST_PLUGIN_TIMEOUT);
     assert!(!hinted_work_dir.exists(), "binding must leave output lazy");
 
-    let ctx = ctx_with_scope(scope);
+    let mut ctx = ToolContext::zero();
+    ctx.session_scope = Some(Arc::new(scope));
     let result = crate::tools::TOOL_CTX
         .scope(ctx, tool.execute(&json!({})))
         .await
@@ -3435,7 +3446,9 @@ async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
         "registry-rebound self.work_dir MUST win over scope.workspace()"
     );
     assert_eq!(
-        std::fs::read_to_string(hinted_work_dir.join("report.md")).unwrap(),
+        std::fs::read_to_string(hinted_work_dir.join("report.md"))
+            .unwrap()
+            .trim(),
         "generated report",
         "first plugin execution must create its output directory and artifact"
     );
