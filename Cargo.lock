@@ -4628,6 +4628,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "webpki-roots 0.26.11",
 ]
@@ -4961,6 +4962,7 @@ dependencies = [
 name = "octos-services"
 version = "2.0.3-rc.11"
 dependencies = [
+ "async-trait",
  "chrono",
  "dirs",
  "eyre",
