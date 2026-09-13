@@ -15246,6 +15246,7 @@ fn reserve_peer_build_cache_turn(
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
+    turn_id: &TurnId,
     outcome: TurnTerminalOutcome,
     content: &str,
     tokens_consumed: u64,
@@ -15293,13 +15294,17 @@ fn write_peer_result_if_peer_session(
         TurnTerminalOutcome::RateLimited => "rate_limited",
     };
 
+    // The runtime TurnId is the join key to model/lifecycle ledger events.
+    // The count below is only a file ordinal: failed writes can skip a real
+    // runtime turn without incrementing this count. Never infer an ID from it.
     // #435: versioned result files prevent silent overwrite when a persistent
     // peer runs multiple turns. Count existing result-*.md files to determine
     // the turn number so the caller doesn't need to track state.
     let turn_count = count_peer_result_versions(&peer_dir) + 1;
 
     let text = format!(
-        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\n---\n\n{body}{truncated}\n"
+        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\nturn_id: {}\n---\n\n{body}{truncated}\n",
+        turn_id.0
     );
 
     // Failure authority does not depend on the best-effort result write.
@@ -36178,6 +36183,7 @@ async fn run_standalone_turn(
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
+                    &turn_id,
                     TurnTerminalOutcome::Completed,
                     event.get("content").and_then(Value::as_str).unwrap_or(""),
                     final_tokens_consumed,
@@ -36313,6 +36319,7 @@ async fn run_standalone_turn(
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
+                    &turn_id,
                     turn_outcome,
                     &wire_msg,
                     final_tokens_consumed,
