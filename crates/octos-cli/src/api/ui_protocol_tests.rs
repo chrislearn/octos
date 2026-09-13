@@ -37107,9 +37107,11 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     // an unstaged peer topic writes nothing (no dir creation).
     let peer_key =
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-lens-review-2");
+    let first_turn = TurnId::new();
     write_peer_result_if_peer_session(
         &state,
         &peer_key,
+        &first_turn,
         TurnTerminalOutcome::Completed,
         "All three lenses agree.",
         0,
@@ -37122,11 +37124,16 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
         "result.md should contain outcome: completed"
     );
     assert!(written.contains("turn: 1"), "first turn should be turn 1");
+    assert!(
+        written.contains(&format!("\nturn_id: {}\n", first_turn.0)),
+        "native reports must carry the runtime turn identity, not only a file ordinal"
+    );
     assert!(written.contains("All three lenses agree."));
     // #435: versioned result file for historical record.
     let versioned =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();
     assert!(versioned.contains("outcome: completed"));
+    assert!(versioned.contains(&format!("\nturn_id: {}\n", first_turn.0)));
     // #435: turns.txt index file.
     let turns =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("turns.txt")).unwrap();
@@ -37139,6 +37146,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     write_peer_result_if_peer_session(
         &state,
         &ghost_key,
+        &TurnId::new(),
         TurnTerminalOutcome::Completed,
         "ghost",
         0,
@@ -37153,6 +37161,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     write_peer_result_if_peer_session(
         &state,
         &coding_key,
+        &TurnId::new(),
         TurnTerminalOutcome::Completed,
         "not a peer",
         0,
@@ -37160,9 +37169,11 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     );
 
     // Overwrite = latest state on result.md, versioned file for turn 2.
+    let second_turn = TurnId::new();
     write_peer_result_if_peer_session(
         &state,
         &peer_key,
+        &second_turn,
         TurnTerminalOutcome::Errored,
         "second turn failed",
         0,
@@ -37176,6 +37187,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
         "second turn should be turn 2"
     );
     assert!(!rewritten.contains("All three lenses agree."));
+    assert!(rewritten.contains(&format!("\nturn_id: {}\n", second_turn.0)));
     // #435: historical copy preserved.
     let turn1 =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();
@@ -37239,6 +37251,47 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     let rows = filtered["peers"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["slug"], "lens-review-3");
+
+    // Force real best-effort write failures without permissions/ENOSPC
+    // assumptions (which root or platform differences can bypass). Directories
+    // occupy the version/index leaves; only these test-owned leaves are removed.
+    let fault_dir = peers_root.join("lens-review-3");
+    let fault_key = SessionKey::with_profile_topic("dev", "local", "tui", "peer-lens-review-3");
+    std::fs::create_dir(fault_dir.join("result-1.md")).unwrap();
+    std::fs::create_dir(fault_dir.join("turns.txt")).unwrap();
+    let lost_turn = TurnId::new();
+    write_peer_result_if_peer_session(
+        &state,
+        &fault_key,
+        &lost_turn,
+        TurnTerminalOutcome::Completed,
+        "version and index writes fail",
+        0,
+        None,
+    );
+    assert!(fault_dir.join("result-1.md").is_dir());
+    assert!(fault_dir.join("turns.txt").is_dir());
+    assert_eq!(count_peer_result_versions(&fault_dir), 0);
+    std::fs::remove_dir(fault_dir.join("result-1.md")).unwrap();
+    std::fs::remove_dir(fault_dir.join("turns.txt")).unwrap();
+    let recovered_turn = TurnId::new();
+    write_peer_result_if_peer_session(
+        &state,
+        &fault_key,
+        &recovered_turn,
+        TurnTerminalOutcome::Completed,
+        "next actual runtime turn",
+        0,
+        None,
+    );
+    let recovered = std::fs::read_to_string(fault_dir.join("result-1.md")).unwrap();
+    assert!(recovered.contains("\nturn: 1\n"));
+    assert!(recovered.contains(&format!("\nturn_id: {}\n", recovered_turn.0)));
+    assert!(!recovered.contains(&lost_turn.0.to_string()));
+    assert_eq!(
+        std::fs::read_to_string(fault_dir.join("result.md")).unwrap(),
+        recovered
+    );
 }
 
 // --- turn/steer: mid-turn prompt injection (codex parity) ---

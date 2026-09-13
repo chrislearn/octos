@@ -15246,6 +15246,7 @@ fn reserve_peer_build_cache_turn(
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
+    turn_id: &TurnId,
     outcome: TurnTerminalOutcome,
     content: &str,
     tokens_consumed: u64,
@@ -15293,13 +15294,17 @@ fn write_peer_result_if_peer_session(
         TurnTerminalOutcome::RateLimited => "rate_limited",
     };
 
+    // The runtime TurnId is the join key to model/lifecycle ledger events.
+    // The count below is only a file ordinal: failed writes can skip a real
+    // runtime turn without incrementing this count. Never infer an ID from it.
     // #435: versioned result files prevent silent overwrite when a persistent
     // peer runs multiple turns. Count existing result-*.md files to determine
     // the turn number so the caller doesn't need to track state.
     let turn_count = count_peer_result_versions(&peer_dir) + 1;
 
     let text = format!(
-        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\n---\n\n{body}{truncated}\n"
+        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\nturn_id: {}\n---\n\n{body}{truncated}\n",
+        turn_id.0
     );
 
     // Failure authority does not depend on the best-effort result write.
@@ -32544,6 +32549,19 @@ async fn run_standalone_turn(
             return;
         }
     };
+    // #2244 — `on_turn_end` fires at this turn's terminal below (completed,
+    // errored, or interrupted). On the done/error arms it fires BEFORE the
+    // terminal frame is emitted, so a client that observes the turn's end —
+    // including a one-shot `octos chat -m` whose process exits right after —
+    // can rely on the hook having run; the interrupt arm fires right after
+    // its frame instead, to stay inside the 5s interrupt-ack deadline.
+    // Resolved once here from the same profile the turn's agent hooks come
+    // from; `None` (no hooks configured) makes each fire a no-op.
+    let turn_end_hooks = session_runtime.profile.hook_executor.clone();
+    let turn_end_hook_ctx = octos_agent::HookContext {
+        session_id: Some(session_id.to_string()),
+        profile_id: Some(session_runtime.profile.profile_id.clone()),
+    };
     // Outer-loop #4 (§4.2): this turn's peers root — `Some` ONLY when this
     // session is a peer (topic `peer-<slug>`) running under the profile's
     // data dir. The interrupted-terminal release below keys the slot registry
@@ -35153,6 +35171,10 @@ async fn run_standalone_turn(
     // `session`/`turn` from this span (postfix `.instrument` keeps the block
     // itself untouched).
     let turn_span = crate::turn_trace::turn_span(&session_id, &turn_id);
+    // #2244 — snapshot the turn summary now that every prompt rewrite above
+    // (STT transcription merge, voice-mode suffix) has landed; `prompt`
+    // itself moves into the agent task below.
+    let turn_end_summary = crate::session_actor::git_turn_summary(&prompt);
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -36178,6 +36200,7 @@ async fn run_standalone_turn(
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
+                    &turn_id,
                     TurnTerminalOutcome::Completed,
                     event.get("content").and_then(Value::as_str).unwrap_or(""),
                     final_tokens_consumed,
@@ -36197,6 +36220,17 @@ async fn run_standalone_turn(
                 // FIX-04: flush any accumulated drops before the lifecycle
                 // terminal so the client knows the cursor is incomplete.
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+                // #2244 — the turn reached its outcome; fire `on_turn_end`
+                // BEFORE the terminal frame (see the binding above).
+                crate::session_actor::emit_lifecycle_hook_payload(
+                    turn_end_hooks.as_ref(),
+                    &session_id,
+                    octos_agent::HookPayload::on_turn_end(
+                        turn_end_summary.clone(),
+                        Some(&turn_end_hook_ctx),
+                    ),
+                )
+                .await;
                 // Keep continuation admission out of the terminal→receipt gap.
                 // The dispatcher takes this same registry lock before claiming
                 // a queued synthesis. No provider work is awaited under it.
@@ -36313,6 +36347,7 @@ async fn run_standalone_turn(
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
+                    &turn_id,
                     turn_outcome,
                     &wire_msg,
                     final_tokens_consumed,
@@ -36333,6 +36368,17 @@ async fn run_standalone_turn(
                 )
                 .await;
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+                // #2244 — the turn reached its outcome; fire `on_turn_end`
+                // BEFORE the terminal frame (see the binding above).
+                crate::session_actor::emit_lifecycle_hook_payload(
+                    turn_end_hooks.as_ref(),
+                    &session_id,
+                    octos_agent::HookPayload::on_turn_end(
+                        turn_end_summary.clone(),
+                        Some(&turn_end_hook_ctx),
+                    ),
+                )
+                .await;
                 try_emit_terminal(
                     &turn_state,
                     TerminalReason::Errored,
@@ -36771,6 +36817,20 @@ async fn run_standalone_turn(
             steer_buffer.as_ref(),
             peers_root.as_deref(),
             // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
+        )
+        .await;
+        // #2244 — the turn reached its outcome; fire `on_turn_end`. Unlike the
+        // done/error arms this fires AFTER the terminal frame: the interrupt
+        // handler is blocked on that frame within a 5s ack deadline
+        // (INTERRUPT_ACK_TIMEOUT), so an up-to-`timeout_ms` hook wait must not
+        // sit between the state flip and the ack.
+        crate::session_actor::emit_lifecycle_hook_payload(
+            turn_end_hooks.as_ref(),
+            &session_id,
+            octos_agent::HookPayload::on_turn_end(
+                turn_end_summary.clone(),
+                Some(&turn_end_hook_ctx),
+            ),
         )
         .await;
         // codex #2 residual — a client-interrupted peer takes THIS branch, not
