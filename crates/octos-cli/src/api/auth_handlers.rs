@@ -3653,40 +3653,16 @@ pub async fn create_my_sub_account(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     if !req.env_vars.is_empty() {
-        sub.config.env_vars = req.env_vars;
-        // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
-        // persisting so a sub-account never writes a private key to disk.
-        let sub_id = sub.id.clone();
-        super::admin::relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
-        sub.updated_at = chrono::Utc::now();
-        ps.save(&sub)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        super::admin::apply_sub_account_env_vars(
+            ps,
+            &mut sub,
+            req.env_vars,
+            super::admin::relocate_keychain_backed_secrets,
+        )?;
     }
 
     if let Some(email) = &req.email {
-        let email = email.trim().to_lowercase();
-        if !email.is_empty() {
-            super::admin::validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-            if let Some(user_store) = state.user_store.as_ref() {
-                if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        format!("Email '{email}' is already registered to another account"),
-                    ));
-                }
-                let user = crate::user_store::User {
-                    id: sub.id.clone(),
-                    email,
-                    name: sub.name.clone(),
-                    role: crate::user_store::UserRole::User,
-                    created_at: chrono::Utc::now(),
-                    last_login_at: None,
-                };
-                user_store
-                    .save(&user)
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
-        }
+        super::admin::create_sub_account_user_entry(&state, ps, &sub, email)?;
     }
 
     let status = pm.status(&sub.id).await;
@@ -6117,7 +6093,10 @@ mod tests {
     }
 
     // No native Keychain writes without an isolated macOS integration fixture.
-    #[cfg(not(target_os = "macos"))]
+    // Linux-only for now: the injected test store root is cfg(linux), and on
+    // Windows (no backend, no injection) relocation fails before the profile
+    // save, so the env slot the assertions below read never exists.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn my_profile_rejects_service_account_json_under_custom_env_off_macos() {
         // Regression for the dashboard "Custom" bypass: a raw Vertex SA JSON
@@ -6322,6 +6301,111 @@ mod tests {
         assert_eq!(home["settings"]["city"], "Kyoto");
         assert_eq!(home["settings"]["clock_format"], "24h");
         assert_eq!(home["events"][0]["title"], "School pickup");
+    }
+
+    // #1472 wiring: the self-service create path routes env vars through the
+    // same shared helper as the admin path — benign vars (nothing to
+    // relocate) land on the saved sub-account.
+    #[tokio::test]
+    async fn should_create_my_sub_account_with_env_vars_via_my_handler() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let state = AppState {
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..state
+        };
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+
+        let (status, Json(resp)) = create_my_sub_account(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            axum::Json(crate::api::admin::CreateSubAccountRequest {
+                sub_account_id: "sub1".into(),
+                name: "Sub".into(),
+                public_subdomain: "sub1".into(),
+                email: None,
+                channels: vec![],
+                gateway: None,
+                env_vars: std::collections::HashMap::from([(
+                    "DEPLOY_ENV".to_string(),
+                    "production".to_string(),
+                )]),
+            }),
+        )
+        .await
+        .expect("creation succeeds");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.profile.id, "tenant--sub1");
+        let saved = profile_store
+            .get("tenant--sub1")
+            .unwrap()
+            .expect("sub-account persisted");
+        assert_eq!(
+            saved.config.env_vars.get("DEPLOY_ENV").map(String::as_str),
+            Some("production")
+        );
+    }
+
+    // #2316 wiring: the self-service create path shares the rollback helper —
+    // an email conflict after the profile store has persisted rolls the
+    // fresh sub-account back, so the same id stays retryable.
+    #[tokio::test]
+    async fn should_roll_back_my_sub_account_when_email_conflicts() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        let state = AppState {
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..state
+        };
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        user_store
+            .save(&User {
+                id: "other".into(),
+                email: "taken@example.com".into(),
+                name: "Other".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let err = create_my_sub_account(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            axum::Json(crate::api::admin::CreateSubAccountRequest {
+                sub_account_id: "sub1".into(),
+                name: "Sub".into(),
+                public_subdomain: "sub1".into(),
+                email: Some("taken@example.com".into()),
+                channels: vec![],
+                gateway: None,
+                env_vars: std::collections::HashMap::new(),
+            }),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            profile_store.get("tenant--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
     }
 
     // #1470: same partial nested-section patch as above, but through the
