@@ -620,6 +620,7 @@ fn session_open_result_includes_capabilities_field() {
         if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2
             || *feature == UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1
             || *feature == UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
+            || *feature == UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
         {
             continue;
         }
@@ -7426,4 +7427,25 @@ fn memory_requests_refuse_caller_identity_and_origin_fields() {
         .unwrap()["status"],
         "accepted"
     );
+}
+
+#[test]
+fn full_history_append_retry_feature_is_explicitly_negotiated() {
+    let feature = UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1;
+    assert!(
+        !UiProtocolCapabilities::first_server_slice()
+            .supported_features
+            .iter()
+            .any(|f| f == feature)
+    );
+    assert!(
+        UiProtocolCapabilities::full_protocol()
+            .supported_features
+            .iter()
+            .any(|f| f == feature)
+    );
+    let advertised = UiProtocolCapabilities::for_negotiated_features(&[feature.to_owned()]);
+    assert!(advertised.supported_features.iter().any(|f| f == feature));
+    let legacy = UiProtocolCapabilities::for_negotiated_features(std::iter::empty::<&str>());
+    assert!(!legacy.supported_features.iter().any(|f| f == feature));
 }

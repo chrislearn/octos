@@ -302,6 +302,12 @@ pub const UI_PROTOCOL_FEATURE_PLAN_TODOS_V1: &str = "plan.todos.v1";
 /// return the playback URL).
 pub const UI_PROTOCOL_FEATURE_SMART_HOME_V1: &str = "smart_home.v1";
 
+/// Record-only retries check the full live transcript, including sealed
+/// history outside the resident window, and echo the original thread binding.
+/// Clients must not infer this guarantee from method availability alone.
+pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1: &str =
+    "session.append_message.full_history_retry.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -337,6 +343,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
+    UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
 ];
 
 /// The features an `octos serve --stdio` connection has without negotiating.
@@ -1745,6 +1752,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
             UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
             UI_PROTOCOL_FEATURE_SMART_HOME_V1,
+            UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
         ])
     }
 
@@ -1770,7 +1778,12 @@ impl UiProtocolCapabilities {
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1)
                 // `context.state.v1` adds a notification kind legacy clients
                 // cannot decode, so it is never claimed without a request.
-                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1),
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+                // This slice is also the serde default for legacy peers that
+                // omit capabilities. Never infer safe replay on an old peer.
+                .filter(|feature| {
+                    *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
+                }),
         );
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()

@@ -436,6 +436,8 @@ Session, turn, and approval core:
 - `session/btw` (quick aside question answered while the current turn runs; #1609)
 - `session/append_message` (record-only history write: appends one row without starting
   a turn, accepted `UPCR-2026-042`)
+  — `session.append_message.full_history_retry.v1` additionally guarantees retry
+  lookup outside the resident history window and the original thread receipt.
 - `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command).
   Manual and automatic compaction use the same session model selection: a
   peer's configured model lane (also for its request-context sessions), otherwise

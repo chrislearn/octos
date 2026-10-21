@@ -2361,6 +2361,8 @@ struct ConnectionUiFeatures {
     /// task-return-unconsumed-steer-inputs: client asked for the
     /// dropped-before-terminal steer settlement guarantee.
     turn_steer_dropped_v1: bool,
+    /// Explicit acknowledgement of complete-live-history append retries.
+    session_append_full_history_retry_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -2475,6 +2477,11 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
             ),
+            session_append_full_history_retry_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -2517,6 +2524,7 @@ impl ConnectionUiFeatures {
             skill_actions_v1: true,
             skill_action_jobs_v1: true,
             turn_steer_dropped_v1: true,
+            session_append_full_history_retry_v1: false,
             header_present: true,
             stdio_transport: true,
         }
@@ -2564,6 +2572,9 @@ impl ConnectionUiFeatures {
             skill_actions_v1: has(APPUI_FEATURE_SKILL_ACTIONS_V1),
             skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
             turn_steer_dropped_v1: has(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
+            session_append_full_history_retry_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            ),
             header_present: true,
             stdio_transport,
         }
@@ -2679,6 +2690,11 @@ impl ConnectionUiFeatures {
         }
         if self.turn_steer_dropped_v1 {
             requested.push(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1);
+        }
+        if self.session_append_full_history_retry_v1 {
+            requested.push(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            );
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }

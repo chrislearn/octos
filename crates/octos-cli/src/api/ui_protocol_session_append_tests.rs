@@ -581,3 +581,39 @@ async fn session_append_message_retry_outside_window_keeps_original_unbound_rece
     );
     assert!(guard.load(&session_id).await.unwrap().is_partial());
 }
+
+#[test]
+fn session_append_message_full_history_feature_reaches_transport_acknowledgements() {
+    const FEATURE: &str =
+        octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1;
+    let acknowledged = |features: ConnectionUiFeatures| {
+        features
+            .negotiated_capabilities()
+            .supported_features
+            .iter()
+            .any(|value| value == FEATURE)
+    };
+    let empty = HeaderMap::new();
+    assert!(!acknowledged(ConnectionUiFeatures::from_headers_and_query(
+        &empty, None
+    )));
+    assert!(!acknowledged(ConnectionUiFeatures::stdio_defaults()));
+    assert!(acknowledged(ConnectionUiFeatures::from_headers_and_query(
+        &empty,
+        Some("ui_feature=session.append_message.full_history_retry.v1")
+    )));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-octos-ui-features",
+        axum::http::HeaderValue::from_static(FEATURE),
+    );
+    assert!(acknowledged(ConnectionUiFeatures::from_headers_and_query(
+        &headers, None
+    )));
+    assert!(acknowledged(
+        ConnectionUiFeatures::from_requested_feature_tokens([FEATURE], true)
+    ));
+    assert!(!acknowledged(
+        ConnectionUiFeatures::from_requested_feature_tokens(["projection.envelope.v2"], false)
+    ));
+}
