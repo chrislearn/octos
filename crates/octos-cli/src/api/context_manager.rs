@@ -391,6 +391,15 @@ impl Default for PromptBuildPolicy {
     }
 }
 
+impl PromptBuildPolicy {
+    /// Keep provider-required private history inside the owning session's
+    /// model projection. The provider adapter still decides wire eligibility.
+    pub(crate) fn reasoning_for_model(model: &str) -> bool {
+        octos_llm::openai::ModelHints::detect(model).reasoning_style
+            == octos_llm::openai::ReasoningStyle::EffortAndThinkingToggle
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NormalizationReport {
     pub(crate) generation: u64,
@@ -487,6 +496,9 @@ pub(crate) struct CompactContextPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target_tokens_after_compaction: Option<usize>,
     pub(crate) preserve_system_instructions: bool,
+    /// Count private reasoning only when the owning provider replays it.
+    #[serde(default)]
+    pub(crate) include_reasoning_in_budget: bool,
 }
 
 impl Default for CompactContextPolicy {
@@ -499,6 +511,7 @@ impl Default for CompactContextPolicy {
             semantic_shadow_keep_recent_tokens: None,
             target_tokens_after_compaction: None,
             preserve_system_instructions: true,
+            include_reasoning_in_budget: false,
         }
     }
 }
@@ -523,6 +536,8 @@ pub(crate) struct ContextCompactionRecord {
     pub(crate) summary_item_id: Option<TranscriptItemId>,
     pub(crate) token_estimate_before: usize,
     pub(crate) token_estimate_after: Option<usize>,
+    #[serde(default)]
+    pub(crate) includes_reasoning_in_budget: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target_tokens_after_compaction: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1108,6 +1123,7 @@ fn compaction_candidate_fingerprint_for(
         "target_tokens_after_compaction": policy.target_tokens_after_compaction,
         "keep_recent_tokens": policy.keep_recent_tokens,
         "keep_recent_items": policy.keep_recent_items,
+        "include_reasoning_in_budget": policy.include_reasoning_in_budget,
         "dropped_item_ids": dropped_item_ids
             .iter()
             .map(TranscriptItemId::as_str)
@@ -1252,7 +1268,11 @@ fn expected_v2_active_projection(
         compaction_summary_insert_index(&installed),
         summary_item.clone(),
     );
-    if (record.token_estimate_after != Some(estimate_items_tokens(&installed))
+    if (record.token_estimate_after
+        != Some(estimate_items_tokens_for_reasoning(
+            &installed,
+            record.includes_reasoning_in_budget,
+        ))
         && record.token_estimate_after != Some(legacy_estimate_items_tokens(&installed)))
         || record.installed_transcript_hash.as_deref()
             != Some(
@@ -1665,13 +1685,19 @@ impl ContextManager {
     /// projection. An infeasible pinned tail is deliberately allowed to stay
     /// over threshold; retrying against the identical projection cannot make
     /// it smaller and would otherwise compact on every agent-loop iteration.
-    pub(crate) fn should_auto_compact(&self, threshold_tokens: usize) -> bool {
-        if estimate_items_tokens(&self.items) <= threshold_tokens {
+    pub(crate) fn should_auto_compact(
+        &self,
+        threshold_tokens: usize,
+        include_reasoning: bool,
+    ) -> bool {
+        if estimate_items_tokens_for_reasoning(&self.items, include_reasoning) <= threshold_tokens {
             return false;
         }
         let projection_hash = self.active_projection_content_hash();
         !self.compactions.iter().rev().any(|record| {
-            record.retry_suppressed_projection_hash.as_deref() == Some(projection_hash.as_str())
+            record.includes_reasoning_in_budget == include_reasoning
+                && record.retry_suppressed_projection_hash.as_deref()
+                    == Some(projection_hash.as_str())
         })
     }
 
@@ -2678,11 +2704,12 @@ impl ContextManager {
             self.close_open_tool_interactions_as_aborted();
         }
         let mut ids = Vec::new();
-        let tool_group_id = message
+        let tool_group_id = (message
             .tool_calls
             .as_ref()
-            .filter(|calls| !calls.is_empty())
-            .map(|_| self.next_semantic_tool_group_id());
+            .is_some_and(|calls| !calls.is_empty())
+            || (message.role == MessageRole::Assistant && message.reasoning_content.is_some()))
+        .then(|| self.next_semantic_tool_group_id());
         match message.role {
             MessageRole::System => ids.push(self.record_item_with_source_ref(
                 TranscriptItemKind::SystemInstruction {
@@ -2701,12 +2728,13 @@ impl ContextManager {
             )),
             MessageRole::Assistant => {
                 if let Some(reasoning) = message.reasoning_content.as_ref() {
-                    ids.push(self.record_item_with_source_ref(
+                    ids.push(self.record_item_with_source_ref_and_group(
                         TranscriptItemKind::AssistantReasoning {
                             content: reasoning.clone(),
                         },
                         TranscriptItemSource::AgentLoop,
                         source_ref.clone(),
+                        tool_group_id.clone(),
                     ));
                 }
                 for tool_call in message.tool_calls.iter().flatten() {
@@ -3120,7 +3148,8 @@ impl ContextManager {
         let input_hash = self.transcript_hash();
         let input_projection_hash = self.active_projection_content_hash();
         let input_item_count = self.items.len();
-        let token_estimate_before = estimate_items_tokens(&self.items);
+        let token_estimate_before =
+            estimate_items_tokens_for_reasoning(&self.items, policy.include_reasoning_in_budget);
         let policy_fingerprint = hash_json(&json!(&policy));
 
         // Installing twice without any intervening projection change would
@@ -3191,7 +3220,8 @@ impl ContextManager {
             };
             let mut candidate = retained.clone();
             candidate.insert(summary_insert_index, compaction_item.clone());
-            let estimate = estimate_items_tokens(&candidate);
+            let estimate =
+                estimate_items_tokens_for_reasoning(&candidate, policy.include_reasoning_in_budget);
             (
                 replacement_transcript_hash,
                 compaction_item,
@@ -3207,9 +3237,9 @@ impl ContextManager {
             .filter(|item| pinned_item_ids.contains(&item.id))
             .cloned()
             .collect::<Vec<_>>();
-        let pinned_token_estimate = policy
-            .target_tokens_after_compaction
-            .map(|_| estimate_items_tokens(&pinned_items));
+        let pinned_token_estimate = policy.target_tokens_after_compaction.map(|_| {
+            estimate_items_tokens_for_reasoning(&pinned_items, policy.include_reasoning_in_budget)
+        });
         let mut installed = build_candidate(&summary);
         let mut budget_outcome = if policy.target_tokens_after_compaction.is_some() {
             ContextCompactionBudgetOutcome::Met
@@ -3259,6 +3289,7 @@ impl ContextManager {
                         summary_item_id: None,
                         token_estimate_before,
                         token_estimate_after: None,
+                        includes_reasoning_in_budget: policy.include_reasoning_in_budget,
                         target_tokens_after_compaction: Some(target),
                         pinned_token_estimate,
                         budget_outcome,
@@ -3314,6 +3345,7 @@ impl ContextManager {
             summary_item_id: Some(summary_item_id),
             token_estimate_before,
             token_estimate_after: Some(token_estimate_after),
+            includes_reasoning_in_budget: policy.include_reasoning_in_budget,
             target_tokens_after_compaction: policy.target_tokens_after_compaction,
             pinned_token_estimate,
             budget_outcome,
@@ -3426,7 +3458,7 @@ impl ContextManager {
                 .filter(|item| pinned_ids.contains(&item.id))
                 .cloned()
                 .collect::<Vec<_>>();
-            estimate_items_tokens(&pinned)
+            estimate_items_tokens_for_reasoning(&pinned, policy.include_reasoning_in_budget)
         });
         let pinned_infeasible = target_tokens_after_compaction
             .zip(pinned_token_estimate)
@@ -3458,8 +3490,12 @@ impl ContextManager {
             retained_item_ids: Vec::new(),
             dropped_item_ids: Vec::new(),
             summary_item_id: None,
-            token_estimate_before: estimate_items_tokens(&self.items),
+            token_estimate_before: estimate_items_tokens_for_reasoning(
+                &self.items,
+                policy.include_reasoning_in_budget,
+            ),
             token_estimate_after: None,
+            includes_reasoning_in_budget: policy.include_reasoning_in_budget,
             target_tokens_after_compaction,
             pinned_token_estimate,
             budget_outcome: if pinned_infeasible {
@@ -3489,6 +3525,7 @@ impl ContextManager {
         // position rather than the first id match anywhere.
         let mut consumed_tool_outputs: HashSet<TranscriptItemId> = HashSet::new();
         let mut index = 0;
+        let mut pending_reasoning: Option<(String, TranscriptItemId)> = None;
 
         while index < self.items.len() {
             let item = &self.items[index];
@@ -3512,14 +3549,33 @@ impl ContextManager {
                     index += 1;
                 }
                 TranscriptItemKind::AssistantFinal { content } => {
-                    entries.push(PromptMessageEntry::new(
+                    let mut entry = PromptMessageEntry::new(
                         message(MessageRole::Assistant, content.clone()),
                         item.id.clone(),
-                    ));
+                    );
+                    if let Some((reasoning, source)) = pending_reasoning.take() {
+                        entry.message.reasoning_content = Some(reasoning);
+                        entry.source_item_ids.insert(0, source);
+                    }
+                    entries.push(entry);
                     index += 1;
                 }
                 TranscriptItemKind::AssistantReasoning { content } => {
                     if policy.include_reasoning {
+                        let same_message_follows = self.items.get(index + 1).is_some_and(|next| {
+                            item.semantic_group_id.is_some()
+                                && item.semantic_group_id == next.semantic_group_id
+                                && matches!(
+                                    next.kind,
+                                    TranscriptItemKind::AssistantToolCall { .. }
+                                        | TranscriptItemKind::AssistantFinal { .. }
+                                )
+                        });
+                        if same_message_follows {
+                            pending_reasoning = Some((content.clone(), item.id.clone()));
+                            index += 1;
+                            continue;
+                        }
                         let mut msg = message(MessageRole::Assistant, String::new());
                         msg.reasoning_content = Some(content.clone());
                         entries.push(PromptMessageEntry::new(msg, item.id.clone()));
@@ -3533,6 +3589,9 @@ impl ContextManager {
                     let mut source_item_ids = Vec::new();
                     let mut call_ids = Vec::new();
                     let mut calls = Vec::new();
+                    if let Some((_, source)) = pending_reasoning.as_ref() {
+                        source_item_ids.push(source.clone());
+                    }
 
                     while let Some(item) = self.items.get(index) {
                         let TranscriptItemKind::AssistantToolCall {
@@ -3543,6 +3602,11 @@ impl ContextManager {
                         else {
                             break;
                         };
+                        if index != group_start
+                            && item.semantic_group_id != self.items[group_start].semantic_group_id
+                        {
+                            break;
+                        }
                         source_item_ids.push(item.id.clone());
                         call_ids.push(call_id.clone());
                         calls.push(ToolCall {
@@ -3555,7 +3619,9 @@ impl ContextManager {
                     }
 
                     let mut content = String::new();
-                    if let Some(next_item) = self.items.get(index) {
+                    if let Some(next_item) = self.items.get(index).filter(|next| {
+                        next.semantic_group_id == self.items[group_start].semantic_group_id
+                    }) {
                         if let TranscriptItemKind::AssistantFinal {
                             content: next_content,
                         } = &next_item.kind
@@ -3567,6 +3633,7 @@ impl ContextManager {
                     }
 
                     let mut msg = message(MessageRole::Assistant, content);
+                    msg.reasoning_content = pending_reasoning.take().map(|(content, _)| content);
                     msg.tool_calls = Some(calls);
                     entries.push(PromptMessageEntry::tool_call_group(
                         msg,
@@ -3926,7 +3993,28 @@ impl ContextManager {
             }
         }
 
-        let recent_start = self.items.len().saturating_sub(policy.keep_recent_items);
+        let mut recent_start = self.items.len().saturating_sub(policy.keep_recent_items);
+        if policy.include_reasoning_in_budget {
+            // Legacy item retention must not leave half of an assistant
+            // message behind. Expand the cut to its complete semantic block.
+            let retained_tail: HashSet<_> = self
+                .items
+                .iter()
+                .skip(recent_start)
+                .map(|item| &item.id)
+                .collect();
+            for block in self.semantic_blocks() {
+                if block.item_ids.iter().any(|id| retained_tail.contains(id)) {
+                    if let Some(start) = self
+                        .items
+                        .iter()
+                        .position(|item| block.item_ids.contains(&item.id))
+                    {
+                        recent_start = recent_start.min(start);
+                    }
+                }
+            }
+        }
         for item in self.items.iter().skip(recent_start) {
             if retained_ids.insert(item.id.clone()) {
                 retained.push(item.clone());
@@ -3955,7 +4043,21 @@ impl ContextManager {
         Vec<TranscriptItemId>,
         Vec<TranscriptItemId>,
     ) {
-        let blocks = self.semantic_blocks();
+        let mut blocks = self.semantic_blocks();
+        if policy.include_reasoning_in_budget {
+            let reasoning_tokens: HashMap<_, _> = self
+                .items
+                .iter()
+                .map(|item| (&item.id, estimate_reasoning_tokens(item)))
+                .collect();
+            for block in &mut blocks {
+                block.estimated_tokens += block
+                    .item_ids
+                    .iter()
+                    .filter_map(|id| reasoning_tokens.get(id))
+                    .sum::<usize>();
+            }
+        }
         let mut retained_block_ids = HashSet::new();
         let latest_user = blocks
             .iter()
@@ -4305,7 +4407,13 @@ fn estimate_entries_tokens(entries: &[PromptMessageEntry]) -> usize {
     let bytes = entries
         .iter()
         .map(|entry| {
-            entry.message.content.len() + entry.message.media.iter().map(String::len).sum::<usize>()
+            entry.message.content.len()
+                + entry
+                    .message
+                    .reasoning_content
+                    .as_ref()
+                    .map_or(0, String::len)
+                + entry.message.media.iter().map(String::len).sum::<usize>()
         })
         .sum::<usize>();
     estimate_tokens_from_bytes(bytes)
@@ -4503,6 +4611,24 @@ fn estimate_items_tokens(items: &[TranscriptItem]) -> usize {
     items.iter().map(estimate_item_tokens).sum::<usize>().max(1)
 }
 
+fn estimate_reasoning_tokens(item: &TranscriptItem) -> usize {
+    match &item.kind {
+        TranscriptItemKind::AssistantReasoning { content } => {
+            octos_llm::context::estimate_tokens(content) as usize
+        }
+        _ => 0,
+    }
+}
+
+fn estimate_items_tokens_for_reasoning(items: &[TranscriptItem], include_reasoning: bool) -> usize {
+    estimate_items_tokens(items)
+        + if include_reasoning {
+            items.iter().map(estimate_reasoning_tokens).sum::<usize>()
+        } else {
+            0
+        }
+}
+
 fn legacy_estimate_items_tokens(items: &[TranscriptItem]) -> usize {
     let bytes = items
         .iter()
@@ -4576,7 +4702,12 @@ fn xml_escape_text(value: &str) -> String {
 fn estimate_messages_tokens(messages: &[Message]) -> usize {
     messages
         .iter()
-        .map(|message| octos_llm::context::estimate_message_tokens(message) as usize)
+        .map(|message| {
+            octos_llm::context::estimate_message_tokens(message) as usize
+                + message.reasoning_content.as_deref().map_or(0, |reasoning| {
+                    octos_llm::context::estimate_tokens(reasoning) as usize
+                })
+        })
         .sum::<usize>()
         .max(1)
 }
@@ -4650,12 +4781,19 @@ fn rebuild_semantic_tool_groups(items: &mut [TranscriptItem]) {
     }
     for index in 0..items.len() {
         match &items[index].kind {
+            TranscriptItemKind::AssistantReasoning { .. } => {
+                items[index].semantic_group_id =
+                    Some(format!("semgrp_{}", items[index].id.as_str()));
+            }
             TranscriptItemKind::AssistantToolCall { .. } => {
                 let preceding_group = index.checked_sub(1).and_then(|previous| {
                     if matches!(
                         items[previous].kind,
                         TranscriptItemKind::AssistantToolCall { .. }
-                    ) {
+                            | TranscriptItemKind::AssistantReasoning { .. }
+                    ) && items[previous].source_ref == items[index].source_ref
+                        && items[previous].source == items[index].source
+                    {
                         items[previous].semantic_group_id.clone()
                     } else {
                         None
@@ -4674,7 +4812,10 @@ fn rebuild_semantic_tool_groups(items: &mut [TranscriptItem]) {
                         if matches!(
                             items[previous].kind,
                             TranscriptItemKind::AssistantToolCall { .. }
-                        ) {
+                                | TranscriptItemKind::AssistantReasoning { .. }
+                        ) && items[previous].source_ref == items[index].source_ref
+                            && items[previous].source == items[index].source
+                        {
                             items[previous].semantic_group_id.clone()
                         } else {
                             None
@@ -4729,6 +4870,12 @@ fn semantic_blocks_for_items(items: &[TranscriptItem]) -> Vec<SemanticBlock> {
         members
             .iter()
             .any(|item| matches!(item.kind, TranscriptItemKind::AssistantToolCall { .. }))
+            || (members
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::AssistantReasoning { .. }))
+                && members
+                    .iter()
+                    .any(|item| matches!(item.kind, TranscriptItemKind::AssistantFinal { .. })))
     });
     let mut parent_id: Option<SemanticBlockId> = None;
     let mut prefix_hash = hash_json(&json!({
@@ -4767,12 +4914,16 @@ fn semantic_blocks_for_items(items: &[TranscriptItem]) -> Vec<SemanticBlock> {
                     _ => None,
                 })
                 .collect::<HashSet<_>>();
-            let closed =
-                !expected_call_ids.is_empty() && expected_call_ids.is_subset(&terminal_call_ids);
+            let has_tools = !expected_call_ids.is_empty();
+            let closed = expected_call_ids.is_subset(&terminal_call_ids);
             consumed_group_items.extend(block_items.iter().map(|item| item.id.clone()));
             index += 1;
             (
-                SemanticBlockKind::ToolInteraction,
+                if has_tools {
+                    SemanticBlockKind::ToolInteraction
+                } else {
+                    SemanticBlockKind::AssistantFinal
+                },
                 closed,
                 Some(group_id.clone()),
                 block_items,
@@ -5012,6 +5163,152 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn replayed_reasoning_counts_toward_compaction_and_survives_resume() {
+        let mut answer = Message::assistant("done");
+        answer.reasoning_content = Some("private reasoning ".repeat(2_000));
+        let mut manager = ContextManager::from_session_history(
+            "budget",
+            None,
+            &[Message::user("old task"), answer, Message::user("new task")],
+        );
+        assert!(!manager.should_auto_compact(1_000, false));
+        assert!(manager.should_auto_compact(1_000, true));
+        let record = manager.compact_context(
+            "old task completed",
+            CompactContextPolicy {
+                keep_recent_tokens: Some(128),
+                target_tokens_after_compaction: Some(1_000),
+                include_reasoning_in_budget: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(record.status, ContextCompactionStatus::Installed);
+        assert!(record.token_estimate_before > 1_000);
+        assert!(record.token_estimate_after.unwrap() <= 1_000);
+        assert!(record.includes_reasoning_in_budget);
+        let restored = ContextManager::from_snapshot(
+            serde_json::from_str(&serde_json::to_string(&manager.snapshot()).unwrap()).unwrap(),
+        );
+        let projection = |context: &ContextManager| {
+            context
+                .for_prompt(&PromptBuildPolicy {
+                    include_reasoning: true,
+                    ..Default::default()
+                })
+                .messages
+                .into_iter()
+                .map(|m| (m.role, m.content, m.reasoning_content))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(projection(&restored), projection(&manager));
+        assert!(
+            !restored
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::AssistantFinal { .. }))
+        );
+        assert!(!restored.should_auto_compact(1_000, true));
+    }
+
+    #[test]
+    fn legacy_compaction_keeps_reasoning_with_retained_answer() {
+        let mut answer = Message::assistant("done");
+        answer.reasoning_content = Some("retained reasoning".into());
+        let mut manager =
+            ContextManager::from_session_history("legacy", None, &[Message::user("task"), answer]);
+        manager.compact_context(
+            "summary",
+            CompactContextPolicy {
+                keep_recent_items: 1,
+                include_reasoning_in_budget: true,
+                ..Default::default()
+            },
+        );
+        let frame = manager.for_prompt(&PromptBuildPolicy {
+            include_reasoning: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            frame.messages.last().unwrap().reasoning_content.as_deref(),
+            Some("retained reasoning")
+        );
+    }
+
+    #[test]
+    fn reasoning_is_not_attached_to_a_different_source_message() {
+        let mut standalone = Message::assistant("");
+        standalone.reasoning_content = Some("first message only".into());
+        let manager = ContextManager::from_session_history(
+            "ownership",
+            None,
+            &[
+                Message::user("task"),
+                standalone,
+                Message::assistant("different message"),
+            ],
+        );
+        let restored = ContextManager::from_snapshot(manager.snapshot());
+        let frame = restored.for_prompt(&PromptBuildPolicy {
+            include_reasoning: true,
+            ..Default::default()
+        });
+        let answer = frame
+            .messages
+            .iter()
+            .find(|m| m.content == "different message")
+            .unwrap();
+        assert!(answer.reasoning_content.is_none());
+        let fork = restored.fork_child_history(&ForkPolicy::default());
+        assert!(
+            !fork
+                .items
+                .iter()
+                .any(|i| matches!(i.kind, TranscriptItemKind::AssistantReasoning { .. }))
+        );
+        assert!(PromptBuildPolicy::reasoning_for_model("deepseek-flash"));
+        assert!(!PromptBuildPolicy::reasoning_for_model("gpt-4o"));
+    }
+
+    #[test]
+    fn should_replay_reasoning_on_its_original_assistant_message() {
+        let mut call = tool_call_message("call_a", "read");
+        call.content = "inspect".into();
+        call.reasoning_content = Some("plan".into());
+        let mut final_answer = Message::assistant("done");
+        final_answer.reasoning_content = Some("conclude".into());
+        let history = vec![
+            Message::user("task"),
+            call,
+            tool_result_message("call_a", "result"),
+            final_answer,
+        ];
+        let manager = ContextManager::from_session_history("replay", None, &history);
+        let snapshot =
+            serde_json::from_str(&serde_json::to_string(&manager.snapshot()).unwrap()).unwrap();
+        let restored = ContextManager::from_snapshot(snapshot);
+        let frame = restored.for_prompt(&PromptBuildPolicy {
+            include_reasoning: true,
+            ..Default::default()
+        });
+        assert_eq!(frame.messages.len(), 4);
+        assert_eq!(frame.messages[1].reasoning_content.as_deref(), Some("plan"));
+        assert_eq!(frame.messages[1].content, "inspect");
+        assert_eq!(frame.messages[1].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            frame.messages[3].reasoning_content.as_deref(),
+            Some("conclude")
+        );
+        assert_eq!(frame.messages[3].content, "done");
+        assert!(
+            restored
+                .for_prompt(&PromptBuildPolicy::default())
+                .messages
+                .iter()
+                .all(|m| m.reasoning_content.is_none())
+        );
+    }
+
     /// The safety property of the whole change: the fast path may never be
     /// MORE permissive than the exact replay. Loading a ledger the replay
     /// would have rebuilt is the failure that matters; being stricter only
@@ -5045,7 +5342,7 @@ mod tests {
         manager.record_message(&Message::user("continue"));
         manager.record_message(&assistant);
         assert!(legacy_estimate_items_tokens(manager.items()) > 100_000);
-        assert!(!manager.should_auto_compact(1_000));
+        assert!(!manager.should_auto_compact(1_000, false));
         manager.record_tool_output("one", "read_file", &"raw logs ".repeat(50_000));
         assert!(
             estimate_items_tokens(manager.items()) < 4_000,
@@ -6903,6 +7200,7 @@ mod tests {
                 semantic_shadow_keep_recent_tokens: None,
                 target_tokens_after_compaction: None,
                 preserve_system_instructions: true,
+                include_reasoning_in_budget: false,
             },
         );
 
@@ -7041,10 +7339,10 @@ mod tests {
             &item.kind,
             TranscriptItemKind::UserInput { content, .. } if content == &pinned
         )));
-        assert!(!manager.should_auto_compact(128));
+        assert!(!manager.should_auto_compact(128, false));
 
         manager.record_message(&Message::assistant("meaningful new generation"));
-        assert!(manager.should_auto_compact(128));
+        assert!(manager.should_auto_compact(128, false));
     }
 
     #[test]
@@ -7077,7 +7375,7 @@ mod tests {
         }));
         assert_eq!(manager.generation(), generation);
         assert_eq!(manager.ledger_items(), ledger.as_slice());
-        assert!(!manager.should_auto_compact(128));
+        assert!(!manager.should_auto_compact(128, false));
     }
 
     #[test]
@@ -7111,7 +7409,7 @@ mod tests {
         assert_eq!(manager.ledger_items(), ledger.as_slice());
         assert_eq!(manager.items(), active.as_slice());
         assert!(manager.state().last_compaction_id.is_none());
-        assert!(!manager.should_auto_compact(96));
+        assert!(!manager.should_auto_compact(96, false));
     }
 
     #[test]

@@ -4090,7 +4090,7 @@ pub(crate) fn prompt_cache_lane_identity(
 
 fn appui_context_prompt_policy(llm_provider: &dyn octos_llm::LlmProvider) -> PromptBuildPolicy {
     PromptBuildPolicy {
-        include_reasoning: false,
+        include_reasoning: PromptBuildPolicy::reasoning_for_model(llm_provider.model_id()),
         supports_media: true,
         max_prompt_token_estimate: None,
         model_capability_id: format!(
@@ -4116,12 +4116,13 @@ fn appui_compact_context_if_over_threshold(
 ) -> Vec<UiNotification> {
     let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
     let policy = appui_context_prompt_policy(llm_provider.as_ref());
-    if !manager.should_auto_compact(threshold) {
+    if !manager.should_auto_compact(threshold, policy.include_reasoning) {
         return Vec::new();
     }
     let budgets = appui_compaction_budgets(threshold);
     let summary_budget = budgets.summary_budget;
-    let compact_policy = appui_semantic_compact_policy(trigger, budgets);
+    let mut compact_policy = appui_semantic_compact_policy(trigger, budgets);
+    compact_policy.include_reasoning_in_budget = policy.include_reasoning;
     if !manager.should_retry_compaction(&compact_policy) {
         return Vec::new();
     }
@@ -4882,7 +4883,7 @@ impl AppUiPromptContextBridge {
 
     fn prompt_policy(request: &PromptContextRequest) -> PromptBuildPolicy {
         PromptBuildPolicy {
-            include_reasoning: false,
+            include_reasoning: PromptBuildPolicy::reasoning_for_model(&request.model_id),
             supports_media: true,
             max_prompt_token_estimate: None,
             model_capability_id: format!("{}/{}", request.provider_name, request.model_id),
@@ -5008,10 +5009,14 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // block on a bounded SyncSender under backpressure, and a blocking
         // send while holding the scratch mutex would stall the bridge.
         let mut lifecycle_events: Vec<UiNotification> = Vec::new();
-        let compaction_pass = if scratch.manager.should_auto_compact(threshold) {
+        let compaction_pass = if scratch
+            .manager
+            .should_auto_compact(threshold, policy.include_reasoning)
+        {
             let budgets = appui_compaction_budgets(threshold);
             let trigger = format!("agent_loop:{}", request.phase.as_str());
-            let compact_policy = appui_semantic_compact_policy(trigger.clone(), budgets);
+            let mut compact_policy = appui_semantic_compact_policy(trigger.clone(), budgets);
+            compact_policy.include_reasoning_in_budget = policy.include_reasoning;
             scratch
                 .manager
                 .should_retry_compaction(&compact_policy)
