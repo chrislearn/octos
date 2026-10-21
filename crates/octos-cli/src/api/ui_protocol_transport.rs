@@ -31481,38 +31481,16 @@ async fn handle_session_append_message(
 
         let data_dir = sessions_guard.data_dir().to_path_buf();
         match sessions_guard
-            .add_message_once_with_seq(&params.session_id, message.clone())
+            .add_message_once_with_receipt(&params.session_id, message.clone())
             .await
         {
-            Ok((seq, true)) => AppendOutcome::Committed {
+            Ok((seq, true, thread_id)) => AppendOutcome::Committed {
                 seq,
-                thread_id: stamped_thread,
+                thread_id,
                 message: Box::new(message),
                 data_dir,
             },
-            Ok((seq, false)) => {
-                // Idempotent retry hit — echo the EXISTING row's binding, not
-                // a freshly minted one. A found row with no binding (a system
-                // row is legitimately unbound) stays unbound: substituting
-                // this request's stamp would report a thread the durable row
-                // never had, so the fallback only covers a row that cannot be
-                // located at all.
-                let thread_id = match client_message_id.as_deref() {
-                    Some(cmid) => sessions_guard
-                        .load(&params.session_id)
-                        .await
-                        .and_then(|session| {
-                            session
-                                .messages
-                                .iter()
-                                .find(|row| row.client_message_id.as_deref() == Some(cmid))
-                                .map(|row| row.thread_id.clone())
-                        })
-                        .unwrap_or(stamped_thread),
-                    None => stamped_thread,
-                };
-                AppendOutcome::RetryHit { seq, thread_id }
-            }
+            Ok((seq, false, thread_id)) => AppendOutcome::RetryHit { seq, thread_id },
             Err(error) => {
                 let _ = send_rpc_error(
                     ws,

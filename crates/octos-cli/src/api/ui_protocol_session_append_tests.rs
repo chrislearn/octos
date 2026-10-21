@@ -530,3 +530,54 @@ fn external_record_committed_mid_turn_defers_to_the_next_turn_prompt() {
     );
     drop(registration);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_retry_outside_window_keeps_original_unbound_receipt() {
+    let session_id = SessionKey("local:append-outside-window".into());
+    let (state, tmp) = append_state_with_user_row(&session_id).await;
+    {
+        let sessions = state.sessions.as_ref().unwrap();
+        let mut guard = sessions.lock().await;
+        let mut original = Message::system("Original record has no thread");
+        original.client_message_id = Some("old-unbound-record".into());
+        guard.add_message(&session_id, original).await.unwrap();
+        guard
+            .add_message(&session_id, Message::user("x".repeat(33 * 1024 * 1024)))
+            .await
+            .unwrap();
+        guard
+            .add_message(&session_id, Message::user("Current user thread"))
+            .await
+            .unwrap();
+        // Reopen the manager to load its default bounded window.
+        *guard = octos_bus::SessionManager::open(tmp.path()).unwrap();
+        assert!(guard.load(&session_id).await.unwrap().is_partial());
+    }
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "old-retry".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "user".into(),
+            content: "A changed retry must not bind the old record".into(),
+            source: "external_record:app".into(),
+            media: vec![],
+            client_message_id: Some("old-unbound-record".into()),
+            thread_id: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 1);
+    assert!(frame["result"]["thread_id"].is_null());
+    let guard = state.sessions.as_ref().unwrap().lock().await;
+    assert_eq!(
+        guard.load_full(&session_id).await.unwrap().messages.len(),
+        4
+    );
+    assert!(guard.load(&session_id).await.unwrap().is_partial());
+}
