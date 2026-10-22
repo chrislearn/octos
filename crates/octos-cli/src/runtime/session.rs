@@ -767,7 +767,8 @@ impl SessionRuntime {
         // The prompt's slash commands (`/router`, `/queue`, …) are handled by
         // bus channels only; serve sessions get the client's own commands
         // instead, via `apply_client_commands` (octoscode#664).
-        let base_prompt = strip_slash_commands(&profile.prompt_parts.pre_memory);
+        let base_prompt =
+            strip_slash_commands(&profile.prompt_parts.pre_memory_for_tools(&tools.specs()));
         let mut agent = Agent::new_shared(
             AgentId::new("api"),
             profile.llm.clone(),
@@ -1636,6 +1637,7 @@ tools = ["read_file"]
             review_config: None,
             human_approval_rules: None,
             prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                uses_bundled_base: false,
                 pre_memory: system_prompt.clone(),
                 post_memory: String::new(),
             },
@@ -2439,6 +2441,44 @@ tools = ["read_file"]
         );
     }
 
+    #[tokio::test]
+    async fn session_runtime_projects_bundled_prompt_after_tool_policy_and_keeps_skills() {
+        let tmp = TempDir::new().unwrap();
+        let mut profile = make_profile(tmp.path().join("profile-data")).await;
+        let profile_mut = Arc::get_mut(&mut profile).unwrap();
+        profile_mut.prompt_parts = crate::commands::gateway::prompt::GatewayPromptParts {
+            pre_memory: include_str!("../prompts/gateway_default.txt").to_owned(),
+            post_memory: "\n## Active Skills\nSKILL-CONTENT-MUST-REMAIN".into(),
+            uses_bundled_base: true,
+        };
+        profile_mut.tool_policy = Some(octos_agent::ToolPolicy {
+            allow: vec![
+                "read_file".into(),
+                "write_file".into(),
+                "edit_file".into(),
+                "bash".into(),
+            ],
+            deny: vec![],
+            ..Default::default()
+        });
+        let rt =
+            SessionRuntime::bootstrap(&profile, SessionKey::new("api", "compact-prompt"), None)
+                .await
+                .expect("bootstrap");
+        let prompt = rt.agent.system_prompt_snapshot();
+        assert!(
+            !rt.tools
+                .specs()
+                .iter()
+                .any(|tool| tool.name == "web_search")
+        );
+        assert!(!prompt.contains("podcast_generate"));
+        assert!(!prompt.contains("## Slash Commands"));
+        assert!(prompt.contains("## Coding And Shell Rules"));
+        assert!(prompt.contains("SKILL-CONTENT-MUST-REMAIN"));
+        assert!(rt.tools.specs().iter().any(|tool| tool.name == "edit_file"));
+    }
+
     /// Build a `ProfileRuntime` like `make_profile`, but with a
     /// pre-constructed `Arc<HookExecutor>` stashed on the
     /// `hook_executor` field. Used by the M11-F REG-3 regression
@@ -2491,6 +2531,7 @@ tools = ["read_file"]
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
             prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                uses_bundled_base: false,
                 pre_memory: "test-system-prompt".to_string(),
                 post_memory: String::new(),
             },

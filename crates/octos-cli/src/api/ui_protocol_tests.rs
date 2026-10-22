@@ -32099,6 +32099,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         human_approval_rules: None,
         system_prompt: "test-system-prompt".to_string(),
         prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+            uses_bundled_base: false,
             pre_memory: "test-system-prompt".to_string(),
             post_memory: String::new(),
         },

@@ -851,6 +851,7 @@ impl ProfileRuntime {
                 crate::commands::load_profile_prompt_template(&profile.name, template)
         {
             prompt_parts.pre_memory = template;
+            prompt_parts.uses_bundled_base = false;
         }
         let system_prompt = prompt_parts.joined();
 

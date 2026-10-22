@@ -2219,6 +2219,53 @@ impl ContextManager {
         Some(id)
     }
 
+    /// Suppress an initially empty snapshot, but always deliver a clearing
+    /// transition once this source has been shown. Inspect the durable ledger:
+    /// compaction may have moved the previous value into a summary, and resume
+    /// must still tell the model that it is no longer current.
+    pub(crate) fn record_context_snapshot(
+        &mut self,
+        event_kind: ContextEventKind,
+        label: impl Into<String>,
+        content: impl Into<String>,
+        is_empty: bool,
+    ) -> Option<TranscriptItemId> {
+        let label = label.into();
+        let content = content.into();
+        let previous = self
+            .ledger_items
+            .iter()
+            .rev()
+            .find_map(|item| match &item.kind {
+                TranscriptItemKind::ContextEvent {
+                    event_kind: kind,
+                    label: source,
+                    content,
+                } if *kind == event_kind && source == &label => Some(content),
+                _ => None,
+            });
+        if previous.is_none() && is_empty {
+            return None;
+        }
+        // An active identical snapshot remains sufficient even when other
+        // event sources share this kind (e.g. peer results vs. team membership).
+        if let Some(TranscriptItemKind::ContextEvent {
+            content: active, ..
+        }) = self.items.iter().rev().find_map(|item| match &item.kind {
+            TranscriptItemKind::ContextEvent {
+                event_kind: kind,
+                label: source,
+                ..
+            } if *kind == event_kind && source == &label => Some(&item.kind),
+            _ => None,
+        }) {
+            if active == &content {
+                return None;
+            }
+        }
+        self.record_context_event(event_kind, label, content)
+    }
+
     pub(crate) fn record_item_with_source_ref(
         &mut self,
         kind: TranscriptItemKind,
@@ -8380,6 +8427,139 @@ mod tests {
                 .record_context_event(ContextEventKind::GoalSnapshot, "goal", "active: 1")
                 .is_some(),
             "a transition back to an older value must append a superseding event"
+        );
+    }
+
+    #[test]
+    fn initially_empty_snapshots_do_not_change_history_or_generation() {
+        let mut manager = ContextManager::new("empty-snapshots", None);
+        manager.record_message(&Message::user("do the work"));
+        let generation = manager.generation;
+        let original = manager.ledger_items.clone();
+        for kind in [
+            ContextEventKind::MemoryUpdate,
+            ContextEventKind::GoalSnapshot,
+            ContextEventKind::PeerResultsReady,
+        ] {
+            assert!(
+                manager
+                    .record_context_snapshot(kind, "snapshot", "empty", true)
+                    .is_none()
+            );
+        }
+        assert_eq!(manager.ledger_items, original);
+        assert_eq!(manager.generation, generation);
+        assert_eq!(
+            manager
+                .for_prompt(&PromptBuildPolicy::default())
+                .messages
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn snapshot_clears_previous_state_and_dedupes_by_source_after_resume() {
+        let mut manager = ContextManager::new("snapshot-resume", None);
+        let kind = ContextEventKind::PeerResultsReady;
+        manager
+            .record_context_snapshot(kind, "team", "two peers", false)
+            .unwrap();
+        manager.record_context_event(kind, "results", "peer finished");
+        assert!(
+            manager
+                .record_context_snapshot(kind, "team", "two peers", false)
+                .is_none()
+        );
+        let mut resumed = ContextManager::from_snapshot(manager.snapshot());
+        // Another source sharing the kind does not turn its initial empty
+        // state into a meaningful clearing update.
+        assert!(
+            resumed
+                .record_context_snapshot(kind, "other-team", "empty", true)
+                .is_none()
+        );
+        assert!(
+            resumed
+                .record_context_snapshot(kind, "team", "no peers", true)
+                .is_some()
+        );
+        assert!(
+            resumed
+                .record_context_snapshot(kind, "team", "no peers", true)
+                .is_none()
+        );
+        assert!(
+            resumed
+                .record_context_snapshot(kind, "team", "two peers", false)
+                .is_some()
+        );
+        assert!(
+            resumed
+                .for_prompt(&PromptBuildPolicy::default())
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("two peers")
+        );
+    }
+
+    #[test]
+    fn snapshot_clearing_survives_compaction_and_snapshot_roundtrip() {
+        let mut manager = ContextManager::new("snapshot-compaction", None);
+        manager.record_context_snapshot(
+            ContextEventKind::MemoryUpdate,
+            "memory",
+            "old preference",
+            false,
+        );
+        manager.record_message(&Message::user("old request ".repeat(80)));
+        manager.record_message(&Message::assistant("old answer ".repeat(80)));
+        manager.record_message(&Message::user("new request"));
+        let compacted = manager.compact_context(
+            "Old preference and exchange",
+            CompactContextPolicy {
+                keep_recent_tokens: Some(30),
+                ..CompactContextPolicy::default()
+            },
+        );
+        assert_eq!(compacted.status, ContextCompactionStatus::Installed);
+        assert!(
+            !manager.items.iter().any(|item| matches!(&item.kind,
+                TranscriptItemKind::ContextEvent { label, .. } if label == "memory"
+            )),
+            "test must exercise a snapshot removed from the active projection"
+        );
+        let mut resumed = ContextManager::from_snapshot(manager.snapshot());
+        assert!(
+            resumed
+                .record_context_snapshot(
+                    ContextEventKind::MemoryUpdate,
+                    "memory",
+                    "memory cleared",
+                    true
+                )
+                .is_some()
+        );
+        let frame = resumed.for_prompt(&PromptBuildPolicy::default());
+        assert!(
+            frame
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("memory cleared")
+        );
+        assert!(
+            resumed
+                .record_context_snapshot(
+                    ContextEventKind::MemoryUpdate,
+                    "memory",
+                    "memory cleared",
+                    true
+                )
+                .is_none()
         );
     }
 

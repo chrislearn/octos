@@ -4328,13 +4328,33 @@ fn appui_context_history_for_agent(
 /// re-project the prompt. These events intentionally bypass the canonical
 /// chat transcript (they are wake/snapshot metadata, not user-authored chat
 /// rows) but remain durable in the ContextManager v2 snapshot.
+struct TailContextEvent {
+    kind: ContextEventKind,
+    label: &'static str,
+    content: String,
+    /// None for one-shot notices; Some for snapshots whose empty initial
+    /// state adds no information. A later clearing snapshot is still recorded.
+    snapshot_is_empty: Option<bool>,
+}
+
+impl From<(ContextEventKind, &'static str, String)> for TailContextEvent {
+    fn from((kind, label, content): (ContextEventKind, &'static str, String)) -> Self {
+        Self {
+            kind,
+            label,
+            content,
+            snapshot_is_empty: None,
+        }
+    }
+}
+
 fn appui_append_tail_context_events(
     data_dir: &Path,
     session_id: &SessionKey,
     llm_provider: &Arc<dyn octos_llm::LlmProvider>,
     context_manager: &Arc<StdMutex<ContextManager>>,
     history: &mut Vec<Message>,
-    events: Vec<(ContextEventKind, &'static str, String)>,
+    events: Vec<TailContextEvent>,
 ) {
     if events.is_empty() {
         return;
@@ -4343,12 +4363,14 @@ fn appui_append_tail_context_events(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let mut appended = 0usize;
-    for (event_kind, label, content) in events {
-        appended += usize::from(
-            manager
-                .record_context_event(event_kind, label, content)
-                .is_some(),
-        );
+    for event in events {
+        let recorded = match event.snapshot_is_empty {
+            Some(empty) => {
+                manager.record_context_snapshot(event.kind, event.label, event.content, empty)
+            }
+            None => manager.record_context_event(event.kind, event.label, event.content),
+        };
+        appended += usize::from(recorded.is_some());
     }
     if appended == 0 {
         return;
@@ -41528,45 +41550,54 @@ async fn run_standalone_turn(
         }
     }
 
-    let mut tail_context_events = peer_turn_start_notes(
+    let mut tail_context_events: Vec<TailContextEvent> = peer_turn_start_notes(
         &session_runtime.profile.data_dir.join("peers"),
         &session_id,
         ws.is_external(),
-    );
+    )
+    .into_iter()
+    .map(Into::into)
+    .collect();
     if !ws.is_external() {
         if let Ok(team) = state.ui_protocol.workspace_teams.get(
             &session_runtime.profile.data_dir,
             &session_runtime.workspace_root,
             &session_id,
         ) {
-            tail_context_events.push((
-                ContextEventKind::PeerResultsReady,
-                "workspace-peer-team",
-                team.index(&session_id),
-            ));
+            tail_context_events.push(TailContextEvent {
+                kind: ContextEventKind::PeerResultsReady,
+                label: "workspace-peer-team",
+                content: team.index(&session_id),
+                snapshot_is_empty: Some(
+                    team.members
+                        .iter()
+                        .all(|member| member.session_id == session_id),
+                ),
+            });
         }
     }
     if let Some(notes) = read_and_clear_goal_progress_notes(
         &session_runtime.profile.data_dir,
         &session_id.to_string(),
     ) {
-        tail_context_events.push((ContextEventKind::GoalProgress, "goal-progress", notes));
+        tail_context_events.push((ContextEventKind::GoalProgress, "goal-progress", notes).into());
     }
     if let Some(notes) = crate::autonomy::monitor_runtime::read_and_clear_monitor_notes(
         &session_runtime.profile.data_dir,
         &session_id.to_string(),
     ) {
-        tail_context_events.push((ContextEventKind::MonitorEvent, "monitor-events", notes));
+        tail_context_events.push((ContextEventKind::MonitorEvent, "monitor-events", notes).into());
     }
-    tail_context_events.push((
-        ContextEventKind::MemoryUpdate,
-        "memory-snapshot",
-        if volatile_memory_context.is_empty() {
+    tail_context_events.push(TailContextEvent {
+        kind: ContextEventKind::MemoryUpdate,
+        label: "memory-snapshot",
+        snapshot_is_empty: Some(volatile_memory_context.is_empty()),
+        content: if volatile_memory_context.is_empty() {
             "No injected memory is currently available.".to_owned()
         } else {
             volatile_memory_context
         },
-    ));
+    });
     let active_goal_snapshot = default_agent_orchestrator()
         .model_goal_snapshot(&session_id, &session_runtime.profile.profile_id);
     let goal_snapshot_context = if active_goal_snapshot["status"] == "active" {
@@ -41590,11 +41621,12 @@ async fn run_standalone_turn(
     } else {
         serde_json::json!({ "status": "none" })
     };
-    tail_context_events.push((
-        ContextEventKind::GoalSnapshot,
-        "session-goal-snapshot",
-        goal_snapshot_context.to_string(),
-    ));
+    tail_context_events.push(TailContextEvent {
+        kind: ContextEventKind::GoalSnapshot,
+        label: "session-goal-snapshot",
+        content: goal_snapshot_context.to_string(),
+        snapshot_is_empty: Some(active_goal_snapshot["status"] != "active"),
+    });
     appui_append_tail_context_events(
         &session_runtime.sessions_root,
         &session_id,
