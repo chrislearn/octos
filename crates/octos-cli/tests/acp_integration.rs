@@ -848,6 +848,7 @@ async fn should_sanitize_stored_history_when_loading_a_session() {
             thread_id: Some("t-seed".into()),
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
         mgr.add_message(&key, msg(octos_core::MessageRole::User, "SEED_USER"))
             .await

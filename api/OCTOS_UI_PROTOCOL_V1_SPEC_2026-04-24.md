@@ -438,6 +438,9 @@ Session, turn, and approval core:
   a turn, accepted `UPCR-2026-042`)
   — `session.append_message.full_history_retry.v1` additionally guarantees retry
   lookup outside the resident history window and the original thread receipt.
+  — `session.append_message.participant.v1` (UPCR-2026-053, proposed) acknowledges an
+  optional `participant` label on user/assistant records; memory extraction keeps
+  shared experiences and one-participant requests scoped to that participant.
 - `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command).
   Manual and automatic compaction use the same session model selection: a
   peer's configured model lane (also for its request-context sessions), otherwise

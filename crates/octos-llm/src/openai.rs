@@ -1902,6 +1902,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -2026,6 +2027,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
         let vision = ModelHints::default();
         assert!(request_has_user_images(std::slice::from_ref(&img), &vision));
@@ -2839,6 +2841,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -2856,6 +2859,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -2980,6 +2984,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
         let mut assistant = mk(MessageRole::Assistant, "");
         assistant.tool_calls = Some(vec![octos_core::ToolCall {
@@ -3012,6 +3017,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
         msgs.push(mk(MessageRole::Assistant, "a red circle"));
         msgs.push(mk(MessageRole::User, "and the size?"));
@@ -3067,6 +3073,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
         let mut assistant = mk(MessageRole::Assistant, "");
         assistant.tool_calls = Some(vec![octos_core::ToolCall {
@@ -3538,6 +3545,7 @@ mod cache_usage_tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }];
         let response = provider
             .chat(&messages, &[], &ChatConfig::default())

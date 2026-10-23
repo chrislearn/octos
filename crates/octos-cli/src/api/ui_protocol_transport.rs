@@ -2363,6 +2363,8 @@ struct ConnectionUiFeatures {
     turn_steer_dropped_v1: bool,
     /// Explicit acknowledgement of complete-live-history append retries.
     session_append_full_history_retry_v1: bool,
+    /// UPCR-2026-053: client asked whether `participant` is persisted.
+    session_append_participant_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -2482,6 +2484,11 @@ impl ConnectionUiFeatures {
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
             ),
+            session_append_participant_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -2525,6 +2532,7 @@ impl ConnectionUiFeatures {
             skill_action_jobs_v1: true,
             turn_steer_dropped_v1: true,
             session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
             header_present: true,
             stdio_transport: true,
         }
@@ -2574,6 +2582,9 @@ impl ConnectionUiFeatures {
             turn_steer_dropped_v1: has(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
             session_append_full_history_retry_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            ),
+            session_append_participant_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
             ),
             header_present: true,
             stdio_transport,
@@ -2695,6 +2706,10 @@ impl ConnectionUiFeatures {
             requested.push(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
             );
+        }
+        if self.session_append_participant_v1 {
+            requested
+                .push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -14958,6 +14973,7 @@ async fn raw_profile_llm_test(
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     }];
     let canonical_family = octos_llm::registry::lookup(&family_id)
         .map(|entry| entry.name)
@@ -31395,6 +31411,35 @@ async fn handle_session_append_message(
         return;
     }
 
+    // UPCR-2026-053: the label is shown verbatim inside memory-extraction
+    // input, so refuse anything that could break that line's framing rather
+    // than silently rewriting it.
+    let participant = match params.participant.as_deref().map(str::trim) {
+        None => None,
+        Some(label)
+            if role != MessageRole::System
+                && !label.is_empty()
+                && label.len() <= octos_core::MESSAGE_PARTICIPANT_MAX_BYTES
+                && !label
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '[' | ']' | '(' | ')')) =>
+        {
+            Some(label.to_owned())
+        }
+        Some(_) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: participant must be a non-empty single-line label of at most {} bytes without brackets, on a user or assistant row",
+                    octos_core::MESSAGE_PARTICIPANT_MAX_BYTES
+                ))
+                .with_data(json!({ "kind": "invalid_participant" })),
+            );
+            return;
+        }
+    };
+
     let message = Message {
         role,
         content: params.content,
@@ -31405,6 +31450,7 @@ async fn handle_session_append_message(
         client_message_id: client_message_id.clone(),
         thread_id: None,
         source: Some(source.to_owned()),
+        participant,
         timestamp: Utc::now(),
     };
     // Thread binding is resolved BEFORE the write so the echoed value always
@@ -32004,6 +32050,7 @@ fn build_btw_messages(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::User,
@@ -32016,6 +32063,7 @@ fn build_btw_messages(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
     ]
 }
@@ -37950,6 +37998,7 @@ async fn model_join_review_summary(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::User,
@@ -37962,6 +38011,7 @@ async fn model_join_review_summary(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
     ];
     let config = review_join_chat_config();
