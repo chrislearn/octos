@@ -2241,7 +2241,7 @@ impl Agent {
                 tool_structured_metadata,
                 tool_cascades,
             ) = match result {
-                Ok(tool_result) => {
+                Ok(mut tool_result) => {
                     debug!(
                         tool = %tc_name,
                         success = tool_result.success,
@@ -2304,11 +2304,25 @@ impl Agent {
                     // Media the tool wants the model to see rides on the
                     // tool message's `media`; each provider renders it in
                     // its own shape for the current batch (octos_llm::tool_media).
-                    let tool_model_media: Vec<String> = tool_result
-                        .model_media
-                        .iter()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .collect();
+                    let mut tool_model_media = Vec::new();
+                    for path in &tool_result.model_media {
+                        let reference = path.to_string_lossy();
+                        if octos_llm::vision::is_image(&reference) {
+                            match octos_llm::vision::snapshot_image(
+                                &reference,
+                                ctx.session_scope.as_ref().map(|s| s.workspace()),
+                            ) {
+                                Ok(snapshot) => {
+                                    tool_model_media.push(snapshot.to_string_lossy().into_owned())
+                                }
+                                Err(error) => tool_result.output.push_str(&format!(
+                                    "\n[Image not shown: {reference}: {error}]"
+                                )),
+                            }
+                        } else {
+                            tool_model_media.push(reference.into_owned());
+                        }
+                    }
 
                     let output_preview =
                         octos_core::truncated_utf8(&tool_result.output, 200, "...");
@@ -3762,9 +3776,11 @@ mod tests {
         assert_eq!(messages[0].role, octos_core::MessageRole::Tool);
         assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_see"));
         assert_eq!(messages[0].content, "SEEING_TOOL_OUTPUT");
+        assert_eq!(messages[0].media.len(), 1);
+        assert_ne!(messages[0].media[0], image.to_string_lossy());
         assert_eq!(
-            messages[0].media,
-            vec![image.to_string_lossy().into_owned()]
+            std::fs::read(&messages[0].media[0]).unwrap(),
+            std::fs::read(&image).unwrap()
         );
         assert_eq!(messages[1].role, octos_core::MessageRole::Tool);
         assert!(messages[1].media.is_empty());

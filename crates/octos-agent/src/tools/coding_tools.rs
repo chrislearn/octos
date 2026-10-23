@@ -17,11 +17,12 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+use super::command_output::{CommandOutput, wait_with_capture};
 use super::{
     ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, Tool, ToolApprovalDecision, ToolApprovalRequest,
     ToolContext, ToolResult,
@@ -49,10 +50,15 @@ fn exec_sessions() -> Arc<Mutex<HashMap<String, ExecSession>>> {
 
 #[derive(Clone)]
 struct ExecSession {
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
-    output: Arc<Mutex<String>>,
+    stdin: Arc<Mutex<Option<SessionInput>>>,
+    output: CommandOutput,
     exit_code: Arc<Mutex<Option<i32>>>,
     sandboxed: bool,
+}
+
+enum SessionInput {
+    Pipe(ChildStdin),
+    Terminal(super::terminal::TerminalWriter),
 }
 
 fn next_exec_session_id() -> String {
@@ -180,46 +186,6 @@ fn resolve_optional_workdir(
     };
     super::resolve_path_with_scope(base_dir, workdir, filesystem_scope)
         .map_err(|_| format!("workdir outside allowed filesystem scope: {workdir}"))
-}
-
-async fn append_reader_output<R>(mut reader: R, output: Arc<Mutex<String>>, label: &'static str)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut buf = [0_u8; 8192];
-    loop {
-        let read = match reader.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
-        };
-        let chunk = String::from_utf8_lossy(&buf[..read]);
-        let mut guard = output.lock().await;
-        if label == "stderr" && !chunk.is_empty() {
-            guard.push_str("\n--- stderr ---\n");
-        }
-        guard.push_str(&chunk);
-        truncate_capture_in_place(&mut guard);
-    }
-}
-
-/// Trim an accumulating capture buffer to its last [`MAX_CAPTURE_BYTES`] once it
-/// grows past twice that, keeping the tail.
-///
-/// `len - MAX_CAPTURE_BYTES` is a raw BYTE offset that need not fall on a UTF-8
-/// char boundary — slicing there directly panics ("byte index N is not a char
-/// boundary") when a multibyte char (CJK/emoji) straddles it. Because this runs
-/// inside a `tokio::spawn`ed reader task, that panic silently kills the reader
-/// and the stream stops capturing. Advance the cut to the next char boundary
-/// first so the slice is always valid.
-fn truncate_capture_in_place(guard: &mut String) {
-    if guard.len() > MAX_CAPTURE_BYTES * 2 {
-        let mut keep_from = guard.len().saturating_sub(MAX_CAPTURE_BYTES);
-        while keep_from < guard.len() && !guard.is_char_boundary(keep_from) {
-            keep_from += 1;
-        }
-        let trimmed = guard[keep_from..].to_string();
-        *guard = format!("... (earlier output truncated)\n{trimmed}");
-    }
 }
 
 async fn request_command_approval(
@@ -385,7 +351,7 @@ impl Tool for ExecCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command. For long-running commands, set tty=true or yield_time_ms to receive a session_id and continue with write_stdin."
+        "Run a shell command. Set tty=true for a real terminal, or yield_time_ms for a pipe session; continue with write_stdin. Truncated output includes a full log path."
     }
 
     fn tags(&self) -> &[&str] {
@@ -405,7 +371,7 @@ impl Tool for ExecCommandTool {
                 "workdir": {"type": "string"},
                 "timeout_secs": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_SECS},
                 "yield_time_ms": {"type": "integer", "minimum": 0},
-                "max_output_tokens": {"type": "integer", "minimum": 1},
+                "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Maximum estimated tokens in captured output (ASCII ~4 chars/token, non-ASCII ~1.5); not bytes or an exact provider tokenizer."},
                 "tty": {"type": "boolean"}
             }
         })
@@ -520,6 +486,7 @@ impl ExecCommandTool {
         #[cfg(unix)]
         cmd.process_group(0);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        let capture = CommandOutput::new(&self.base_dir)?;
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -530,32 +497,27 @@ impl ExecCommandTool {
                 });
             }
         };
-        // Capture the pid BEFORE `wait_with_output` consumes the child — the
+        // Capture the pid BEFORE `wait_with_capture` consumes the child — the
         // timeout arm needs it to kill the process tree (dropping the wait
         // future does NOT kill a tokio child).
         let child_pid = child.id();
         // Armed for the whole wait: a dropped future (user interrupt ->
         // `agent_task.abort()`) reaches neither arm below. See `ChildGroupGuard`.
         let mut group_guard = ChildGroupGuard::new(child_pid);
-        let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        let result = timeout(
+            Duration::from_secs(timeout_secs),
+            wait_with_capture(child, capture.clone()),
+        )
+        .await;
         group_guard.disarm();
         match result {
             Ok(Ok(output)) => {
-                let mut text = String::new();
-                text.push_str(&String::from_utf8_lossy(&output.stdout));
-                if !output.stderr.is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\n--- stderr ---\n");
-                    }
-                    text.push_str(&String::from_utf8_lossy(&output.stderr));
-                }
+                let mut view = capture.view(false);
+                let mut text = view.render(MAX_CAPTURE_BYTES - 2048);
                 if text.is_empty() {
                     text.push_str("(no output)");
                 }
-                text.push_str(&format!(
-                    "\n\nExit code: {}",
-                    output.status.code().unwrap_or(-1)
-                ));
+                text.push_str(&format!("\n\nExit code: {}", output.code().unwrap_or(-1)));
                 // #28c — file-change receipt on the coding-session exec
                 // path too (same shared 28a module; same five acceptance
                 // semantics as ShellTool / BashTool).
@@ -576,26 +538,35 @@ impl ExecCommandTool {
                         );
                     }
                 }
-                // Scan BEFORE truncation (the denial line may be what gets
-                // cut), append AFTER (so the hint itself survives the cut).
-                let hint =
-                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
-                let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
+                // Scan the retained tail before the final budget cut; earlier
+                // diagnostics remain available through the full log.
+                let hint = sandbox_denial_hint(!self.sandbox.is_noop(), output.success(), &text);
+                let max = MAX_CAPTURE_BYTES;
                 let mut out = truncate_output(text, max);
                 if let Some(hint) = hint {
                     out.push_str(hint);
                 }
                 Ok(ToolResult {
-                    output: out,
-                    success: output.status.success(),
+                    output: view.apply_token_budget(out, input.max_output_tokens),
+                    success: output.success(),
+                    structured_metadata: Some(view.metadata()),
                     ..Default::default()
                 })
             }
-            Ok(Err(error)) => Ok(ToolResult {
-                output: format!("Failed to execute command: {error}"),
-                success: false,
-                ..Default::default()
-            }),
+            Ok(Err(error)) => {
+                capture.record_error(&error);
+                let mut view = capture.view(false);
+                let text = format!(
+                    "Failed to execute command: {error}\n{}",
+                    view.render(MAX_CAPTURE_BYTES - 2048)
+                );
+                Ok(ToolResult {
+                    output: view.apply_token_budget(text, input.max_output_tokens),
+                    success: false,
+                    structured_metadata: Some(view.metadata()),
+                    ..Default::default()
+                })
+            }
             Err(_) => {
                 // Dropping the wait future does NOT kill a tokio child, so
                 // the wrapper shell and any grandchildren keep running. Kill
@@ -603,8 +574,15 @@ impl ExecCommandTool {
                 // SIGKILL on Unix, `taskkill /F /T` on Windows) — the same
                 // helper the `bash` tool uses.
                 kill_timed_out_child(child_pid).await;
+                let mut view = capture.view(false);
+                let text = format!(
+                    "Command timed out after {timeout_secs} seconds\n{}\nFull output: {}",
+                    view.render(MAX_CAPTURE_BYTES - 2048),
+                    view.path.display()
+                );
                 Ok(ToolResult {
-                    output: format!("Command timed out after {timeout_secs} seconds"),
+                    output: view.apply_token_budget(text, input.max_output_tokens),
+                    structured_metadata: Some(view.metadata()),
                     success: false,
                     ..Default::default()
                 })
@@ -618,12 +596,6 @@ impl ExecCommandTool {
         cwd: PathBuf,
         input: ExecCommandInput,
     ) -> Result<ToolResult> {
-        // Fail closed on an unhonorable sandbox config BEFORE spawning
-        // anything: the typed refusal (model-facing Display — operator
-        // remediation stays in the logs) IS the tool result. The wrap-level
-        // refusal command would also fail, but a background command discards
-        // its stderr, and the model deserves the full refusal text, not a
-        // truncated stderr line.
         if let Some(refusal) = self.sandbox.refusal() {
             return Ok(ToolResult {
                 output: refusal.to_string(),
@@ -631,94 +603,118 @@ impl ExecCommandTool {
                 ..Default::default()
             });
         }
-
-        let mut cmd = self.sandbox.wrap_command(&command, &cwd);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                return Ok(ToolResult {
-                    output: format!("Failed to execute command: {error}"),
-                    success: false,
-                    ..Default::default()
-                });
-            }
-        };
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let session_id = next_exec_session_id();
-        let output = Arc::new(Mutex::new(String::new()));
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !super::shell::command_allows_write_explicitly(&command)
+            && super::shell::command_looks_like_file_write(&command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny".into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        let output = CommandOutput::new(&self.base_dir)?;
         let exit_code = Arc::new(Mutex::new(None));
-        // #2136 review: after the child exits, give the pipe readers a
-        // BOUNDED grace to drain before publishing the exit code, then
-        // publish regardless. A plain reader-join deadlocked when a
-        // descendant (a backgrounded `server &`, a daemon that inherits
-        // stdout) keeps a pipe write-end open — EOF never arrives and the
-        // session reported `running` forever. The grace closes the
-        // round-2 race (a fast-exiting command's final output — e.g. a
-        // denial line — is captured within the window, since its fds close
-        // at exit) without hanging on a surviving descendant; combined
-        // with sampling the exit code BEFORE the output, "not running"
-        // implies "output drained" in the common case.
-        const READER_DRAIN_GRACE: Duration = Duration::from_millis(200);
-        let stdout_reader = stdout
-            .map(|stdout| tokio::spawn(append_reader_output(stdout, output.clone(), "stdout")));
-        let stderr_reader = stderr
-            .map(|stderr| tokio::spawn(append_reader_output(stderr, output.clone(), "stderr")));
-        let exit_code_for_wait = exit_code.clone();
-        tokio::spawn(async move {
-            let code = child.wait().await.ok().and_then(|status| status.code());
-            let _ = tokio::time::timeout(READER_DRAIN_GRACE, async {
-                if let Some(handle) = stdout_reader {
-                    let _ = handle.await;
-                }
-                if let Some(handle) = stderr_reader {
-                    let _ = handle.await;
-                }
-            })
-            .await;
-            *exit_code_for_wait.lock().await = Some(code.unwrap_or(-1));
-        });
-        exec_sessions().lock().await.insert(
-            session_id.clone(),
-            ExecSession {
-                stdin: Arc::new(Mutex::new(stdin)),
-                output: output.clone(),
-                exit_code: exit_code.clone(),
-                sandboxed: !self.sandbox.is_noop(),
-            },
-        );
+        let status = exit_code.clone();
+        let seconds = input
+            .timeout_secs
+            .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
+            .clamp(1, MAX_EXEC_TIMEOUT_SECS);
+        let mut cmd = self.sandbox.wrap_command(&command, &cwd);
+        sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        let (stdin, pid) = if input.tty.unwrap_or(false) {
+            let terminal = super::terminal::launch(&cmd, output.clone(), seconds)?;
+            let pid = terminal.pid;
+            tokio::spawn(async move {
+                *status.lock().await = Some(terminal.done.await.unwrap_or(-1));
+            });
+            (Some(SessionInput::Terminal(terminal.writer)), pid)
+        } else {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
+            cmd.process_group(0);
+            let mut child = cmd.spawn()?;
+            let pid = child.id();
+            let stdin = child.stdin.take().map(SessionInput::Pipe);
+            let captured = output.clone();
+            tokio::spawn(async move {
+                let mut guard = ChildGroupGuard::new(pid);
+                let code = match timeout(
+                    Duration::from_secs(seconds),
+                    wait_with_capture(child, captured.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(code)) => code.code().unwrap_or(-1),
+                    Ok(Err(error)) => {
+                        captured.record_error(error);
+                        -1
+                    }
+                    Err(_) => {
+                        captured.record_error(format!(
+                            "Command timed out after {seconds} seconds; capture interrupted"
+                        ));
+                        kill_timed_out_child(pid).await;
+                        -1
+                    }
+                };
+                captured.finish();
+                guard.disarm();
+                *status.lock().await = Some(code);
+            });
+            (stdin, pid)
+        };
+        // Cancellation before the first yielded result must not leak the child.
+        let mut startup_guard = ChildGroupGuard::new(pid);
+        let session_id = next_exec_session_id();
+        let session = ExecSession {
+            stdin: Arc::new(Mutex::new(stdin)),
+            output,
+            exit_code,
+            sandboxed: !self.sandbox.is_noop(),
+        };
+        exec_sessions()
+            .lock()
+            .await
+            .insert(session_id.clone(), session.clone());
         tokio::time::sleep(Duration::from_millis(
-            input.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_MS),
+            input
+                .yield_time_ms
+                .unwrap_or(DEFAULT_EXEC_YIELD_MS)
+                .min(30_000),
         ))
         .await;
-        // #2136 review round 3, P2: sample the exit code FIRST, then the
-        // output. The exit-code task sets the code only AFTER joining the
-        // pipe readers, so `code.is_some()` (not running) guarantees the
-        // output buffer is fully drained — reading output after the code
-        // therefore never sees a stale/empty capture with running:false.
-        let code = *exit_code.lock().await;
-        let captured = output.lock().await.clone();
-        Ok(ToolResult {
-            output: json!({
-                "session_id": session_id,
-                "running": code.is_none(),
-                "exit_code": code,
-                "output": session_output_payload(
-                    captured,
-                    code,
-                    !self.sandbox.is_noop(),
-                    input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES),
-                ),
-            })
-            .to_string(),
-            success: true,
-            ..Default::default()
-        })
+        let result = exec_session_result(&session_id, &session, input.max_output_tokens).await;
+        startup_guard.disarm();
+        Ok(result)
+    }
+}
+
+async fn exec_session_result(id: &str, session: &ExecSession, budget: Option<usize>) -> ToolResult {
+    let code = *session.exit_code.lock().await;
+    if code.is_some() {
+        session.stdin.lock().await.take();
+    }
+    let mut view = session.output.view(true);
+    let text = session_output_payload(
+        view.render(MAX_CAPTURE_BYTES),
+        code,
+        session.sandboxed,
+        MAX_CAPTURE_BYTES,
+    );
+    let text = view.apply_token_budget(text, budget);
+    let mut payload = view.metadata();
+    payload["session_id"] = json!(id);
+    payload["running"] = json!(code.is_none());
+    payload["exit_code"] = json!(code);
+    payload["output"] = json!(text);
+    ToolResult {
+        output: payload.to_string(),
+        success: true,
+        structured_metadata: Some(view.metadata()),
+        ..Default::default()
     }
 }
 
@@ -742,7 +738,7 @@ impl Tool for WriteStdinTool {
     }
 
     fn description(&self) -> &str {
-        "Write characters to a running exec_command session and return recent captured output."
+        "Write characters to an exec_command session and return only output since the previous read, with a complete log path and byte offsets."
     }
 
     fn tags(&self) -> &[&str] {
@@ -757,7 +753,7 @@ impl Tool for WriteStdinTool {
                 "session_id": {"type": "string"},
                 "chars": {"type": "string"},
                 "yield_time_ms": {"type": "integer", "minimum": 0},
-                "max_output_tokens": {"type": "integer", "minimum": 1}
+                "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Maximum estimated tokens in captured output (ASCII ~4 chars/token, non-ASCII ~1.5); not bytes or an exact provider tokenizer."}
             }
         })
     }
@@ -774,37 +770,36 @@ impl Tool for WriteStdinTool {
         };
         if let Some(chars) = input.chars.as_deref() {
             let mut stdin = session.stdin.lock().await;
-            if let Some(stdin) = stdin.as_mut() {
-                stdin.write_all(chars.as_bytes()).await?;
-                stdin.flush().await?;
-            } else {
-                return Ok(ToolResult {
-                    output: format!("exec session {} has no open stdin", input.session_id),
-                    success: false,
-                    ..Default::default()
-                });
+            match stdin.as_mut() {
+                Some(SessionInput::Pipe(pipe)) => {
+                    pipe.write_all(chars.as_bytes()).await?;
+                    pipe.flush().await?;
+                }
+                Some(SessionInput::Terminal(writer)) => {
+                    let writer = writer.clone();
+                    let bytes = chars.as_bytes().to_vec();
+                    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                        use std::io::Write;
+                        let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+                        writer.write_all(&bytes)?;
+                        writer.flush()
+                    })
+                    .await??;
+                }
+                None => {
+                    return Ok(ToolResult {
+                        output: format!("exec session {} has no open stdin", input.session_id),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
             }
         }
-        tokio::time::sleep(Duration::from_millis(input.yield_time_ms.unwrap_or(250))).await;
-        // #2136 review round 3, P2: code before output (see spawn_session).
-        let code = *session.exit_code.lock().await;
-        let output = session.output.lock().await.clone();
-        Ok(ToolResult {
-            output: json!({
-                "session_id": input.session_id,
-                "running": code.is_none(),
-                "exit_code": code,
-                "output": session_output_payload(
-                    output,
-                    code,
-                    session.sandboxed,
-                    input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES),
-                ),
-            })
-            .to_string(),
-            success: true,
-            ..Default::default()
-        })
+        tokio::time::sleep(Duration::from_millis(
+            input.yield_time_ms.unwrap_or(250).min(30_000),
+        ))
+        .await;
+        Ok(exec_session_result(&input.session_id, &session, input.max_output_tokens).await)
     }
 }
 
@@ -1953,7 +1948,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Run a one-shot shell command and return stdout/stderr. Non-PTY, non-interactive. Codex-compatible alias of exec_command / shell with a stripped-down schema (`cmd`, optional `timeout_ms`)."
+        "Run a noninteractive shell command. Truncated output includes a full log path for read_file/grep."
     }
 
     fn tags(&self) -> &[&str] {
@@ -2090,6 +2085,7 @@ impl Tool for BashTool {
         #[cfg(unix)]
         cmd.process_group(0);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        let capture = CommandOutput::new(&self.base_dir)?;
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -2103,7 +2099,7 @@ impl Tool for BashTool {
         // codex review (#1172) P2: `tokio::process::Child` does NOT
         // kill the underlying process on drop, so a `timeout()` that
         // expires would leave the shell running and able to mutate
-        // the workspace later. Save the PID before `wait_with_output`
+        // the workspace later. Save the PID before `wait_with_capture`
         // takes ownership of the child, then on timeout send
         // SIGTERM -> brief grace -> SIGKILL (Unix) or `taskkill /F /T`
         // (Windows). Mirrors `ShellTool`'s kill-on-timeout path.
@@ -2111,22 +2107,20 @@ impl Tool for BashTool {
         // Armed for the whole wait: a dropped future (user interrupt ->
         // `agent_task.abort()`) reaches neither arm below. See `ChildGroupGuard`.
         let mut group_guard = ChildGroupGuard::new(child_pid);
-        let waited = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        let waited = timeout(
+            Duration::from_secs(timeout_secs),
+            wait_with_capture(child, capture.clone()),
+        )
+        .await;
         group_guard.disarm();
         match waited {
             Ok(Ok(output)) => {
-                let mut text = String::new();
-                text.push_str(&String::from_utf8_lossy(&output.stdout));
-                if !output.stderr.is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\n--- stderr ---\n");
-                    }
-                    text.push_str(&String::from_utf8_lossy(&output.stderr));
-                }
+                let mut view = capture.view(false);
+                let mut text = view.render(MAX_CAPTURE_BYTES - 2048);
                 if text.is_empty() {
                     text.push_str("(no output)");
                 }
-                let exit_code = output.status.code().unwrap_or(-1);
+                let exit_code = output.code().unwrap_or(-1);
                 text.push_str(&format!("\n\nExit code: {exit_code}"));
                 // #28c — file-change receipt appended ONCE to THIS result's
                 // tail (28a semantics: prompt-cache stable, never a system
@@ -2150,32 +2144,46 @@ impl Tool for BashTool {
                     }
                 }
                 // Scan BEFORE truncation, append AFTER — see run_to_completion.
-                let hint =
-                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
+                let hint = sandbox_denial_hint(!self.sandbox.is_noop(), output.success(), &text);
                 let mut out = truncate_output(text, MAX_CAPTURE_BYTES);
                 if let Some(hint) = hint {
                     out.push_str(hint);
                 }
                 Ok(ToolResult {
                     output: out,
-                    success: output.status.success(),
-                    structured_metadata: Some(json!({
-                        "codex_tool": "bash",
-                        "octos_tool": "exec_command",
-                        "exit_code": exit_code,
-                    })),
+                    success: output.success(),
+                    structured_metadata: Some({
+                        let mut metadata = view.metadata();
+                        metadata["codex_tool"] = json!("bash");
+                        metadata["exit_code"] = json!(exit_code);
+                        metadata
+                    }),
                     ..Default::default()
                 })
             }
-            Ok(Err(error)) => Ok(ToolResult {
-                output: format!("Failed to execute command: {error}"),
-                success: false,
-                ..Default::default()
-            }),
+            Ok(Err(error)) => {
+                capture.record_error(&error);
+                let mut view = capture.view(false);
+                Ok(ToolResult {
+                    output: format!(
+                        "Failed to execute command: {error}\n{}",
+                        view.render(MAX_CAPTURE_BYTES - 2048)
+                    ),
+                    success: false,
+                    structured_metadata: Some(view.metadata()),
+                    ..Default::default()
+                })
+            }
             Err(_) => {
                 kill_timed_out_child(child_pid).await;
+                let mut view = capture.view(false);
                 Ok(ToolResult {
-                    output: format!("Command timed out after {timeout_secs} seconds"),
+                    output: format!(
+                        "Command timed out after {timeout_secs} seconds\n{}\nFull output: {}",
+                        view.render(MAX_CAPTURE_BYTES - 2048),
+                        view.path.display()
+                    ),
+                    structured_metadata: Some(view.metadata()),
                     success: false,
                     ..Default::default()
                 })
@@ -2251,7 +2259,7 @@ impl Drop for ChildGroupGuard {
 /// then SIGKILL if any process remains. On Windows uses `taskkill /F /T`.
 /// Errors are swallowed because the call is best-effort cleanup —
 /// the timeout result has already been returned to the caller.
-async fn kill_timed_out_child(child_pid: Option<u32>) {
+pub(super) async fn kill_timed_out_child(child_pid: Option<u32>) {
     let Some(pid) = child_pid else {
         return;
     };
@@ -2969,8 +2977,10 @@ pub(super) fn inspect_image_file(
     });
     let model_media = match &shown {
         Ok(()) => {
+            let snapshot =
+                octos_llm::vision::snapshot_image(&resolved.to_string_lossy(), ancestor_stop)?;
             payload["shown_to_model"] = json!(true);
-            vec![resolved.to_path_buf()]
+            vec![snapshot]
         }
         Err(reason) => {
             payload["shown_to_model"] = json!(false);

@@ -34,10 +34,12 @@ hint defaults to false for compatibility. When enabled, old image attachments
 remain in their original request positions until their transcript rows are
 compacted away; modality fallback still applies. It does not retain old videos.
 
-Use immutable/versioned image paths: the provider reads the files again when
-building requests. This is not an immutable byte snapshot or a guarantee of
-provider-side cache hits. Retained images consume image/context quota. Pi's
-Files API adapter and Octos inline transport are still different transports.
+New tool images are now copied into persistent, integrity-checked snapshots
+before entering history; later changes to the original filename cannot change
+historical pixels. See [tool-io-parity.md](tool-io-parity.md) for retention and
+MCP behavior. This is not a guarantee of provider-side cache hits. Retained
+images consume image/context quota. Pi's Files API adapter and Octos inline
+transport are still different transports.
 
 ## Controlled comparison contract
 

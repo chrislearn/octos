@@ -24,9 +24,15 @@ async fn four_tools_deliver_image_pixels_and_retain_them_after_another_read() {
     std::fs::write(workspace.path().join("notes.txt"), "second read").unwrap();
     let server = MockServer::start().await;
     let sequence = Arc::new(AtomicUsize::new(0));
+    let original_image = workspace.path().join("screen.png");
     Mock::given(method("POST")).and(path("/chat/completions"))
         .respond_with(move |request: &wiremock::Request| {
             let n = sequence.fetch_add(1, Ordering::SeqCst);
+            if n == 1 {
+                // A later tool regenerates the same filename. Historical wire
+                // pixels must remain unchanged in the subsequent request.
+                std::fs::write(&original_image, b"\x89PNG\r\n\x1a\nchanged").unwrap();
+            }
             let mut message = if n < 2 {
                 json!({"role":"assistant", "content":null, "tool_calls":[{
                     "id":format!("read_{n}"), "type":"function", "function":{

@@ -936,7 +936,11 @@ mod tests {
                 .await
                 .unwrap();
             assert!(result.success, "{}", result.output);
-            assert_eq!(result.model_media, vec![path.clone()]);
+            assert_eq!(result.model_media.len(), 1);
+            assert_eq!(
+                std::fs::read(&result.model_media[0]).unwrap(),
+                std::fs::read(&path).unwrap()
+            );
             assert!(result.output.contains("shown_to_model"));
         }
         assert!(tool.description().contains("images"));
@@ -960,7 +964,11 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success, "{}", result.output);
-        assert_eq!(result.model_media, vec![image]);
+        assert_eq!(result.model_media.len(), 1);
+        assert_eq!(
+            std::fs::read(&result.model_media[0]).unwrap(),
+            std::fs::read(&image).unwrap()
+        );
         let outside = legacy.path().join("outside.png");
         std::fs::write(&outside, b"\x89PNG\r\n\x1a\n").unwrap();
         let denied = tool
