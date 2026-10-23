@@ -139,7 +139,9 @@ mod tests {
             source: None,
             participant: None,
         };
-        tx.send(SteeringMessage::FollowUp(Box::new(msg))).await.unwrap();
+        tx.send(SteeringMessage::FollowUp(Box::new(msg)))
+            .await
+            .unwrap();
         let received = rx.recv().await.unwrap();
         assert!(
             matches!(received, SteeringMessage::FollowUp(m) if m.content == "stop and focus on tests")
