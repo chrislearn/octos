@@ -89,6 +89,7 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 

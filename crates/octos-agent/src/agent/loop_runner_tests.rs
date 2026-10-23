@@ -2480,6 +2480,7 @@ impl PromptContextManager for SpyPromptContextManager {
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
                     source: None,
+                    participant: None,
                 },
             );
             prompt_replaced = true;
@@ -3449,6 +3450,7 @@ fn recover_shell_retry_output_prefers_diff_like_success() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3461,6 +3463,7 @@ fn recover_shell_retry_output_prefers_diff_like_success() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3478,6 +3481,7 @@ fn recover_shell_retry_output_prefers_diff_like_success() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3490,6 +3494,7 @@ fn recover_shell_retry_output_prefers_diff_like_success() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3507,6 +3512,7 @@ fn recover_shell_retry_output_prefers_diff_like_success() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3519,6 +3525,7 @@ fn recover_shell_retry_output_prefers_diff_like_success() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3536,6 +3543,7 @@ fn recover_shell_retry_output_prefers_diff_like_success() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3548,6 +3556,7 @@ fn recover_shell_retry_output_prefers_diff_like_success() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
         ];
 
@@ -3586,6 +3595,7 @@ fn recover_shell_retry_does_not_fire_diff_like_on_all_success_turn() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         });
         messages.push(Message {
             role: MessageRole::Tool,
@@ -3598,6 +3608,7 @@ fn recover_shell_retry_does_not_fire_diff_like_on_all_success_turn() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         });
     }
 
@@ -3627,6 +3638,7 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3639,6 +3651,7 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3656,6 +3669,7 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3668,6 +3682,7 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3685,6 +3700,7 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3697,6 +3713,7 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3714,6 +3731,7 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3726,6 +3744,7 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3743,6 +3762,7 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3755,6 +3775,7 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
         ];
 
@@ -3784,6 +3805,7 @@ fn recover_shell_retry_output_accepts_useful_non_diff_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -3796,6 +3818,7 @@ fn recover_shell_retry_output_accepts_useful_non_diff_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -3813,6 +3836,7 @@ fn recover_shell_retry_output_accepts_useful_non_diff_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -3825,6 +3849,7 @@ fn recover_shell_retry_output_accepts_useful_non_diff_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -3842,6 +3867,7 @@ fn recover_shell_retry_output_accepts_useful_non_diff_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -3854,6 +3880,7 @@ fn recover_shell_retry_output_accepts_useful_non_diff_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -3871,6 +3898,7 @@ fn recover_shell_retry_output_accepts_useful_non_diff_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -3883,6 +3911,7 @@ fn recover_shell_retry_output_accepts_useful_non_diff_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 
@@ -3912,6 +3941,7 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3924,6 +3954,7 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3941,6 +3972,7 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3953,6 +3985,7 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3970,6 +4003,7 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3982,6 +4016,7 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3999,6 +4034,7 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -4011,6 +4047,7 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
         ];
 
@@ -4037,6 +4074,7 @@ fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4049,6 +4087,7 @@ fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4066,6 +4105,7 @@ fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4078,6 +4118,7 @@ fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4095,6 +4136,7 @@ fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4107,6 +4149,7 @@ fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4124,6 +4167,7 @@ fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4136,6 +4180,7 @@ fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 
@@ -4165,6 +4210,7 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4177,6 +4223,7 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4194,6 +4241,7 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4206,6 +4254,7 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4223,6 +4272,7 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4235,6 +4285,7 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4252,6 +4303,7 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4264,6 +4316,7 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 
@@ -4290,6 +4343,7 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4302,6 +4356,7 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4319,6 +4374,7 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4331,6 +4387,7 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4348,6 +4405,7 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4360,6 +4418,7 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4377,6 +4436,7 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4389,6 +4449,7 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 
@@ -4430,6 +4491,7 @@ fn current_user_turn_start_returns_zero_when_no_user_message() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }];
     assert_eq!(current_user_turn_start(&messages), 0);
 }
@@ -4467,6 +4529,7 @@ fn latest_tool_batch_contains_picks_up_shell_in_mixed_batch() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4479,6 +4542,7 @@ fn latest_tool_batch_contains_picks_up_shell_in_mixed_batch() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4491,6 +4555,7 @@ fn latest_tool_batch_contains_picks_up_shell_in_mixed_batch() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 
@@ -4518,6 +4583,7 @@ fn latest_tool_batch_contains_returns_false_when_pure_non_shell_batch() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4530,6 +4596,7 @@ fn latest_tool_batch_contains_returns_false_when_pure_non_shell_batch() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 
@@ -4568,6 +4635,7 @@ fn intra_turn_window_skips_stale_shell_history_from_prior_turn() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     });
     messages.push(Message {
         role: MessageRole::Tool,
@@ -4580,6 +4648,7 @@ fn intra_turn_window_skips_stale_shell_history_from_prior_turn() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     });
 
     // Whole-history scan still matches the stale streak — that's the
@@ -4616,6 +4685,7 @@ fn intra_turn_window_does_not_trip_on_single_fresh_shell_after_stale_streak() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     });
     messages.push(Message {
         role: MessageRole::Tool,
@@ -4628,6 +4698,7 @@ fn intra_turn_window_does_not_trip_on_single_fresh_shell_after_stale_streak() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     });
 
     let window_start = current_user_turn_start(&messages);
@@ -4671,6 +4742,7 @@ fn latest_tool_batch_index_returns_shell_index_in_mixed_batch() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4683,6 +4755,7 @@ fn latest_tool_batch_index_returns_shell_index_in_mixed_batch() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4695,6 +4768,7 @@ fn latest_tool_batch_index_returns_shell_index_in_mixed_batch() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 
@@ -4784,6 +4858,7 @@ fn stale_shell_failure_streak(id_prefix: &str) -> Vec<Message> {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         });
         out.push(Message {
             role: MessageRole::Tool,
@@ -4796,6 +4871,7 @@ fn stale_shell_failure_streak(id_prefix: &str) -> Vec<Message> {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         });
     }
     out
@@ -5189,6 +5265,7 @@ async fn shell_spiral_dispatch_marks_loop_detected_recently() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         });
         messages.push(Message {
             role: MessageRole::Tool,
@@ -5201,6 +5278,7 @@ async fn shell_spiral_dispatch_marks_loop_detected_recently() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         });
     }
 
@@ -5318,6 +5396,7 @@ async fn should_compact_and_retry_on_context_overflow() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }];
     for i in 0..14 {
         messages.push(Message {
@@ -5331,6 +5410,7 @@ async fn should_compact_and_retry_on_context_overflow() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         });
         messages.push(Message {
             role: MessageRole::Assistant,
@@ -5343,6 +5423,7 @@ async fn should_compact_and_retry_on_context_overflow() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         });
     }
 
@@ -6334,6 +6415,7 @@ fn spawn_only_tool_result(tool_call_id: &str, content: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -8301,6 +8383,7 @@ fn spiral_shell_exchange(id: &str, command: &str, output: &str) -> [Message; 2] 
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -8313,6 +8396,7 @@ fn spiral_shell_exchange(id: &str, command: &str, output: &str) -> [Message; 2] 
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     ]
 }

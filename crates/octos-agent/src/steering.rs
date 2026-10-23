@@ -136,6 +136,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
         tx.send(SteeringMessage::FollowUp(msg)).await.unwrap();
         let received = rx.recv().await.unwrap();
