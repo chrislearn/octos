@@ -2807,7 +2807,7 @@ impl Tool for ViewImageTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect a local image file (PNG / JPEG / GIF / WEBP / BMP / SVG). Returns format, MIME type, and byte length so the host UI can render a preview."
+        "Inspect a local image file. PNG, JPEG and WEBP images up to 5 MiB are attached to the model; other formats or oversized images return metadata and an explicit reason they were not shown."
     }
 
     fn tags(&self) -> &[&str] {
@@ -2894,89 +2894,104 @@ impl Tool for ViewImageTool {
             FilesystemScope::Workspace => Some(self.base_dir.as_path()),
             FilesystemScope::Host => None,
         };
-        let (bytes, byte_length) = match read_image_header_no_follow(&resolved, ancestor_stop) {
-            Ok(pair) => pair,
-            Err(error) => {
-                return Ok(ToolResult {
-                    output: format!("view_image: failed to read {path}: {error}"),
-                    success: false,
-                    structured_metadata: Some(json!({
-                        "codex_tool": "view_image",
-                        "error_kind": "coding_tool_missing",
-                        "path": path,
-                    })),
-                    ..Default::default()
-                });
-            }
-        };
-        let (format, mime) = match detect_image_format(&bytes) {
-            Some(pair) => pair,
-            None => {
-                return Ok(ToolResult {
-                    output: format!(
-                        "view_image: {path} does not match a recognised image header (PNG / JPEG / GIF / WEBP / BMP / SVG)"
-                    ),
-                    success: false,
-                    structured_metadata: Some(json!({
-                        "codex_tool": "view_image",
-                        "error_kind": "coding_tool_denied",
-                        "reason": "unrecognised_image_format",
-                        "path": path,
-                    })),
-                    ..Default::default()
-                });
-            }
-        };
-        // Shown to the model when the provider can take it: a raster format
-        // every vision API accepts, under the smallest common size ceiling,
-        // and with an extension the providers' image detection recognises
-        // (they key on the path, not the bytes). Otherwise the model gets
-        // the metadata and a reason, never a silent nothing.
-        let shown = if !VISION_FORMATS.contains(&format) {
-            Err(format!(
-                "{format} is not a format the model can view; convert it to PNG or JPEG"
-            ))
-        } else if byte_length > MAX_MODEL_IMAGE_BYTES {
-            Err(format!(
-                "{byte_length} bytes is over the {MAX_MODEL_IMAGE_BYTES}-byte limit for showing an image to the model; downscale it"
-            ))
-        } else if !octos_llm::vision::is_image(&resolved.to_string_lossy()) {
-            Err("the file needs a .png, .jpg, .jpeg, .gif or .webp extension to be shown to the model".to_string())
-        } else {
-            Ok(())
-        };
-        let mut payload = json!({
+        inspect_image_file(&resolved, path, ancestor_stop, self.name())
+    }
+}
+
+/// Shared image read path. Callers must resolve and authorize the path first;
+/// this helper keeps bounded header reads, symlink checks and model-media limits
+/// identical for `read_file` and `view_image`.
+pub(super) fn inspect_image_file(
+    resolved: &std::path::Path,
+    path: &str,
+    ancestor_stop: Option<&std::path::Path>,
+    tool_name: &str,
+) -> Result<ToolResult> {
+    let (bytes, byte_length) = match read_image_header_no_follow(resolved, ancestor_stop) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return Ok(ToolResult {
+                output: format!("{tool_name}: failed to read {path}: {error}"),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": tool_name,
+                    "error_kind": "coding_tool_missing",
+                    "path": path,
+                })),
+                ..Default::default()
+            });
+        }
+    };
+    let (format, mime) = match detect_image_format(&bytes) {
+        Some(pair) => pair,
+        None => {
+            return Ok(ToolResult {
+                output: format!(
+                    "{tool_name}: {path} does not match a recognised image header (PNG / JPEG / GIF / WEBP / BMP / SVG)"
+                ),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": tool_name,
+                    "error_kind": "coding_tool_denied",
+                    "reason": "unrecognised_image_format",
+                    "path": path,
+                })),
+                ..Default::default()
+            });
+        }
+    };
+    // Shown to the model when the provider can take it: a raster format
+    // every vision API accepts, under the smallest common size ceiling,
+    // and with an extension the providers' image detection recognises
+    // (they key on the path, not the bytes). Otherwise the model gets
+    // the metadata and a reason, never a silent nothing.
+    let shown = if !VISION_FORMATS.contains(&format) {
+        Err(format!(
+            "{format} is not a format the model can view; convert it to PNG or JPEG"
+        ))
+    } else if byte_length > MAX_MODEL_IMAGE_BYTES {
+        Err(format!(
+            "{byte_length} bytes is over the {MAX_MODEL_IMAGE_BYTES}-byte limit for showing an image to the model; downscale it"
+        ))
+    } else if !octos_llm::vision::is_image(&resolved.to_string_lossy()) {
+        Err(
+            "the file needs a .png, .jpg, .jpeg, .gif or .webp extension to be shown to the model"
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    };
+    let mut payload = json!({
+        "path": path,
+        "format": format,
+        "mime_type": mime,
+        "byte_length": byte_length,
+    });
+    let model_media = match &shown {
+        Ok(()) => {
+            payload["shown_to_model"] = json!(true);
+            vec![resolved.to_path_buf()]
+        }
+        Err(reason) => {
+            payload["shown_to_model"] = json!(false);
+            payload["not_shown_because"] = json!(reason);
+            Vec::new()
+        }
+    };
+    Ok(ToolResult {
+        output: payload.to_string(),
+        success: true,
+        structured_metadata: Some(json!({
+            "codex_tool": tool_name,
             "path": path,
             "format": format,
             "mime_type": mime,
             "byte_length": byte_length,
-        });
-        let model_media = match &shown {
-            Ok(()) => {
-                payload["shown_to_model"] = json!(true);
-                vec![resolved.clone()]
-            }
-            Err(reason) => {
-                payload["shown_to_model"] = json!(false);
-                payload["not_shown_because"] = json!(reason);
-                Vec::new()
-            }
-        };
-        Ok(ToolResult {
-            output: payload.to_string(),
-            success: true,
-            structured_metadata: Some(json!({
-                "codex_tool": "view_image",
-                "path": path,
-                "format": format,
-                "mime_type": mime,
-                "byte_length": byte_length,
-                "shown_to_model": shown.is_ok(),
-            })),
-            model_media,
-            ..Default::default()
-        })
-    }
+            "shown_to_model": shown.is_ok(),
+        })),
+        model_media,
+        ..Default::default()
+    })
 }
 
 /// `view_video`: the video counterpart of [`ViewImageTool`].

@@ -48,6 +48,13 @@ pub struct ModelHints {
     #[serde(default)]
     pub lacks_video: bool,
 
+    /// Keep tool-returned images in subsequent requests until their transcript
+    /// rows are compacted away. Opt-in: retains visual context and a stable
+    /// request prefix, at the cost of provider image/context usage. Video keeps
+    /// its current-batch-only behavior. Use immutable/versioned image paths.
+    #[serde(default)]
+    pub retain_tool_images: bool,
+
     /// Merge consecutive system messages into one (some providers reject multiples).
     #[serde(default = "default_true")]
     pub merge_system_messages: bool,
@@ -71,6 +78,7 @@ impl Default for ModelHints {
             fixed_temperature: false,
             lacks_vision: false,
             lacks_video: false,
+            retain_tool_images: false,
             merge_system_messages: true,
             reasoning_style: ReasoningStyle::None,
         }
@@ -186,6 +194,7 @@ impl ModelHints {
             fixed_temperature,
             lacks_vision,
             lacks_video: false,
+            retain_tool_images: false,
             merge_system_messages: true,
             reasoning_style,
         }
@@ -615,11 +624,12 @@ impl OpenAIProvider {
 
             let mut content = build_openai_content(m, &content_hints, scope_root);
             if m.role == MessageRole::Tool {
-                let shown = crate::tool_media::for_tool_row(
+                let shown = crate::tool_media::for_tool_row_with_image_history(
                     messages,
                     index,
                     content_hints.lacks_vision,
                     content_hints.lacks_video,
+                    content_hints.retain_tool_images,
                 );
                 if let Some(note) = shown.note.as_deref() {
                     content = append_note(content, note);
@@ -1351,22 +1361,25 @@ fn is_image_modality_error(body: &str) -> bool {
 /// inlined (i.e. images are not already stripped by the configured
 /// `lacks_vision`). Decides whether a 400 is worth retrying text-only.
 fn request_has_user_images(messages: &[Message], hints: &ModelHints) -> bool {
-    !hints.lacks_vision && request_has_media(messages, vision::is_image)
+    !hints.lacks_vision && request_has_media(messages, vision::is_image, hints.retain_tool_images)
 }
 
 /// A user row's media, or a current-batch tool row's: both go out inline.
-fn request_has_media(messages: &[Message], kind: fn(&str) -> bool) -> bool {
+fn request_has_media(messages: &[Message], kind: fn(&str) -> bool, retain_history: bool) -> bool {
     messages.iter().enumerate().any(|(i, m)| {
         m.media.iter().any(|p| kind(p))
             && (m.role == MessageRole::User
-                || (m.role == MessageRole::Tool && crate::tool_media::is_current(messages, i)))
+                || (m.role == MessageRole::Tool
+                    && (retain_history || crate::tool_media::is_current(messages, i))))
     })
 }
 
 /// Whether the request carries a user-row video we would have sent as a
 /// `video_url` part. Decides whether a refusal is worth retrying without it.
 fn request_has_user_videos(messages: &[Message], hints: &ModelHints) -> bool {
-    !hints.lacks_video && !hints.lacks_vision && request_has_media(messages, vision::is_video)
+    !hints.lacks_video
+        && !hints.lacks_vision
+        && request_has_media(messages, vision::is_video, false)
 }
 
 fn request_has_user_media(messages: &[Message], hints: &ModelHints) -> bool {
@@ -2075,6 +2088,7 @@ mod tests {
             fixed_temperature: false,
             lacks_vision: true,
             lacks_video: false,
+            retain_tool_images: false,
             merge_system_messages: false,
             reasoning_style: ReasoningStyle::EffortAndThinkingToggle,
         };
@@ -2878,6 +2892,7 @@ mod tests {
             fixed_temperature: true,
             lacks_vision: true,
             lacks_video: false,
+            retain_tool_images: false,
             merge_system_messages: false,
             reasoning_style: ReasoningStyle::None,
         });
@@ -3246,6 +3261,44 @@ mod tests {
             parts[1]["text"].as_str().unwrap().contains("call_1"),
             "{}",
             parts[1]
+        );
+    }
+
+    #[test]
+    fn should_retain_tool_images_and_request_prefix_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = media_loop(dir.path());
+        let later = media_loop_continued(dir.path());
+        let hints: ModelHints = serde_json::from_value(serde_json::json!({
+            "retain_tool_images": true
+        }))
+        .unwrap();
+        let provider = OpenAIProvider::new("key", "deepseek-v4-flash").with_hints(hints.clone());
+        let a = serde_json::to_value(provider.build_request(
+            &first,
+            &[],
+            &ChatConfig::default(),
+            false,
+        ))
+        .unwrap();
+        let b = serde_json::to_value(provider.build_request(
+            &later,
+            &[],
+            &ChatConfig::default(),
+            false,
+        ))
+        .unwrap();
+        let previous = a["messages"].as_array().unwrap();
+        let current = b["messages"].as_array().unwrap();
+        assert_eq!(
+            &current[..previous.len()],
+            previous.as_slice(),
+            "old image must remain in the same place: {b}"
+        );
+        assert!(b.to_string().contains("data:image/png"));
+        assert!(
+            request_has_user_images(&later, &hints),
+            "historical images must participate in modality fallback"
         );
     }
 

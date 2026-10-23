@@ -126,12 +126,12 @@ impl Tool for ReadFileTool {
     // so `specs()` sees a consistent answer.)
     fn description(&self) -> &str {
         if self.window_armed() {
-            "Read the contents of a file. Returns the file content with line numbers. Large \
+            "Read text with line numbers, or attach PNG/JPEG/WEBP images (up to 5 MiB) directly to the model. Large \
              results are truncated to a bounded window and the message names the exact call to \
              continue (offset/limit, or byte_offset for raw byte paging of very long lines) — \
              page forward until no continuation notice remains."
         } else {
-            "Read the contents of a file. Returns the file content with line numbers."
+            "Read text with line numbers, or attach PNG/JPEG/WEBP images (up to 5 MiB) directly to the model."
         }
     }
 
@@ -360,6 +360,39 @@ impl ReadFileTool {
                 }
             },
         };
+
+        // Images are a native read result, not a second model request. Resolve
+        // permissions and session scope BEFORE inspecting bytes, and bypass the
+        // text cache so a repeated image read never returns FILE_UNCHANGED.
+        let extension = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if octos_llm::vision::is_image(&path.to_string_lossy()) || extension == "bmp" {
+            if input.byte_offset.is_some() || input.byte_limit.is_some() {
+                return Ok(ToolResult {
+                    output: "Image reads attach the whole image; byte paging applies only to text files.".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+            let ancestor_stop = if let Some(scope) = ctx.session_scope.as_ref() {
+                // Shared/granted paths were authorized by the resolver above.
+                path.starts_with(scope.workspace())
+                    .then_some(scope.workspace())
+            } else if self.filesystem_scope == FilesystemScope::Workspace {
+                Some(self.base_dir.as_path())
+            } else {
+                None
+            };
+            return super::coding_tools::inspect_image_file(
+                &path,
+                &input.path,
+                ancestor_stop,
+                self.name(),
+            );
+        }
 
         // Reject files larger than 10MB to prevent OOM (output is capped under
         // the tool-output limit anyway, and reading a multi-GB file just to
@@ -888,6 +921,101 @@ fn cache_matches_request(entry: &CacheEntry, requested_range: Option<(u64, u64)>
 mod tests {
     use super::*;
     use crate::tools::ConcurrencyClass;
+
+    #[tokio::test]
+    async fn should_attach_image_to_main_model_when_reading_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("screen.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let tool = ReadFileTool::new(dir.path());
+        let cache = Arc::new(FileStateCache::new());
+        let ctx = ctx_with_cache(cache.clone());
+        for _ in 0..2 {
+            let result = tool
+                .execute_with_context(&ctx, &serde_json::json!({"path": "screen.png"}))
+                .await
+                .unwrap();
+            assert!(result.success, "{}", result.output);
+            assert_eq!(result.model_media, vec![path.clone()]);
+            assert!(result.output.contains("shown_to_model"));
+        }
+        assert!(tool.description().contains("images"));
+        assert!(
+            cache.is_empty(),
+            "images must never become text-cache stubs"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_image_scope_and_reject_outside_reads() {
+        let workspace = tempfile::tempdir().unwrap();
+        let legacy = tempfile::tempdir().unwrap();
+        let image = workspace.path().join("scope.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let ctx = ctx_with_scope(scope);
+        let tool = ReadFileTool::new(legacy.path());
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path":"scope.png"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert_eq!(result.model_media, vec![image]);
+        let outside = legacy.path().join("outside.png");
+        std::fs::write(&outside, b"\x89PNG\r\n\x1a\n").unwrap();
+        let denied = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path":outside}))
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        assert!(denied.model_media.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_not_claim_pixels_when_image_is_invalid_or_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("screen.png");
+        let tool = ReadFileTool::new(dir.path());
+        std::fs::write(&path, b"this is not an image").unwrap();
+        let invalid = tool
+            .execute(&serde_json::json!({"path":"screen.png"}))
+            .await
+            .unwrap();
+        assert!(!invalid.success);
+        assert!(invalid.model_media.is_empty());
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(6 * 1024 * 1024)
+            .unwrap();
+        let large = tool
+            .execute(&serde_json::json!({"path":"screen.png"}))
+            .await
+            .unwrap();
+        assert!(large.model_media.is_empty());
+        assert!(
+            large.output.contains("not_shown_because"),
+            "{}",
+            large.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_not_attach_symlinked_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let result = ReadFileTool::new(dir.path())
+            .execute(&serde_json::json!({"path":"link/secret.png"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.model_media.is_empty());
+    }
 
     #[tokio::test]
     async fn armed_read_caps_an_oversized_malformed_argument_error() {
@@ -1766,17 +1894,13 @@ mod tests {
     // process-global counts (#2077/#2126 lesson).
     // -----------------------------------------------------------------------
 
-    /// R6: the UNARMED tool must be byte-for-byte the origin/main tool at the
-    /// WIRE — same name, description, and input schema — because every enabled
-    /// tool's ToolSpec is serialized into the LLM prompt-cache prefix
-    /// (registry.rs `specs()`). A changed unarmed spec would invalidate that
-    /// prefix for every session on the planet, armed or not, defeating the
-    /// "flag-gated, zero blast radius" premise. This golden is the exact
-    /// origin/main ToolSpec JSON; only the ARMED tool may differ from it.
-    fn read_file_origin_toolspec() -> serde_json::Value {
+    /// Windowed-read arming may extend the schema, but the unarmed contract
+    /// stays stable across sessions. Image support is deliberately present in
+    /// both modes; changing the windowing flag must not remove that capability.
+    fn read_file_base_toolspec() -> serde_json::Value {
         serde_json::json!({
             "name": "read_file",
-            "description": "Read the contents of a file. Returns the file content with line numbers.",
+            "description": "Read text with line numbers, or attach PNG/JPEG/WEBP images (up to 5 MiB) directly to the model.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -1811,13 +1935,13 @@ mod tests {
     }
 
     #[test]
-    fn unarmed_read_file_toolspec_is_byte_identical_to_origin_main() {
+    fn unarmed_read_file_toolspec_keeps_base_image_contract() {
         let tool = ReadFileTool::new("/tmp").with_window_enforcement(false);
         let spec = read_file_toolspec(&tool);
         assert_eq!(
             spec,
-            read_file_origin_toolspec(),
-            "the UNARMED read_file ToolSpec must equal origin/main exactly — no \
+            read_file_base_toolspec(),
+            "the UNARMED read_file ToolSpec must equal the base image-aware spec exactly — no \
              byte_offset/byte_limit in the schema, no windowing sentence in the \
              description — or the prompt-cache prefix changes for every session"
         );
@@ -1825,8 +1949,8 @@ mod tests {
         // keys, so this is deterministic).
         assert_eq!(
             serde_json::to_string(&spec).unwrap(),
-            serde_json::to_string(&read_file_origin_toolspec()).unwrap(),
-            "serialized unarmed spec must match origin byte-for-byte"
+            serde_json::to_string(&read_file_base_toolspec()).unwrap(),
+            "serialized unarmed spec must match the base contract byte-for-byte"
         );
     }
 
@@ -1838,7 +1962,7 @@ mod tests {
         let spec = read_file_toolspec(&tool);
         assert_ne!(
             spec,
-            read_file_origin_toolspec(),
+            read_file_base_toolspec(),
             "the armed spec differs from origin by design"
         );
         let props = spec["input_schema"]["properties"].as_object().unwrap();
