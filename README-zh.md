@@ -327,6 +327,7 @@ Goal 记录 Agent 要完成什么，Loop 安排周期性轮次，Monitor 观察�
 - [Harness 开发者接口](docs/OCTOS_HARNESS_DEVELOPER_INTERFACE.md)
 - [产物与工作流集成指南](docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md)
 - [Harness 兼容性与版本管理](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
+- [基于工具结果的进展提醒与可选周期反思](docs/event-driven-reflection.md)
 - [文档站点](https://octos-org.github.io/octos/zh/)
 
 ## 参与开发

@@ -30,6 +30,7 @@
 //! clean-up is out of scope for M8.1.
 
 mod build_cache_usage;
+mod output_claims;
 pub use build_cache_usage::{BuildCacheUsage, BuildCacheUseGuard};
 
 use std::collections::HashSet;
@@ -277,9 +278,9 @@ pub struct ToolContext {
     ///
     /// File tools consult this cache on read and invalidate it on write. When
     /// `None`, tools behave as they did pre-M8.4 (no cache, no stub). The
-    /// cache is wrapped in `Arc` so it can be cloned cheaply into subagents;
-    /// use [`FileStateCache::clone_for_subagent`] when a delegate should
-    /// receive an independent copy instead of a shared handle.
+    /// cache is wrapped in `Arc` for tools in the SAME model context.
+    /// Independent children use [`FileStateCache::empty_for_new_context`];
+    /// copying or sharing parent entries would claim unseen file bodies.
     pub file_state_cache: Option<Arc<FileStateCache>>,
     /// Notification inbox surfaced to tools. M8.2/M8.3 will populate this.
     pub notifications: Arc<Notifications>,

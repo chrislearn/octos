@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 const LEGACY_CONTEXT_MANAGER_SCHEMA: &str = "octos.context-manager.v1";
 const CONTEXT_MANAGER_SCHEMA: &str = "octos.context-manager.v2";
-const DEFAULT_TOOL_OUTPUT_POLICY_ID: &str = "tool-output-v1";
+const DEFAULT_TOOL_OUTPUT_POLICY_ID: &str = "tool-output-v2";
 const TOOL_OUTPUT_UI_PREVIEW_MAX_BYTES: usize = 512;
 const SYNTHETIC_MISSING_TOOL_OUTPUT: &str =
     "[tool output missing: aborted before result was recorded]";
@@ -350,7 +350,11 @@ pub(crate) struct ToolOutputPreviewLink {
 pub(crate) struct ToolOutputPolicy {
     pub(crate) policy_id: String,
     pub(crate) inline_raw_threshold_bytes: usize,
-    pub(crate) model_visible_max_bytes: usize,
+    /// An explicit projection override. By default the execution layer's
+    /// per-tool budget is authoritative; a second preview-sized cap would
+    /// discard already-bounded file pages and their recovery footers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model_visible_max_bytes: Option<usize>,
 }
 
 impl Default for ToolOutputPolicy {
@@ -358,7 +362,7 @@ impl Default for ToolOutputPolicy {
         Self {
             policy_id: DEFAULT_TOOL_OUTPUT_POLICY_ID.to_owned(),
             inline_raw_threshold_bytes: 16 * 1024,
-            model_visible_max_bytes: 4 * 1024,
+            model_visible_max_bytes: None,
         }
     }
 }
@@ -2392,20 +2396,25 @@ impl ContextManager {
         };
         let mut probe = ContextManager::new(self.session_id.clone(), self.thread_id.clone())
             .with_tool_output_policy(self.tool_output_policy.clone());
-        probe.record_message(message);
-
-        // #982: the probe was built from a fresh, empty transcript so its
-        // Tool branch resolved to `tool_name: "unknown"`. Rewrite any
-        // freshly-built `ToolOutput` envelope with the real tool_name
-        // we can look up against `self.items`.
-        for probe_item in probe.items.iter_mut() {
-            if let TranscriptItemKind::ToolOutput { envelope } = &mut probe_item.kind {
-                if envelope.tool_name == "unknown" {
-                    if let Some(real_name) = self.tool_name_for_call_id(&envelope.tool_call_id) {
-                        envelope.tool_name = real_name;
-                    }
-                }
+        if message.role == MessageRole::Tool {
+            if let Some(call_id) = message.tool_call_id.as_deref() {
+                let call_id = normalize_tool_call_id(call_id);
+                let name = self
+                    .tool_name_for_call_id(&call_id)
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let mut envelope = self.tool_output_envelope(call_id, name, &message.content);
+                envelope.media = message.media.clone();
+                // The empty probe cannot resolve the parent call's budget or
+                // target. Build against this ledger before twin comparison;
+                // retain raw sidecars even when this is a new persisted row.
+                self.retain_tool_output(&envelope, &message.content);
+                probe.record_item(
+                    TranscriptItemKind::ToolOutput { envelope },
+                    TranscriptItemSource::ToolRuntime,
+                );
             }
+        } else {
+            probe.record_message(message);
         }
 
         let mut ids = Vec::new();
@@ -3020,73 +3029,144 @@ impl ContextManager {
         semantic_group_id: Option<String>,
     ) -> TranscriptItemId {
         let tool_call_id = normalize_tool_call_id(&tool_call_id.into());
-        let tool_name: String = tool_name.into();
+        let envelope = self.tool_output_envelope(tool_call_id, tool_name.into(), raw_output);
+        self.retain_tool_output(&envelope, raw_output);
+        self.record_item_with_source_ref_and_group(
+            TranscriptItemKind::ToolOutput { envelope },
+            source,
+            source_ref,
+            semantic_group_id,
+        )
+    }
+
+    /// Build live and persisted projections with the same tool identity,
+    /// execution budget and recovery target before comparing their contents.
+    fn tool_output_envelope(
+        &self,
+        tool_call_id: String,
+        tool_name: String,
+        raw_output: &str,
+    ) -> ToolOutputEnvelope {
         let raw_sha256 = sha256_prefixed(raw_output.as_bytes());
         let original_bytes = raw_output.len();
-        let (mut model_visible_content, truncation_reason) = truncate_utf8(
-            raw_output,
-            self.tool_output_policy.model_visible_max_bytes,
-            ToolOutputTruncationReason::MaxBytes,
-        );
+        let max_bytes = self
+            .tool_output_policy
+            .model_visible_max_bytes
+            .unwrap_or_else(|| octos_core::tool_output_limit(&tool_name));
+        let (mut model_visible_content, truncation_reason) =
+            truncate_utf8(raw_output, max_bytes, ToolOutputTruncationReason::MaxBytes);
         if truncation_reason.is_some() {
-            // The bare `[truncated]` floor told the model that something was
-            // cut but not what, how much, or how to get it back — so a careful
-            // model re-read the file in slices (the round-3 GLM pattern). Name
-            // the call, the visible/original sizes and the recall handle.
+            // The execution layer can append recovery/checker diagnostics
+            // after bounding the body. Keep both ends within the SAME default
+            // byte budget so trailing log paths and diagnostics survive; the
+            // gap remains explicit. Caller overrides retain prefix semantics.
+            let omitted_bytes = if self.tool_output_policy.model_visible_max_bytes.is_none() {
+                let cut = octos_core::truncate_head_tail_report(raw_output, max_bytes, 0.7);
+                model_visible_content = format!("{}\n[truncated]", cut.content);
+                Some(cut.omitted_bytes)
+            } else {
+                None
+            };
             let target = self
                 .tool_target_for_call_id(&tool_call_id)
                 .unwrap_or_else(|| tool_name_for_note(&tool_name));
+            // A head/tail projection has a hole before the final visible
+            // line. Do not mistake that tail for contiguous read coverage.
+            let prefix = if omitted_bytes.is_some() {
+                ""
+            } else {
+                &model_visible_content
+            };
+            let recovery = self.tool_output_recovery_hint(&tool_call_id, &tool_name, prefix);
             model_visible_content = annotate_truncation(
                 model_visible_content,
                 &truncation_note(
                     &target,
-                    self.tool_output_policy.model_visible_max_bytes,
+                    max_bytes,
                     original_bytes,
                     &tool_call_id,
+                    &recovery,
+                    omitted_bytes,
                 ),
             );
         }
         let raw_artifact_ref = (truncation_reason.is_some()
             || original_bytes > self.tool_output_policy.inline_raw_threshold_bytes)
             .then(|| format!("tool-output/{raw_sha256}.txt"));
-        if let Some(artifact_ref) = raw_artifact_ref.as_ref() {
-            self.tool_output_artifacts
-                .insert(artifact_ref.clone(), raw_output.as_bytes().to_vec());
-        }
-        // #2131: keep the call_id -> recall handle alive independent of `items`,
-        // which `compact_context` prunes. Latest write wins for a reused id.
-        self.recall_index.insert(
-            tool_call_id.clone(),
-            ToolOutputRecallEntry {
-                artifact_ref: raw_artifact_ref.clone(),
-                model_visible_content: model_visible_content.clone(),
-            },
-        );
         let ui_preview_content = tool_output_preview(&model_visible_content);
         let ui_preview = Some(ToolOutputPreviewLink {
             preview_ref: format!("appui/tool-output-preview/{tool_call_id}"),
             bytes: ui_preview_content.len(),
             content: ui_preview_content,
         });
-        self.record_item_with_source_ref_and_group(
-            TranscriptItemKind::ToolOutput {
-                envelope: ToolOutputEnvelope {
-                    tool_call_id,
-                    tool_name,
-                    raw_sha256,
-                    raw_artifact_ref,
-                    ui_preview,
-                    original_bytes,
-                    model_visible_bytes: model_visible_content.len(),
-                    model_visible_content,
-                    truncation_reason,
-                    policy_id: self.tool_output_policy.policy_id.clone(),
-                    media: Vec::new(),
-                },
+        ToolOutputEnvelope {
+            tool_call_id,
+            tool_name,
+            raw_sha256,
+            raw_artifact_ref,
+            ui_preview,
+            original_bytes,
+            model_visible_bytes: model_visible_content.len(),
+            model_visible_content,
+            truncation_reason,
+            policy_id: self.tool_output_policy.policy_id.clone(),
+            media: Vec::new(),
+        }
+    }
+
+    fn retain_tool_output(&mut self, envelope: &ToolOutputEnvelope, raw_output: &str) {
+        if let Some(artifact_ref) = envelope.raw_artifact_ref.as_ref() {
+            self.tool_output_artifacts
+                .insert(artifact_ref.clone(), raw_output.as_bytes().to_vec());
+        }
+        // The recall handle survives compaction of its transcript envelope.
+        self.recall_index.insert(
+            envelope.tool_call_id.clone(),
+            ToolOutputRecallEntry {
+                artifact_ref: envelope.raw_artifact_ref.clone(),
+                model_visible_content: envelope.model_visible_content.clone(),
             },
-            source,
-            source_ref,
-            semantic_group_id,
+        );
+    }
+
+    fn tool_output_recovery_hint(&self, call_id: &str, tool_name: &str, prefix: &str) -> String {
+        if tool_name != "read_file" {
+            return "Repeat the original call with a narrower output range.".to_owned();
+        }
+        let arguments = self.items.iter().rev().find_map(|item| match &item.kind {
+            TranscriptItemKind::AssistantToolCall {
+                call_id: candidate,
+                arguments,
+                ..
+            } if candidate == call_id => Some(arguments),
+            _ => None,
+        });
+        // Byte mode is advertised only by an armed read_file. Recommend it
+        // only when the original call already used that supported schema.
+        if arguments.is_some_and(|args| args.get("byte_offset").is_some()) {
+            return "Repeat read_file with the same byte_offset and a smaller byte_limit, then follow its continuation notice.".to_owned();
+        }
+        // A projection cap may split a formatted source line. Start at the
+        // last visible line again, never skip its unseen suffix. The gutter
+        // belongs to the native read_file format, not the source file text.
+        let next_line = prefix
+            .lines()
+            .rev()
+            .find_map(|line| {
+                line.split_once('│')
+                    .and_then(|(number, _)| number.trim().parse::<usize>().ok())
+            })
+            .or_else(|| {
+                arguments.and_then(|args| {
+                    args.get("start_line")
+                        .or_else(|| args.get("offset"))
+                        .and_then(Value::as_u64)
+                        .map(|line| line as usize)
+                })
+            })
+            .unwrap_or(1);
+        format!(
+            "Repeat read_file with the same path, start_line: {next_line}, limit: 1, then continue forward; the last displayed line may be incomplete."
         )
     }
 
@@ -4587,13 +4667,24 @@ fn truncation_note(
     shown_bytes: usize,
     original_bytes: usize,
     call_id: &str,
+    recovery: &str,
+    omitted_bytes: Option<usize>,
 ) -> String {
+    let coverage = match omitted_bytes {
+        Some(omitted) => format!(
+            "showing head and tail within a {} body budget for {} of {target}; {omitted} bytes omitted from the recorded tool output",
+            human_bytes(shown_bytes),
+            human_bytes(original_bytes),
+        ),
+        None => format!(
+            "showing the first {} of {} of {target}",
+            human_bytes(shown_bytes.min(original_bytes)),
+            human_bytes(original_bytes),
+        ),
+    };
     format!(
-        "[showing the first {} of {} of {target}. `recall` with tool_call_id \"{call_id}\" \
-         (page=N for later pages) returns the recorded output while this session still holds \
-         it; otherwise repeat the call for a narrower range.]",
-        human_bytes(shown_bytes.min(original_bytes)),
-        human_bytes(original_bytes),
+        "[{coverage}. {recovery} If available, `recall` with tool_call_id \"{call_id}\" \
+         (page=N for later pages) can retrieve the recorded output while this session still holds it.]",
     )
 }
 
@@ -5383,7 +5474,11 @@ mod tests {
 
     #[test]
     fn should_exclude_hidden_reasoning_and_raw_ledger_payload_from_compaction_threshold() {
-        let mut manager = ContextManager::new("model-budget", None);
+        let mut manager =
+            ContextManager::new("model-budget", None).with_tool_output_policy(ToolOutputPolicy {
+                model_visible_max_bytes: Some(4096),
+                ..Default::default()
+            });
         let mut assistant = Message::assistant("artifact saved");
         assistant.reasoning_content = Some("private reasoning ".repeat(50_000));
         manager.record_message(&Message::user("continue"));
@@ -6338,7 +6433,7 @@ mod tests {
         let policy = ToolOutputPolicy {
             policy_id: "test-policy".into(),
             inline_raw_threshold_bytes: 8,
-            model_visible_max_bytes: 10,
+            model_visible_max_bytes: Some(10),
         };
         let mut manager = ContextManager::new("s", None).with_tool_output_policy(policy);
         manager.record_tool_output("call_1", "shell", "0123456789abcdef");
@@ -6871,7 +6966,7 @@ mod tests {
         let policy = ToolOutputPolicy {
             policy_id: "test-policy".into(),
             inline_raw_threshold_bytes: 8,
-            model_visible_max_bytes: 10,
+            model_visible_max_bytes: Some(10),
         };
         let mut manager = ContextManager::new(session_id, None).with_tool_output_policy(policy);
         // Committed rows: a snapshot only reloads conversation rows that the
@@ -6945,7 +7040,7 @@ mod tests {
         let policy = ToolOutputPolicy {
             policy_id: "test-policy".into(),
             inline_raw_threshold_bytes: 1024,
-            model_visible_max_bytes: 1024,
+            model_visible_max_bytes: Some(1024),
         };
         let mut manager = ContextManager::new("s", None).with_tool_output_policy(policy);
         manager.record_message(&Message::system("system"));
@@ -9849,3 +9944,80 @@ mod tests {
 #[cfg(test)]
 #[path = "context_journal_tests.rs"]
 mod context_journal_tests;
+
+#[cfg(test)]
+mod bounded_tool_projection_tests {
+    use super::*;
+
+    fn call(name: &str) -> Message {
+        let mut message = Message::assistant("");
+        message.tool_calls = Some(vec![ToolCall {
+            id: "call_budget".into(),
+            name: name.into(),
+            arguments: json!({"cmd": "inspect", "command": "inspect"}),
+            metadata: None,
+        }]);
+        message
+    }
+
+    #[test]
+    fn bounded_tool_projection_default_follows_each_execution_budget() {
+        for name in [
+            "read_file",
+            "bash",
+            "shell",
+            "exec_command",
+            "web_search",
+            "search",
+            "unknown_tool",
+        ] {
+            let budget = octos_core::tool_output_limit(name);
+            let raw = format!("{}\nend-of-bounded-result", "x".repeat(budget - 100));
+            let mut manager = ContextManager::new("projection", None);
+            manager.record_message(&call(name));
+            manager.record_tool_output("call_budget", name, &raw);
+            let frame = manager.for_prompt(&PromptBuildPolicy::default());
+            let delivered = frame
+                .messages
+                .iter()
+                .find(|m| m.role == MessageRole::Tool)
+                .unwrap();
+            assert_eq!(
+                delivered.content, raw,
+                "{name}: a result within the execution budget must reach the model intact"
+            );
+            assert!(frame.report.truncated_item_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn bounded_tool_projection_over_budget_recording_and_persisted_merge_agree() {
+        let raw = "x".repeat(octos_core::tool_output_limit("shell") + 5_000);
+        let mut manager = ContextManager::new("projection", None);
+        let call = call("shell");
+        let output = Message::tool_with_thread(raw, "call_budget", octos_core::ThreadId::new("t"));
+        manager.record_message(&call);
+        manager.record_message(&output);
+        let before = manager.items().len();
+        manager.record_persisted_message_merging_prompt_equivalent(&call, 0);
+        manager.record_persisted_message_merging_prompt_equivalent(&output, 1);
+        assert_eq!(
+            manager.items().len(),
+            before,
+            "persisted probes must resolve the same tool budget and target before truncating"
+        );
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let delivered = frame
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .unwrap();
+        assert!(delivered.content.starts_with(&"x".repeat(20_000)));
+        assert!(delivered.content.contains("bytes omitted"));
+        assert_eq!(
+            manager.tool_output_by_call_id("call_budget").as_deref(),
+            Some(output.content.as_str())
+        );
+        assert!(delivered.content.ends_with("[truncated]"));
+    }
+}

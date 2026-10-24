@@ -180,6 +180,165 @@ async fn request_user_input_emits_structured_metadata_event() {
 
 struct FakeSpawnTool;
 
+/// A native response can race an unrelated supervisor registration before
+/// reaching an alias. Only the returned ID belongs to this invocation.
+struct RacingSpawnTool {
+    omit_handle: bool,
+}
+
+#[async_trait::async_trait]
+impl Tool for RacingSpawnTool {
+    fn name(&self) -> &str {
+        "spawn"
+    }
+    fn description(&self) -> &str {
+        "spawn with an interleaved unrelated registration"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    async fn execute(&self, _: &Value) -> Result<ToolResult> {
+        unreachable!()
+    }
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let supervisor = ctx.task_supervisor.as_ref().unwrap();
+        let task_id = supervisor.register_with_input(
+            "spawn",
+            "requested",
+            ctx.parent_session_key.as_deref(),
+            Some(args.clone()),
+        );
+        supervisor.mark_completed(&task_id, vec!["requested.txt".into()]);
+        // Deterministically reproduce the interleaving that a concurrent
+        // registration can create while native dispatch is awaited.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let unrelated = supervisor.register_with_input(
+            "spawn",
+            "unrelated",
+            ctx.parent_session_key.as_deref(),
+            None,
+        );
+        supervisor.mark_completed(&unrelated, vec!["unrelated.txt".into()]);
+        Ok(ToolResult {
+            output: "native launch succeeded".into(),
+            success: true,
+            structured_metadata: (!self.omit_handle)
+                .then(|| json!({"task_id": task_id, "agent_id": task_id})),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn spawn_aliases_use_returned_handle_not_newest_concurrent_registration() {
+    for name in ["spawn_agent", "delegate"] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(RacingSpawnTool { omit_handle: false });
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:race".into()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                name,
+                &json!({"task":"requested work", "role":"reviewer", "timeout_ms": 100}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).unwrap();
+        let returned = supervisor
+            .get_task(payload["agent_id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            returned.output_files,
+            vec!["requested.txt"],
+            "{name} returned an unrelated task"
+        );
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["task_id"],
+            payload["agent_id"]
+        );
+        let unrelated = supervisor
+            .get_all_tasks()
+            .into_iter()
+            .find(|task| task.output_files == vec!["unrelated.txt"])
+            .unwrap();
+        assert!(
+            unrelated.role.is_none(),
+            "alias must not stamp the unrelated task's role"
+        );
+    }
+}
+
+#[tokio::test]
+async fn spawn_alias_without_returned_handle_never_adopts_an_unrelated_task() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::with_builtins(temp.path());
+    registry.register(RacingSpawnTool { omit_handle: true });
+    let supervisor = registry.supervisor();
+    let ctx = ToolContext {
+        task_supervisor: Some(supervisor.clone()),
+        ..ToolContext::zero()
+    };
+    let result = registry
+        .execute_with_context(
+            &ctx,
+            "spawn_agent",
+            &json!({"task":"requested", "role":"reviewer"}),
+        )
+        .await
+        .unwrap();
+    assert!(!result.success);
+    assert_eq!(
+        result.structured_metadata.unwrap()["reason"],
+        "spawn_missing_task_id"
+    );
+    assert!(
+        supervisor
+            .get_all_tasks()
+            .iter()
+            .all(|task| task.role.is_none())
+    );
+    assert!(result.output.contains("may already be running"));
+}
+
+#[tokio::test]
+async fn spawn_alias_accepts_completed_inline_backends_without_adopting_a_task() {
+    for args in [
+        json!({"task":"requested", "mode":"sync"}),
+        json!({"task":"requested", "backend":"agent_mcp"}),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(RacingSpawnTool { omit_handle: true });
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(&ctx, "spawn_agent", &args)
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(payload["status"], "completed");
+        assert!(payload.get("agent_id").is_none());
+        assert!(result.structured_metadata.unwrap().get("task_id").is_none());
+        assert!(
+            supervisor
+                .get_all_tasks()
+                .iter()
+                .all(|task| task.role.is_none())
+        );
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for FakeSpawnTool {
     fn name(&self) -> &str {
@@ -210,6 +369,7 @@ impl Tool for FakeSpawnTool {
         Ok(ToolResult {
             output: "spawned fake worker".to_string(),
             success: true,
+            structured_metadata: Some(json!({"task_id": task_id, "agent_id": task_id})),
             ..Default::default()
         })
     }
@@ -233,7 +393,11 @@ async fn spawn_agent_delegates_to_registered_spawn_tool() {
             &json!({
                 "message": "inspect parity",
                 "agent_type": "worker",
-                "reasoning_effort": "high"
+                "reasoning_effort": "high",
+                "max_iterations": 0,
+                "owned_paths": ["output/review"],
+                "isolation": "shared",
+                "skill_paths": ["skills/example/SKILL.md", "tools/TOOLS.md"]
             }),
         )
         .await
@@ -246,6 +410,13 @@ async fn spawn_agent_delegates_to_registered_spawn_tool() {
     assert_eq!(input["task"], "inspect parity");
     assert_eq!(input["label"], "codex-worker");
     assert_eq!(input["role"], crate::ROLE_IMPLEMENTER);
+    assert_eq!(input["max_iterations"], 0);
+    assert_eq!(input["owned_paths"], json!(["output/review"]));
+    assert_eq!(input["isolation"], "shared");
+    assert_eq!(
+        input["skill_paths"],
+        json!(["skills/example/SKILL.md", "tools/TOOLS.md"])
+    );
     assert!(
         input["additional_instructions"]
             .as_str()
@@ -1036,6 +1207,7 @@ async fn m14_c_wiring_delegate_pre_expands_role_allow_list_per_971() {
             &json!({
                 "role": "reviewer",
                 "task": "audit PR #1234",
+                "owned_paths": ["output/delegate-review"],
                 "timeout_ms": 5_000,
             }),
         )
@@ -1055,6 +1227,7 @@ async fn m14_c_wiring_delegate_pre_expands_role_allow_list_per_971() {
         .find(|t| t.tool_name == "spawn" || t.tool_name == "spawn_agent")
         .expect("task registered");
     let input = task.tool_input.expect("tool input recorded");
+    assert_eq!(input["owned_paths"], json!(["output/delegate-review"]));
     let allowed = input["allowed_tools"]
         .as_array()
         .expect("allowed_tools array on delegate spawn payload");

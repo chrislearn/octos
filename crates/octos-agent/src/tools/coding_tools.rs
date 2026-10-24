@@ -1018,6 +1018,10 @@ fn normalize_spawn_agent_args_with_role(
             "context",
             "model",
             "context_window",
+            "max_iterations",
+            "skill_paths",
+            "owned_paths",
+            "isolation",
             "additional_instructions",
             "workflow",
             "backend",
@@ -1233,15 +1237,13 @@ fn normalize_spawn_agent_args_with_role(
     Value::Object(out)
 }
 
-fn newest_spawned_task(
-    supervisor: &crate::task_supervisor::TaskSupervisor,
-    before: &HashSet<String>,
-) -> Option<crate::task_supervisor::BackgroundTask> {
-    supervisor
-        .get_all_tasks()
-        .into_iter()
-        .filter(|task| !before.contains(&task.id))
-        .max_by_key(|task| task.started_at)
+fn spawned_task_id(result: &ToolResult) -> Option<&str> {
+    let metadata = result.structured_metadata.as_ref()?;
+    metadata
+        .get("task_id")
+        .or_else(|| metadata.get("agent_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
 }
 
 async fn spawn_agent_without_delegate(args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
@@ -1328,6 +1330,17 @@ impl Tool for SpawnAgentTool {
                 "role": {"type": "string"},
                 "mode": {"type": "string", "enum": ["background", "sync"]},
                 "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                "skill_paths": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Canonical instruction files the child must read through its permitted tools."
+                },
+                "owned_paths": {"type": "array", "items": {"type": "string"},
+                    "description": "Native shared-worker exclusive output paths; forwarded unchanged to spawn ownership admission."},
+                "isolation": {"type": "string", "enum": ["shared", "worktree"]},
+                "max_iterations": {
+                    "type": "integer", "minimum": 0,
+                    "description": "Optional iteration limit; 0 or omitted is unlimited. Host policy takes precedence."
+                },
                 "role": {
                     "type": "string",
                     "description": "Optional backend-owned role template that resolves to a tool budget + sandbox + model preference + prompt prefix. When set, the resolved template seeds the spawn payload; inline `allowed_tools` still wins.",
@@ -1419,27 +1432,36 @@ impl Tool for SpawnAgentTool {
             return spawn_agent_without_delegate(args, ctx).await;
         };
         let spawn_args = normalize_spawn_agent_args_with_role(args, role_template);
-        let before = ctx
-            .task_supervisor
-            .as_ref()
-            .map(|supervisor| {
-                supervisor
-                    .get_all_tasks()
-                    .into_iter()
-                    .map(|task| task.id)
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
         let result = delegate.execute_with_context(ctx, &spawn_args).await?;
         if !result.success {
             return Ok(result);
         }
-        let task = ctx
-            .task_supervisor
-            .as_ref()
-            .and_then(|supervisor| newest_spawned_task(supervisor, &before));
+        // Correlate this invocation by its returned native handle. Snapshot
+        // differences/newest-task heuristics can select a concurrent sibling.
+        let task = spawned_task_id(&result).and_then(|id| {
+            ctx.task_supervisor
+                .as_ref()
+                .and_then(|supervisor| supervisor.get_task(id))
+        });
+        // The external agent_mcp backend completes its dispatch inline even
+        // when the caller omitted mode; it has no native supervised handle.
+        let completes_inline = spawn_args.get("mode").and_then(Value::as_str) == Some("sync")
+            || spawn_args.get("backend").and_then(Value::as_str) == Some("agent_mcp");
+        if task.is_none() && !completes_inline {
+            return Ok(ToolResult {
+                output: format!(
+                    "spawn_agent: native spawn returned no resolvable supervised task_id. The worker may already be running; do not blindly respawn. Native output: {}",
+                    result.output
+                ),
+                success: false,
+                structured_metadata: Some(
+                    json!({"codex_tool": "spawn_agent", "reason": "spawn_missing_task_id"}),
+                ),
+                ..Default::default()
+            });
+        }
         let mut payload = json!({
-            "status": "started",
+            "status": if task.is_some() { "started" } else { "completed" },
             "output": result.output,
         });
         let mut resolved_task_id: Option<String> = None;
@@ -1549,6 +1571,10 @@ impl Tool for SpawnAgentTool {
             "octos_tool": "spawn",
             "spawn_args": spawn_args.clone(),
         });
+        if let Some(task_id) = resolved_task_id {
+            meta["task_id"] = json!(task_id);
+            meta["agent_id"] = json!(task_id);
+        }
         if let Some(template) = role_template {
             meta["role"] = json!(template.name);
             meta["role_summary"] = serde_json::to_value(template.summary()).unwrap_or(Value::Null);
@@ -1714,7 +1740,8 @@ fn collect_agent_statuses(
             None => json!({
                 "agent_id": target,
                 "status": "unknown",
-                "terminal": true,
+                "terminal": false,
+                "error": "Task not found. Use the task ID returned by spawn or the id from check_background_tasks, not a label.",
             }),
         })
         .collect();
@@ -1725,16 +1752,28 @@ fn collect_agent_statuses(
 }
 
 async fn wait_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
-    let input: AgentTargetInput =
-        serde_json::from_value(args.clone()).unwrap_or(AgentTargetInput {
-            target: None,
-            agent_id: None,
-            targets: Vec::new(),
-            timeout_ms: None,
-        });
+    let input: AgentTargetInput = match serde_json::from_value(args.clone()) {
+        Ok(input) => input,
+        Err(error) => {
+            return Ok(ToolResult {
+                output: format!("Invalid wait_agent arguments: {error}"),
+                success: false,
+                ..Default::default()
+            });
+        }
+    };
     let mut targets = input.targets;
     if let Some(target) = input.target.or(input.agent_id) {
         targets.push(target);
+    }
+    if targets.is_empty() || targets.iter().any(|target| target.trim().is_empty()) {
+        return Ok(ToolResult {
+            output:
+                "wait_agent requires at least one nonempty task ID in targets, target, or agent_id"
+                    .to_owned(),
+            success: false,
+            ..Default::default()
+        });
     }
     let Some(supervisor) = ctx.task_supervisor.as_ref() else {
         return Ok(ToolResult {
@@ -1747,14 +1786,15 @@ async fn wait_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Resul
     let started = Instant::now();
     let statuses = loop {
         let (statuses, all_terminal) = collect_agent_statuses(supervisor, &targets);
-        if all_terminal || started.elapsed() >= Duration::from_millis(timeout_ms) {
+        let has_unknown = statuses.iter().any(|status| status["status"] == "unknown");
+        if has_unknown || all_terminal || started.elapsed() >= Duration::from_millis(timeout_ms) {
             break statuses;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     Ok(ToolResult {
         output: json!({ "agents": statuses }).to_string(),
-        success: true,
+        success: statuses.iter().all(|status| status["status"] != "unknown"),
         ..Default::default()
     })
 }
@@ -2386,6 +2426,8 @@ struct DelegateInput {
     task: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    owned_paths: Vec<String>,
 }
 
 const DEFAULT_DELEGATE_TIMEOUT_MS: u64 = 300_000;
@@ -2463,6 +2505,8 @@ impl Tool for DelegateAliasTool {
                     "type": "string",
                     "description": "Task description for the subagent"
                 },
+                "owned_paths": {"type": "array", "items": {"type": "string"},
+                    "description": "Exclusive output paths forwarded to native spawn; required for shared writers under host claim policy."},
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1000,
@@ -2597,13 +2641,9 @@ impl Tool for DelegateAliasTool {
             "mode": "background",
             "role": template.name,
             "allowed_tools": template.to_spawn_compatible_allow(),
+            "owned_paths": input.owned_paths,
         });
 
-        let before: HashSet<String> = supervisor
-            .get_all_tasks()
-            .into_iter()
-            .map(|task| task.id)
-            .collect();
         let spawn_result = spawn_agent.execute_with_context(ctx, &spawn_args).await?;
         if !spawn_result.success {
             return Ok(ToolResult {
@@ -2618,7 +2658,9 @@ impl Tool for DelegateAliasTool {
                 ..Default::default()
             });
         };
-        let Some(task_record) = newest_spawned_task(&supervisor, &before) else {
+        let Some(task_record) =
+            spawned_task_id(&spawn_result).and_then(|id| supervisor.get_task(id))
+        else {
             return Ok(ToolResult {
                 output: "delegate: spawn_agent did not register a new task with the supervisor"
                     .to_string(),
@@ -2692,6 +2734,7 @@ impl Tool for DelegateAliasTool {
                 "codex_tool": "delegate",
                 "role": template.name,
                 "agent_id": agent_id,
+                "task_id": agent_id,
                 "artifacts": artifacts,
                 "terminal": terminal,
             })),
@@ -3795,3 +3838,83 @@ fn catalog_score(entry: &ToolCatalogEntry, query: &str, tokens: &[String]) -> i3
 #[cfg(test)]
 #[path = "coding_tools_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod background_handle_contract {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext {
+            task_supervisor: Some(Arc::new(crate::TaskSupervisor::new())),
+            ..ToolContext::zero()
+        }
+    }
+
+    #[tokio::test]
+    async fn should_reject_unknown_task_handles_without_claiming_completion() {
+        let ctx = context();
+        let result = wait_agent_body(
+            &WaitAgentTool,
+            &json!({"targets":["friendly-label"], "timeout_ms":0}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.success, "a label is not a supervisor handle");
+        let value: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["agents"][0]["status"], "unknown");
+        assert_eq!(value["agents"][0]["terminal"], false);
+        assert!(
+            value["agents"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_preserve_known_states_and_reject_a_mixed_unknown_wait() {
+        let ctx = context();
+        let supervisor = ctx.task_supervisor.as_ref().unwrap();
+        let running = supervisor.register("work", "running", None);
+        supervisor.mark_running(&running);
+        let done = supervisor.register("work", "done", None);
+        supervisor.mark_completed(&done, vec![]);
+        let valid = wait_agent_body(
+            &WaitAgentTool,
+            &json!({"targets":[running, done], "timeout_ms":0}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(valid.success);
+        let value: Value = serde_json::from_str(&valid.output).unwrap();
+        assert_eq!(value["agents"][0]["status"], "running");
+        assert_eq!(value["agents"][0]["terminal"], false);
+        assert_eq!(value["agents"][1]["status"], "completed");
+        assert_eq!(value["agents"][1]["terminal"], true);
+        let mixed = wait_agent_body(
+            &WaitAgentTool,
+            &json!({"targets":[done, "missing"], "timeout_ms":0}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!mixed.success);
+        let value: Value = serde_json::from_str(&mixed.output).unwrap();
+        assert_eq!(value["agents"][0]["terminal"], true);
+        assert_eq!(value["agents"][1]["terminal"], false);
+    }
+
+    #[tokio::test]
+    async fn should_reject_empty_or_malformed_wait_targets() {
+        let ctx = context();
+        for args in [json!({}), json!({"targets":[]}), json!({"targets":"bad"})] {
+            let result = wait_agent_body(&WaitAgentTool, &args, &ctx).await.unwrap();
+            assert!(
+                !result.success,
+                "invalid target lists cannot mean all work completed"
+            );
+        }
+    }
+}

@@ -1276,9 +1276,9 @@ fn bootstrap_session_policy(workspace_root: &Path) -> Result<()> {
 /// `max_tokens` defaults to `None`, and loop detection is non-terminal, so this
 /// cap is the only remaining backstop for an actively-looping agent. `50`
 /// restores the ceiling these lanes had before the default became unlimited;
-/// spawned sub-agents keep their own, higher default
-/// (`DEFAULT_SPAWN_MAX_ITERATIONS` in `octos-agent/src/tools/spawn.rs`). An
-/// explicit `0` in config still means unlimited.
+/// native spawned sub-agents resolve a separate dispatch policy (unlimited
+/// by default, with explicit request/host overrides). An explicit `0` in
+/// session config still means unlimited.
 pub(crate) const UNATTENDED_MAX_ITERATIONS_FALLBACK: u32 =
     super::turn_policy::AUTONOMOUS_MAX_ITERATIONS;
 
@@ -1286,8 +1286,8 @@ pub(crate) const UNATTENDED_MAX_ITERATIONS_FALLBACK: u32 =
 /// configured `gateway.max_iterations`, falling back to
 /// [`UNATTENDED_MAX_ITERATIONS_FALLBACK`] when unset. Session actors are an
 /// unattended lane, so they never inherit the unlimited interactive default;
-/// spawned sub-agents replace the budget with their own finite default at
-/// dispatch time.
+/// native spawned sub-agents resolve their separate dispatch policy instead
+/// of silently inheriting this unattended-session fallback.
 fn resolve_session_max_iterations(configured: Option<u32>) -> u32 {
     super::turn_policy::max_iterations(configured, super::turn_policy::TurnIntent::Autonomous)
 }

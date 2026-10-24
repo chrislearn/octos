@@ -996,6 +996,303 @@ async fn peer_polling_should_reset_no_progress_threshold_when_output_changes() {
     }
 }
 
+#[tokio::test]
+async fn should_finish_productive_work_without_independent_reflection_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses = Vec::new();
+    for index in 0..24 {
+        responses.push(tool_use(
+            vec![ToolCall {
+                id: format!("write_{index}"),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path":"work.txt", "content":format!("revision {index}")}),
+                metadata: None,
+            }],
+            10,
+            5,
+        ));
+    }
+    responses.push(end_turn("GENUINE-FINAL", 10, 5));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let mut tools = ToolRegistry::new();
+    tools.register(crate::tools::WriteFileTool::new(dir.path()));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("productive-default"), provider, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 64,
+            ..Default::default()
+        });
+    let response = agent
+        .process_message("produce the requested revisions", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(response.content, "GENUINE-FINAL");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("work.txt")).unwrap(),
+        "revision 23"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        25,
+        "only the 24 work calls and the final answer"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, c)| matches!(c.tool_choice, ToolChoice::Auto)),
+        "no hidden tools-disabled call"
+    );
+    assert!(
+        requests.iter().all(|(messages, _, _)| messages
+            .iter()
+            .all(|m| !m.content.contains("[FILE CHURN]")
+                && !m.content.contains("CONVERGENCE CHECKPOINT"))),
+        "edit counts alone do not establish failure"
+    );
+    assert_eq!(response.token_usage.input_tokens, 250);
+    for pair in requests.windows(2) {
+        assert!(
+            message_shape(&pair[1].0).starts_with(&message_shape(&pair[0].0)),
+            "ordinary requests extend the existing history without a reflection branch"
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_nudge_unchanged_peer_results_inline_without_reflection_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses = Vec::new();
+    for index in 0..4 {
+        responses.push(tool_use(
+            vec![ToolCall {
+                id: format!("peer_{index}"),
+                name: "peer_gather".into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }],
+            10,
+            5,
+        ));
+    }
+    responses.push(end_turn("GENUINE-FINAL", 10, 5));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let count = executions.clone();
+    let mut tools = ToolRegistry::new();
+    tools.register(crate::tools::PeerGatherTool::new(Arc::new(move |_| {
+        Ok(if count.fetch_add(1, AtomicOrdering::SeqCst) < 3 {
+            "still running"
+        } else {
+            "done: result"
+        }
+        .into())
+    })));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent =
+        Agent::new(AgentId::new("inline-peer"), provider, tools, memory).with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        });
+    let response = agent
+        .process_message("gather the actual peer result", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(response.content, "GENUINE-FINAL");
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 4);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, c)| matches!(c.tool_choice, ToolChoice::Auto))
+    );
+    assert!(
+        requests[3]
+            .0
+            .iter()
+            .any(|m| m.role == MessageRole::Tool && m.content.contains("[PEER POLLING]")),
+        "actual unchanged results produce an inline warning"
+    );
+    assert!(
+        requests[4]
+            .0
+            .iter()
+            .any(|m| m.role == MessageRole::Tool && m.content.contains("done: result")),
+        "later progress must still be observed"
+    );
+    assert!(!agent.is_loop_detected_recently());
+}
+
+/// A generic observer, deliberately not a peer-named exception.
+struct StateSequenceTool {
+    outputs: Vec<String>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for StateSequenceTool {
+    fn name(&self) -> &str {
+        "inspect_state"
+    }
+    fn description(&self) -> &str {
+        "Observe changing external state"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object", "properties":{"key":{"type":"string"}}})
+    }
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        let index = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(ToolResult {
+            output: self.outputs[index].clone(),
+            success: true,
+            ..Default::default()
+        })
+    }
+}
+
+async fn run_result_feedback_case(cases: &[(&str, &str)], expect_hint: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses: Vec<_> = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (key, _))| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("state_{index}"),
+                    name: "inspect_state".into(),
+                    arguments: serde_json::json!({"key":key}),
+                    metadata: None,
+                }],
+                10,
+                5,
+            )
+        })
+        .collect();
+    responses.push(end_turn("GENUINE-FINAL", 10, 5));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(StateSequenceTool {
+        outputs: cases
+            .iter()
+            .map(|(_, output)| (*output).to_owned())
+            .collect(),
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("result-feedback"), provider, tools, memory).with_config(
+        AgentConfig {
+            max_iterations: 20,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let response = agent
+        .process_message("observe the actual results", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        calls.load(AtomicOrdering::SeqCst),
+        cases.len(),
+        "do not skip observations before seeing their results"
+    );
+    assert_eq!(response.content, "GENUINE-FINAL");
+    assert!(!agent.is_loop_detected_recently());
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), cases.len() + 1, "no extra reflection calls");
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, c)| matches!(c.tool_choice, ToolChoice::Auto))
+    );
+    let actual_results: Vec<_> = requests
+        .last()
+        .unwrap()
+        .0
+        .iter()
+        .filter(|m| m.role == MessageRole::Tool)
+        .collect();
+    assert_eq!(actual_results.len(), cases.len());
+    for (message, (_, expected)) in actual_results.iter().zip(cases) {
+        assert!(
+            message.content.starts_with(expected),
+            "preserve the real tool result"
+        );
+    }
+    assert_eq!(
+        actual_results
+            .iter()
+            .any(|m| m.content.contains("[NO PROGRESS]")),
+        expect_hint
+    );
+}
+
+#[tokio::test]
+async fn result_feedback_should_allow_generic_polling_with_changed_results() {
+    run_result_feedback_case(
+        &[
+            ("job", "running: 1"),
+            ("job", "running: 2"),
+            ("job", "done"),
+        ],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn result_feedback_should_warn_inline_and_observe_later_completion() {
+    run_result_feedback_case(
+        &[
+            ("job", "running"),
+            ("job", "running"),
+            ("job", "running"),
+            ("job", "done"),
+        ],
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn result_feedback_should_warn_on_result_cycles_without_skipping_work() {
+    run_result_feedback_case(
+        &[
+            ("a", "unchanged a"),
+            ("b", "unchanged b"),
+            ("a", "unchanged a"),
+            ("b", "unchanged b"),
+            ("a", "unchanged a"),
+            ("b", "unchanged b"),
+            ("a", "done"),
+        ],
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn result_feedback_should_allow_alternating_calls_with_progress() {
+    run_result_feedback_case(
+        &[
+            ("a", "a1"),
+            ("b", "b1"),
+            ("a", "a2"),
+            ("b", "b2"),
+            ("a", "a3"),
+            ("b", "b3"),
+            ("a", "done"),
+        ],
+        false,
+    )
+    .await;
+}
+
 /// The checkpoint request must be the action request plus appended rows:
 /// same `context_management`, same reasoning effort (Anthropic derives the
 /// `thinking` budget from `max_tokens`, so the output cap must not change it
@@ -5527,13 +5824,13 @@ async fn process_message_fires_loop_warning_once_then_terminal_error() {
     let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
     let tools = ToolRegistry::with_builtins(dir.path());
     let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let agent = Agent::new(AgentId::new("burst"), provider, tools, memory).with_config(
-        crate::AgentConfig {
+    let agent = Agent::new(AgentId::new("burst"), provider, tools, memory)
+        .with_config(crate::AgentConfig {
             max_iterations: 30,
             save_episodes: false,
             ..Default::default()
-        },
-    );
+        })
+        .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
 
     let first = agent.process_message("loop please", &[], vec![]).await;
     // Either the loop warning surfaced, or the recover_shell_retry path
@@ -5798,13 +6095,13 @@ async fn doom_loop_aborts_turn_when_third_identical_call_arrives() {
     let provider_arc: Arc<dyn LlmProvider> = provider.clone();
     let tools = ToolRegistry::with_builtins(dir.path());
     let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
-        crate::AgentConfig {
+    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory)
+        .with_config(crate::AgentConfig {
             max_iterations: 30,
             save_episodes: false,
             ..Default::default()
-        },
-    );
+        })
+        .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
 
     let result = agent
         .process_message("please loop", &[], vec![])
@@ -5983,13 +6280,13 @@ async fn alternating_cycle_still_uses_two_stage_warning_not_doom_abort() {
     let provider_arc: Arc<dyn LlmProvider> = provider.clone();
     let tools = ToolRegistry::with_builtins(dir.path());
     let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
-        crate::AgentConfig {
+    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory)
+        .with_config(crate::AgentConfig {
             max_iterations: 30,
             save_episodes: false,
             ..Default::default()
-        },
-    );
+        })
+        .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
 
     let result = agent
         .process_message("please alternate", &[], vec![])
@@ -6075,13 +6372,13 @@ async fn doom_loop_does_not_execute_the_tripping_call() {
         calls: exec_count.clone(),
     });
     let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
-        crate::AgentConfig {
+    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory)
+        .with_config(crate::AgentConfig {
             max_iterations: 30,
             save_episodes: false,
             ..Default::default()
-        },
-    );
+        })
+        .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
 
     let result = agent
         .process_message("please loop", &[], vec![])
@@ -6098,6 +6395,48 @@ async fn doom_loop_does_not_execute_the_tripping_call() {
         "the tripping call must NOT execute; got {executions} executions \
              across {total_calls} LLM calls"
     );
+}
+
+#[tokio::test]
+async fn result_feedback_should_preserve_budget_on_endless_repetition() {
+    let dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(CountingAlwaysNamedToolProvider {
+        calls: AtomicUsize::new(0),
+        tool_name: "observe_job",
+    });
+    let mut tools = ToolRegistry::new();
+    tools.register(CountingEchoTool {
+        name: "observe_job",
+        output: "running",
+        calls: executions.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("bounded-poll"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        max_iterations: 5,
+        save_episodes: false,
+        ..Default::default()
+    });
+    let response = agent
+        .process_message("observe until the budget", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 5);
+    assert!(
+        provider.calls.load(AtomicOrdering::SeqCst) <= 6,
+        "budget allows at most one terminal grace call"
+    );
+    assert!(
+        !agent.is_loop_detected_recently(),
+        "budget stop must not be presented as proven looping"
+    );
+    assert!(!response.content.is_empty());
 }
 
 #[test]
@@ -9528,4 +9867,451 @@ async fn should_retry_request_timeout_in_same_turn_without_repeating_completed_t
 #[tokio::test]
 async fn should_preserve_completed_tool_rows_when_request_timeout_retries_exhaust() {
     assert_request_timeout_preserves_completed_tool(100).await;
+}
+
+// Native task loops must honor the same workspace compaction policy as chat.
+fn configured_compaction_policy() -> crate::compaction::CompactionPolicy {
+    crate::compaction::CompactionPolicy {
+        token_budget: 6_000,
+        preflight_threshold: Some(6_000),
+        ..Default::default()
+    }
+}
+
+fn configured_compaction_history(words_per_message: usize) -> Vec<Message> {
+    let filler = "word ".repeat(words_per_message);
+    (0..14)
+        .flat_map(|i| {
+            [
+                Message::user(format!("old question {i}: {filler}")),
+                Message::assistant(format!("old answer {i}: {filler}")),
+            ]
+        })
+        .collect()
+}
+
+async fn configured_compaction_agent(
+    dir: &std::path::Path,
+    responses: Vec<ChatResponse>,
+    policy: crate::compaction::CompactionPolicy,
+) -> (Agent, RecordedRequests, Arc<AtomicUsize>) {
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(responses, requests.clone()));
+    let memory = Arc::new(EpisodeStore::open(dir.join("memory")).await.unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner =
+        crate::compaction::CompactionRunner::new(policy).with_summarizer(CountingSummarizer {
+            calls: calls.clone(),
+        });
+    let agent = Agent::new(
+        AgentId::new("configured-compaction"),
+        provider,
+        ToolRegistry::with_builtins(dir),
+        memory,
+    )
+    .with_system_prompt("Complete the task.".to_string())
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_compaction_runner(Arc::new(runner))
+    .with_compaction_workspace(crate::workspace_policy::WorkspacePolicy::for_session())
+    .with_file_state_cache(Arc::new(crate::file_state_cache::FileStateCache::new()));
+    (agent, requests, calls)
+}
+
+fn configured_compaction_read(id: &str) -> ChatResponse {
+    tool_use(
+        vec![ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "visible.txt"}),
+            metadata: None,
+        }],
+        10,
+        5,
+    )
+}
+
+#[tokio::test]
+async fn configured_compaction_task_preflight_uses_workspace_budget_below_provider_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = configured_compaction_policy();
+    let (agent, requests, calls) =
+        configured_compaction_agent(dir.path(), vec![end_turn("done", 10, 5)], policy.clone())
+            .await;
+    let mut task = task_for("finish", dir.path());
+    task.context.working_memory = configured_compaction_history(400);
+    let initial = agent.build_initial_messages(&task).await;
+    let initial_tokens: u32 = initial
+        .iter()
+        .map(octos_llm::context::estimate_message_tokens)
+        .sum();
+    assert!(initial_tokens > policy.token_budget);
+    assert!(initial_tokens < agent.llm.context_window() / 2);
+
+    assert!(agent.run_task(&task).await.unwrap().success);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        calls.load(AtomicOrdering::SeqCst),
+        1,
+        "preflight must run before the first task request"
+    );
+    assert!(requests[0].0.len() < initial.len());
+    let sent_tokens: u32 = requests[0]
+        .0
+        .iter()
+        .map(octos_llm::context::estimate_message_tokens)
+        .sum();
+    assert!(
+        sent_tokens < initial_tokens,
+        "the provider must receive the compacted prompt"
+    );
+}
+
+#[tokio::test]
+async fn configured_compaction_task_runs_after_large_tool_result_without_provider_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("visible.txt"), "payload ".repeat(2_000)).unwrap();
+    let policy = configured_compaction_policy();
+    let (agent, requests, calls) = configured_compaction_agent(
+        dir.path(),
+        vec![
+            configured_compaction_read("read_large"),
+            end_turn("done", 10, 5),
+        ],
+        policy.clone(),
+    )
+    .await;
+    let mut task = task_for("read visible.txt", dir.path());
+    task.context.working_memory = configured_compaction_history(100);
+    let initial = agent.build_initial_messages(&task).await;
+    let initial_tokens: u32 = initial
+        .iter()
+        .map(octos_llm::context::estimate_message_tokens)
+        .sum();
+    assert!(
+        initial_tokens < policy.token_budget,
+        "preflight should have nothing to do"
+    );
+
+    assert!(agent.run_task(&task).await.unwrap().success);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0.len(), initial.len());
+    let tool_result = requests[1]
+        .0
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .unwrap();
+    assert!(
+        tool_result.content.contains("payload payload"),
+        "the real tool result must survive"
+    );
+    let uncompacted_tokens =
+        initial_tokens + octos_llm::context::estimate_message_tokens(tool_result);
+    assert!(uncompacted_tokens > policy.token_budget);
+    assert!(uncompacted_tokens < agent.llm.context_window() / 2);
+    assert_eq!(
+        calls.load(AtomicOrdering::SeqCst),
+        1,
+        "the second iteration must apply the workspace budget"
+    );
+    assert!(
+        requests[1].0.len() < requests[0].0.len(),
+        "old history must shrink before the next provider call"
+    );
+}
+
+#[tokio::test]
+async fn configured_compaction_task_leaves_context_manager_as_the_only_prompt_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("visible.txt"), "visible file body").unwrap();
+    let (agent, requests, calls) = configured_compaction_agent(
+        dir.path(),
+        vec![
+            configured_compaction_read("managed_read"),
+            end_turn("done", 10, 5),
+        ],
+        configured_compaction_policy(),
+    )
+    .await;
+    let phases = Arc::new(StdMutex::new(Vec::new()));
+    let agent = agent.with_prompt_context_manager(Arc::new(SpyPromptContextManager {
+        phases: phases.clone(),
+    }));
+    let mut task = task_for("read visible.txt", dir.path());
+    task.context.working_memory = configured_compaction_history(400);
+
+    assert!(agent.run_task(&task).await.unwrap().success);
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![PromptContextPhase::TurnStart, PromptContextPhase::Iteration]
+    );
+    for (messages, _) in requests.lock().unwrap().iter() {
+        for original in &task.context.working_memory {
+            assert!(
+                messages.iter().any(|m| m.content == original.content),
+                "legacy compaction must not preempt the manager"
+            );
+        }
+    }
+}
+
+async fn configured_compaction_prime_read(agent: &Agent) -> Vec<Message> {
+    let response = configured_compaction_read("first_read");
+    let (results, ..) = agent.execute_tools(&response).await.unwrap();
+    assert!(results[0].content.contains("visible file body"));
+    assert!(!results[0].content.contains("[FILE_UNCHANGED]"));
+    assert!(!agent.file_state_cache.as_ref().unwrap().is_empty());
+    let mut assistant = Message::assistant("");
+    assistant.tool_calls = Some(response.tool_calls);
+    let mut history = vec![
+        Message::system("Complete the task."),
+        Message::user("read visible.txt"),
+        assistant,
+    ];
+    history.extend(results);
+    history.push(Message::assistant("read complete"));
+    history
+}
+
+async fn configured_compaction_reread_after_preflight(task_mode: bool, prune: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("visible.txt"), "visible file body").unwrap();
+    let policy = crate::compaction::CompactionPolicy {
+        token_budget: 100_000,
+        preflight_threshold: Some(1),
+        prune_tool_results_after_turns: prune.then_some(1),
+        ..Default::default()
+    };
+    let (agent, requests, calls) = configured_compaction_agent(
+        dir.path(),
+        vec![
+            configured_compaction_read("second_read"),
+            end_turn("done", 10, 5),
+        ],
+        policy,
+    )
+    .await;
+    let history = configured_compaction_prime_read(&agent).await;
+    if task_mode {
+        let mut task = task_for("read visible.txt again", dir.path());
+        task.context.working_memory = history[1..].to_vec();
+        assert!(agent.run_task(&task).await.unwrap().success);
+    } else {
+        agent
+            .process_message("read visible.txt again", &history[1..], vec![])
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        calls.load(AtomicOrdering::SeqCst),
+        0,
+        "pruning alone returns no summary"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let first = requests[0]
+        .0
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .unwrap();
+    assert_eq!(
+        crate::compaction::ToolResultPlaceholder::from_placeholder_content(&first.content).is_ok(),
+        prune
+    );
+    let second = requests[1]
+        .0
+        .iter()
+        .rev()
+        .find(|m| m.role == MessageRole::Tool)
+        .unwrap();
+    assert_eq!(
+        second.content.contains("[FILE_UNCHANGED]"),
+        !prune,
+        "pruned reads must be fetched again; no-op checks must retain dedup: {}",
+        second.content
+    );
+    if prune {
+        assert!(second.content.contains("visible file body"));
+    }
+}
+
+#[tokio::test]
+async fn configured_compaction_parent_pruned_read_reaches_model_again() {
+    configured_compaction_reread_after_preflight(false, true).await;
+}
+
+#[tokio::test]
+async fn configured_compaction_task_pruned_read_reaches_model_again() {
+    configured_compaction_reread_after_preflight(true, true).await;
+}
+
+#[tokio::test]
+async fn configured_compaction_parent_noop_keeps_read_dedup() {
+    configured_compaction_reread_after_preflight(false, false).await;
+}
+
+#[tokio::test]
+async fn configured_compaction_task_noop_keeps_read_dedup() {
+    configured_compaction_reread_after_preflight(true, false).await;
+}
+
+struct CompactionVisibilityManager {
+    mode: &'static str,
+}
+
+impl PromptContextManager for CompactionVisibilityManager {
+    fn prepare_prompt(
+        &self,
+        _request: PromptContextRequest,
+        messages: &mut Vec<Message>,
+    ) -> Result<PromptContextReport, String> {
+        let before = messages.len();
+        if self.mode.contains("prune") || self.mode == "replace" {
+            for message in messages.iter_mut().filter(|m| m.role == MessageRole::Tool) {
+                message.content = "[prior tool result compacted]".to_string();
+            }
+        } else if self.mode == "append" {
+            messages.push(Message::user("canonical tail"));
+        }
+        if self.mode.contains("error") {
+            return Err("test bridge error".to_string());
+        }
+        Ok(PromptContextReport {
+            prompt_replaced: true,
+            compaction_performed: self.mode.contains("prune") || self.mode == "reported_compaction",
+            messages_before: before,
+            messages_after: messages.len(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn configured_compaction_cache_tracks_actual_visibility_across_all_compaction_paths() {
+    use crate::compaction::{CompactionPolicy, CompactionRunner};
+    use crate::compaction_tiered::{
+        ApiMicroCompactionConfig, MicroCompactionPolicy, Tier1Pass, TieredCompactionRunner,
+    };
+
+    for (mode, invalidated) in [
+        ("turn", true),
+        ("preflight_error", true),
+        ("preflight_error_noop", false),
+        ("tier1", true),
+        ("tier1_noop", false),
+        ("fallback", true),
+        ("legacy_trim", true),
+        ("old_outputs", true),
+        ("old_outputs_noop", false),
+        ("manager_prune", true),
+        ("manager_error_prune", true),
+        ("manager_replace", true),
+        ("manager_reported_compaction", false),
+        ("manager_noop", false),
+        ("manager_error", false),
+        ("manager_append", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("visible.txt"),
+            format!("{}\nvisible file body", "body ".repeat(300)),
+        )
+        .unwrap();
+        let (mut agent, _, _) = configured_compaction_agent(
+            dir.path(),
+            vec![],
+            CompactionPolicy {
+                token_budget: 100_000,
+                preflight_threshold: Some(1),
+                prune_tool_results_after_turns: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut messages = configured_compaction_prime_read(&agent).await;
+        messages.push(Message::user("next turn"));
+        messages.push(Message::assistant("recent reply"));
+        match mode {
+            "turn" => assert!(
+                agent
+                    .maybe_run_turn_compaction(&mut messages, 2)
+                    .unwrap()
+                    .is_none()
+            ),
+            "preflight_error" | "preflight_error_noop" => {
+                agent = agent.with_compaction_runner(Arc::new(CompactionRunner::new(
+                    CompactionPolicy {
+                        token_budget: 100_000,
+                        preflight_threshold: Some(1),
+                        prune_tool_results_after_turns: (mode == "preflight_error").then_some(1),
+                        preserved_invariants: vec!["missing invariant".to_string()],
+                        ..Default::default()
+                    },
+                )));
+                assert!(agent.maybe_run_preflight_compaction(&mut messages).is_err());
+            }
+            "tier1" | "tier1_noop" => {
+                agent = agent.with_tiered_compaction(Arc::new(TieredCompactionRunner::new(
+                    MicroCompactionPolicy {
+                        max_age_turns: 0,
+                        max_size_bytes_per_result: if invalidated { 1 } else { u32::MAX },
+                        pin_recent_files: 0,
+                        dedup_duplicate_reads: false,
+                    },
+                    ApiMicroCompactionConfig::default(),
+                    Box::new(CompactionRunner::new(CompactionPolicy::default())),
+                )));
+                assert_eq!(
+                    agent
+                        .run_tier1_compaction(&mut messages, &[], Tier1Pass::Full)
+                        .performed(),
+                    invalidated
+                );
+            }
+            "fallback" => assert!(agent.fallback_truncate(&mut messages, 40)),
+            "legacy_trim" => {
+                let filler = "word ".repeat((agent.llm.context_window() / 80) as usize);
+                for _ in 0..80 {
+                    messages.push(Message::assistant(filler.clone()));
+                }
+                assert!(agent.trim_to_context_window(&mut messages));
+            }
+            "old_outputs" | "old_outputs_noop" => {
+                if !invalidated {
+                    // A repeated truncation reports a repair but leaves identical text.
+                    super::super::message_repair::truncate_old_tool_results(&mut messages);
+                }
+                let mut turn = LoopTurnState::new(Instant::now());
+                prepare_conversation_messages(&agent, &mut messages, &mut turn);
+            }
+            _ => {
+                agent = agent.with_prompt_context_manager(Arc::new(CompactionVisibilityManager {
+                    mode: mode.strip_prefix("manager_").unwrap(),
+                }));
+                agent.prepare_prompt_with_context_manager(
+                    &mut messages,
+                    PromptContextPhase::Iteration,
+                    2,
+                );
+            }
+        }
+        let (reread, ..) = agent
+            .execute_tools(&configured_compaction_read("fresh_read"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reread[0].content.contains("[FILE_UNCHANGED]"),
+            !invalidated,
+            "{mode}: {}",
+            reread[0].content
+        );
+        if invalidated {
+            assert!(reread[0].content.contains("visible file body"), "{mode}");
+        }
+    }
 }

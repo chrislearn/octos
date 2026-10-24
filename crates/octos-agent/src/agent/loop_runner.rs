@@ -1151,6 +1151,10 @@ impl Agent {
                 let mut retry_state =
                     PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
                 let mut loop_detector = LoopDetector::new(12);
+                // Multiple edits may be productive. Count-only churn and its
+                // provider escalation belong to the explicitly opted-in old
+                // reflection mode; result-aware warnings remain on by default.
+                loop_detector.set_file_churn_enabled(convergence.standalone_enabled());
                 // #27d — turn-local malformed-tool-call feedback counter.
                 let mut malformed_feedback_used: u32 = 0;
                 // Tools may report that they have already exhausted all
@@ -1881,7 +1885,8 @@ impl Agent {
                             });
                         }
                         StopReason::ToolUse => {
-                            // Check for loop detection before executing
+                            // Terminal tool contracts always apply. Heuristic
+                            // pre-execution stops belong to legacy periodic mode.
                             for tc in &response.tool_calls {
                                 if terminal_tools_for_turn.contains(&tc.name) {
                                     self.emit_cost_update(&turn, &response, attributed_cost);
@@ -1905,7 +1910,14 @@ impl Agent {
                                         pending_approval: None,
                                     });
                                 }
-                                // #1765 doom-loop guard: 3+ CONSECUTIVE
+                                // Identical calls can observe changing external
+                                // state. Inline mode checks the actual results
+                                // in handle_tool_use and leaves the next action
+                                // to the ordinary model request.
+                                if !convergence.standalone_enabled() {
+                                    continue;
+                                }
+                                // Legacy #1765 doom-loop guard: 3+ CONSECUTIVE
                                 // identical tool calls (same name + identical
                                 // arguments JSON) abort the turn before the
                                 // next LLM call. Checked ahead of the cycle
@@ -2773,6 +2785,15 @@ impl Agent {
                 if grace_iteration {
                     tools_spec.clear();
                 }
+                // Native workers inherit the workspace policy, including a
+                // budget smaller than the provider's context window. Apply it
+                // on entry just as the conversational loop does. A wired
+                // ContextManager remains the sole prompt owner.
+                if iteration == 1 {
+                    if let Some(summary) = self.maybe_run_preflight_compaction(&mut messages)? {
+                        self.save_conversation_episode(summary).await;
+                    }
+                }
                 // M8.5 tier 1: also runs in task mode so background workers
                 // benefit from the same cheap shrinkage before their LLM call.
                 let protected_ids = collect_protected_tool_call_ids(&messages);
@@ -2782,6 +2803,14 @@ impl Agent {
                 // window before the trim reads context_window().
                 self.llm.ensure_ready().await;
                 prepare_task_messages(self, &mut messages, &mut turn);
+                // Tool results can cross the workspace budget long before a
+                // provider overflow. Compact before the next model request.
+                if let Some(summary) = self
+                    .maybe_run_turn_compaction(&mut messages, iteration)
+                    .map_err(|error| attach_partial_usage(error, turn.total_usage().clone()))?
+                {
+                    self.save_conversation_episode(summary).await;
+                }
                 self.prepare_prompt_with_context_manager(
                     &mut messages,
                     if iteration == 1 {
@@ -3524,14 +3553,10 @@ impl Agent {
             blocked_messages,
         );
 
-        // PR #1363: OpenClaw-style no-progress check. For each Tool
-        // message we just produced, record `(tool_name, args, result)`
-        // in the result-aware ring. If the last 3 records match, append
-        // a soft NO_PROGRESS hint to that tool message's content so the
-        // LLM sees it on its next iteration. Distinguishes a stuck loop
-        // (identical (args, result) repeated) from a legitimate poll
-        // (same args, evolving result). Non-terminating — the hard
-        // cycle detector at the caller's pre-call site is the backstop.
+        // Record executed `(tool_name, args, text result)` tuples. Repeated
+        // one- to three-step patterns append a soft hint to the real result.
+        // The next ordinary model request can act on it. A changing result
+        // breaks repetition; identical text does not prove semantic failure.
         {
             use std::collections::HashMap;
             let id_to_call: HashMap<&str, (&str, &serde_json::Value)> = response

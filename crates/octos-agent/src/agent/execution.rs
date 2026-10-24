@@ -642,6 +642,10 @@ impl Agent {
         // shared file-state cache.
         let agent_definitions = self.agent_definitions.clone();
         let file_state_cache = self.file_state_cache.clone();
+        // The caller can be dropped (for example a sync spawn timeout) while
+        // this separately scheduled tool is still writing. Move its lease into
+        // the task before scheduling, so it also covers a not-yet-polled task.
+        let execution_lifetime_guard = self.execution_lifetime_guard.clone();
         // M8 fix-first item 8 (gap 4b): if the agent carries a resolved
         // profile envelope, derive a ToolPermissions record once per turn
         // and clone it into every ToolContext. Today's pre-M8 default
@@ -711,6 +715,7 @@ impl Agent {
         let captured_router_ctx = octos_llm::current_router_context();
 
         tokio::spawn(async move {
+            let _execution_lifetime_guard = execution_lifetime_guard;
             let tool_start = Instant::now();
             debug!(tool = %tc_name, tool_id = %tc_id, "executing tool");
 
@@ -1083,7 +1088,11 @@ impl Agent {
                 // so the in-flight pipeline/LLM/web_search await is DROPPED at
                 // the next poll and the worker terminates promptly.
                 let cancel_token = bg_supervisor.cancel_token(&task_id);
+                // The spawn-only result returns before this second future
+                // finishes; retain ownership in the actual tool worker too.
+                let bg_execution_lifetime_guard = _execution_lifetime_guard.clone();
                 tokio::spawn(async move {
+                    let _execution_lifetime_guard = bg_execution_lifetime_guard;
                     let _terminal_guard = terminal_guard;
                     bg_supervisor.mark_running(&task_id);
                     // M8.7 (item 4): start a periodic-summary watcher for
@@ -3646,6 +3655,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     use std::sync::Arc;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use octos_core::{AgentId, ToolCall};
@@ -3816,6 +3826,186 @@ mod tests {
 
     struct DropAwareExclusiveTool {
         dropped: Arc<AtomicBool>,
+    }
+
+    struct ExecutionLeaseDropSignal(Arc<AtomicBool>);
+
+    impl Drop for ExecutionLeaseDropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct HeldWriterTool {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        finished: Arc<tokio::sync::Notify>,
+        output: std::path::PathBuf,
+        exclusive: bool,
+    }
+
+    #[async_trait]
+    impl Tool for HeldWriterTool {
+        fn name(&self) -> &str {
+            "held_writer"
+        }
+
+        fn description(&self) -> &str {
+            "write only after the test releases the native tool future"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn concurrency_class(&self) -> crate::tools::ConcurrencyClass {
+            if self.exclusive {
+                crate::tools::ConcurrencyClass::Exclusive
+            } else {
+                crate::tools::ConcurrencyClass::Safe
+            }
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            self.started.notify_one();
+            self.release.notified().await;
+            std::fs::write(&self.output, "written after caller exit")?;
+            self.finished.notify_one();
+            Ok(ToolResult {
+                output: "writer finished".into(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn execution_lease_survives_caller_exit(exclusive: bool, spawn_only: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("owned-output");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let lease_released = Arc::new(AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(HeldWriterTool {
+            started: started.clone(),
+            release: release.clone(),
+            finished: finished.clone(),
+            output: output.clone(),
+            exclusive,
+        });
+        if spawn_only {
+            tools.mark_spawn_only("held_writer", None);
+        }
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("lease-writer"),
+            Arc::new(NoChatProvider),
+            tools,
+            memory,
+        )
+        .with_execution_lifetime_guard(Arc::new(ExecutionLeaseDropSignal(lease_released.clone())));
+        let caller = tokio::spawn(async move {
+            let response = ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![tool_call("call_write", "held_writer")],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            };
+            agent.execute_tools(&response).await.unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        if spawn_only {
+            tokio::time::timeout(Duration::from_secs(5), caller)
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            // This drops the caller and Agent exactly as an outer registry
+            // timeout drops a synchronous spawn. Native tool tasks may survive.
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+        }
+        let released_before_writer_exited = lease_released.load(Ordering::SeqCst);
+        assert!(!output.exists());
+        // Drain the detached task even on RED, so failure does not leave a
+        // background writer behind or confuse cleanup with ownership release.
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), finished.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !lease_released.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap(),
+            "written after caller exit"
+        );
+        assert!(
+            !released_before_writer_exited,
+            "ownership was released while the native writer could still modify its output"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_execution_lease_when_serial_writer_outlives_caller() {
+        execution_lease_survives_caller_exit(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn should_keep_execution_lease_when_parallel_writer_outlives_caller() {
+        execution_lease_survives_caller_exit(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn should_keep_execution_lease_when_spawn_only_writer_outlives_caller() {
+        execution_lease_survives_caller_exit(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn should_release_execution_lease_when_native_tool_abort_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("aborted-output");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let lease_released = Arc::new(AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(HeldWriterTool {
+            started: started.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+            finished: Arc::new(tokio::sync::Notify::new()),
+            output: output.clone(),
+            exclusive: true,
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("abort-writer"),
+            Arc::new(NoChatProvider),
+            tools,
+            memory,
+        )
+        .with_execution_lifetime_guard(Arc::new(ExecutionLeaseDropSignal(lease_released.clone())));
+        let handle = agent.spawn_tool_task(
+            &tool_call("call_abort", "held_writer"),
+            false,
+            &crate::tools::TurnAttachmentContext::default(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        drop(agent);
+        assert!(!lease_released.load(Ordering::SeqCst));
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(lease_released.load(Ordering::SeqCst));
+        assert!(!output.exists(), "cancelled writer must not have written");
     }
 
     #[async_trait]
