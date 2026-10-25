@@ -1273,6 +1273,9 @@ impl Agent {
                     // Retry once on transient failure (e.g. ominix-api restart)
                     if let Ok(ref r) = result {
                         if !r.success
+                            && bg_tools
+                                .get(&bg_name)
+                                .is_some_and(|tool| tool.retry_background_on_transient_error())
                             && (r.output.contains("error sending request")
                                 || r.output.contains("connection refused"))
                         {
@@ -2435,6 +2438,27 @@ impl Agent {
                 }
             };
 
+            // Preserve adapter identity before model-facing sanitization,
+            // which deliberately redacts long hex strings such as SHA-256.
+            let tool_structured_metadata = match (
+                crate::automatic_jobs::receipt(
+                    &tc_name,
+                    &content,
+                    tool_structured_metadata.as_ref(),
+                ),
+                tool_structured_metadata,
+            ) {
+                (Some(job), Some(serde_json::Value::Object(mut metadata))) => {
+                    metadata.insert(
+                        "octos_external_job".into(),
+                        job.metadata()["octos_external_job"].clone(),
+                    );
+                    Some(serde_json::Value::Object(metadata))
+                }
+                (Some(job), None) => Some(job.metadata()),
+                (_, metadata) => metadata,
+            };
+
             // After-tool hooks. Hook FEEDBACK (a checker reporting
             // diagnostics — see HookResult::Feedback) reaches the model:
             // appended to the tool message below AFTER truncation so it
@@ -2759,7 +2783,7 @@ impl Agent {
         let mut success_by_id: Vec<(String, bool)> = Vec::with_capacity(results.len());
 
         for (
-            message,
+            mut message,
             tool_files_modified,
             tool_files_to_send,
             tool_tokens,
@@ -2768,6 +2792,21 @@ impl Agent {
             _cascades,
         ) in results
         {
+            if success
+                && !self.steer_input_pending()
+                && let Some(call) = response
+                    .tool_calls
+                    .iter()
+                    .find(|call| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+            {
+                self.observe_external_job_result(
+                    call,
+                    &mut message,
+                    tool_structured_metadata.as_ref().map(|(_, value)| value),
+                    &turn_attachment_ctx,
+                )
+                .await;
+            }
             // Pair every executed tool result with its `tool_call_id` so
             // downstream gating logic does not need to guess at the
             // identity from content shape.
@@ -2795,6 +2834,102 @@ impl Agent {
             structured_metadata,
             success_by_id,
         ))
+    }
+
+    /// Admit receipt observation without fabricating an assistant tool call.
+    /// Approval-gated watches must be requested explicitly through the normal
+    /// suspend/resume path; tool output cannot grant itself human approval.
+    async fn observe_external_job_result(
+        &self,
+        call: &octos_core::ToolCall,
+        message: &mut Message,
+        metadata: Option<&serde_json::Value>,
+        attachments: &crate::tools::TurnAttachmentContext,
+    ) {
+        const WATCH: &str = "watch_external_job";
+        if call.name == WATCH
+            || !self.tools.is_spawn_only(WATCH)
+            || !self.tools.is_tool_model_reachable(WATCH)
+        {
+            return;
+        }
+        let Some(job) = crate::automatic_jobs::receipt(&call.name, &message.content, metadata)
+        else {
+            return;
+        };
+        let gateway =
+            self.tools.is_dispatch_gateway("run_tool") && self.tools.is_tool_visible("run_tool");
+        let permissions = self
+            .profile
+            .as_deref()
+            .map(crate::tools::ToolPermissions::from_profile)
+            .unwrap_or_default();
+        if !permissions.is_tool_allowed(WATCH)
+            || (gateway && !permissions.is_tool_allowed("run_tool"))
+        {
+            return;
+        }
+        if self
+            .config
+            .human_approval_rules
+            .as_ref()
+            .is_some_and(|rules| {
+                rules.matching_rule(WATCH).is_some()
+                    || (gateway && rules.matching_rule("run_tool").is_some())
+            })
+        {
+            message.content.push_str("\n[Runtime] External job observation requires approval. Request watch_external_job explicitly through the available tool interface; the submitted job must not be resubmitted.");
+            return;
+        }
+        let key = job.key();
+        if !self.tools.claim_automatic_job(&key) {
+            return;
+        }
+        let mut watch = octos_core::ToolCall {
+            id: format!("{}-auto-watch", call.id),
+            name: WATCH.into(),
+            arguments: job.arguments(),
+            metadata: None,
+        };
+        if gateway {
+            watch.arguments = serde_json::json!({"name": WATCH, "arguments": watch.arguments});
+            watch.name = "run_tool".into();
+        }
+        let request = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![watch],
+            stop_reason: octos_llm::StopReason::ToolUse,
+            usage: Default::default(),
+            provider_index: None,
+        };
+        let (admitted, blocked) = self.enforce_session_limits_on_tool_calls(&request);
+        if let Some(watch) = admitted.tool_calls.first() {
+            let native = self.effective_tool_call(watch);
+            match self.spawn_tool_task(&native, true, attachments).await {
+                Ok((handle, _, _, _, true, _, _)) => {
+                    message.content.push_str("\n[Runtime] External job watch registered automatically. Continue independent work; completion arrives as a notification. ");
+                    message.content.push_str(&handle.content);
+                    return;
+                }
+                Ok((refused, _, _, _, _, _, _)) => {
+                    message
+                        .content
+                        .push_str("\n[Runtime] Automatic job observation unavailable: ");
+                    message.content.push_str(&refused.content);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "automatic job watcher registration failed");
+                    message.content.push_str("\n[Runtime] Automatic job observation could not start. Inspect the existing receipt; do not resubmit the external job.");
+                }
+            }
+        } else {
+            for refusal in blocked {
+                message.content.push('\n');
+                message.content.push_str(&refusal.content);
+            }
+        }
+        self.tools.release_automatic_job(&key);
     }
 
     /// Serial dispatch core (M8.8): run `calls` one at a time, in order.

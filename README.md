@@ -249,6 +249,8 @@ results without changing the advertised tool list. Authorized capabilities,
 batched reads, images and agent coordination remain available.
 See [dispatcher usage](docs/fixed-tool-dispatcher.md) and the
 [capability audit](docs/tool-capabilities.md).
+[External-job receipts](docs/external-job-completion.md) can register background
+completion notifications without model polling.
 
 The kernel executes filesystem, shell, web, and MCP tools under the host's tool
 policy and platform sandbox configuration. Host-configured lifecycle hooks can
