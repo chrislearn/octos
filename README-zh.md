@@ -214,6 +214,7 @@ Octos 管理会话标识、工作区作用域、对话历史和已提交事件�
 两个固定入口。可选工具的参数说明通过对话结果返回，发现工具时不会改写工具声明列表。
 已授权的工具能力、批量读取、图片和 Agent 协作均保留。详见
 [固定调度入口说明](docs/fixed-tool-dispatcher.md)与[工具能力审查](docs/tool-capabilities.md)。
+[外部任务回执](docs/external-job-completion.md)可自动登记后台完成通知，无需模型反复查询。
 
 内核按照宿主的工具策略与平台沙箱配置执行文件系统、shell、Web 和 MCP 工具。
 宿主配置的生命周期 hooks 可以在模型调用和工具执行前后介入。OUP 暴露执行过程与

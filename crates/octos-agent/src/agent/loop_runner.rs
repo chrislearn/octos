@@ -725,7 +725,7 @@ impl Agent {
         }
     }
 
-    fn enforce_session_limits_on_tool_calls(
+    pub(super) fn enforce_session_limits_on_tool_calls(
         &self,
         response: &ChatResponse,
     ) -> (ChatResponse, Vec<Message>) {

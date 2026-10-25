@@ -20,9 +20,9 @@ use super::{
     ConfigureToolTool, DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool,
     ImageGenerationTool, ListDirTool, ReadFileTool, RequestUserInputTool, ResumeAgentTool,
     SendInputTool, ShellTool, SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore, ToolResult,
-    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WebFetchTool,
-    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
-    WriteStdinTool,
+    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool,
+    WatchExternalJobTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
+    WorkspaceShowTool, WriteFileTool, WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -243,6 +243,7 @@ pub struct ToolRegistry {
     supervisor: Arc<TaskSupervisor>,
     /// Set to true when any spawn_only tool is actually invoked in this agent run.
     spawn_only_invoked: Arc<std::sync::atomic::AtomicBool>,
+    automatic_job_claims: std::sync::Mutex<HashSet<String>>,
     /// #1148 codex P2: shared live catalog cell used by `tool_search` /
     /// `tool_suggest`. Updated on every mutation (`register`,
     /// `register_arc`, `apply_policy`, `mark_spawn_only`, etc.) so
@@ -330,6 +331,7 @@ impl ToolRegistry {
             background_result_sender: None,
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            automatic_job_claims: std::sync::Mutex::new(HashSet::new()),
             live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: None,
@@ -616,6 +618,24 @@ impl ToolRegistry {
     /// Reset the spawn_only_invoked flag (call at start of each agent run).
     pub fn reset_spawn_only_invoked(&self) {
         self.spawn_only_invoked.store(false, Ordering::SeqCst);
+    }
+
+    /// Registry/session-local deduplication, bounded and independent of model
+    /// calls. Rebinding/snapshotting a workspace starts with fresh claims.
+    pub(crate) fn claim_automatic_job(&self, key: &str) -> bool {
+        let Ok(mut claims) = self.automatic_job_claims.lock() else {
+            return false;
+        };
+        if claims.len() >= 512 {
+            return false;
+        }
+        claims.insert(key.to_string())
+    }
+
+    pub(crate) fn release_automatic_job(&self, key: &str) {
+        if let Ok(mut claims) = self.automatic_job_claims.lock() {
+            claims.remove(key);
+        }
     }
 
     /// Check if a tool came from a plugin binary.
@@ -1072,12 +1092,12 @@ impl ToolRegistry {
     ///   preserves today's behaviour byte-for-byte.
     /// - [`crate::profile::ProfileTools::AllowList`] — keeps tools whose
     ///   names match the allow list (plain name, `group:<id>`, or
-    ///   `<prefix>*` wildcard). Any tool marked `spawn_only` is retained
-    ///   regardless — they carry background-execution wiring the runtime
-    ///   depends on.
+    ///   `<prefix>*` wildcard). Host-installed `spawn_only` wiring is retained
+    ///   unless its tool opts out via `preserve_background_registration`;
+    ///   built-in optional observers are filtered normally.
     /// - [`crate::profile::ProfileTools::DenyList`] — drops tools matching
     ///   any deny list entry (same matching rules). Spawn-only tools are
-    ///   likewise preserved.
+    ///   likewise preserved unless the tool opts out.
     ///
     /// The filter runs in-place. Cache invalidation is handled by
     /// [`ToolRegistry::retain`]. Intended to be called as a post-build
@@ -1085,6 +1105,16 @@ impl ToolRegistry {
     pub fn filter_by_profile(&mut self, tools: &crate::profile::ProfileTools) {
         use crate::profile::ProfileTools;
 
+        let preserved: HashSet<String> = self
+            .spawn_only
+            .iter()
+            .filter(|name| {
+                self.tools
+                    .get(*name)
+                    .is_some_and(|tool| tool.preserve_background_registration())
+            })
+            .cloned()
+            .collect();
         match tools {
             ProfileTools::Default => {
                 // No-op — the default mode is the behaviour-parity path.
@@ -1102,10 +1132,9 @@ impl ToolRegistry {
                     );
                     return;
                 }
-                let spawn_only = self.spawn_only.clone();
                 let allow_entries: Vec<String> = allow.clone();
                 self.retain(|name| {
-                    spawn_only.contains(name)
+                    preserved.contains(name)
                         || allow_entries
                             .iter()
                             .any(|entry| policy::entry_matches(entry, name))
@@ -1115,10 +1144,9 @@ impl ToolRegistry {
                 if deny.is_empty() {
                     return;
                 }
-                let spawn_only = self.spawn_only.clone();
                 let deny_entries: Vec<String> = deny.clone();
                 self.retain(|name| {
-                    spawn_only.contains(name)
+                    preserved.contains(name)
                         || !deny_entries
                             .iter()
                             .any(|entry| policy::entry_matches(entry, name))
@@ -1226,6 +1254,7 @@ impl ToolRegistry {
             // wiring installed on the parent.
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            automatic_job_claims: std::sync::Mutex::new(HashSet::new()),
             live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: self.output_dir_hint.clone(),
@@ -1551,6 +1580,13 @@ impl ToolRegistry {
                 .with_bash_file_writes(permissions.bash_file_writes),
         );
         registry.register(WriteStdinTool);
+        registry.register(
+            WatchExternalJobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope),
+        );
+        registry.mark_spawn_only(
+            "watch_external_job",
+            Some(super::watch_external_job::START_MESSAGE.into()),
+        );
         registry.register(UpdatePlanTool);
         registry.register(RequestUserInputTool);
         // UPCR-2026-023: structured AskUserQuestion. The synchronous,
@@ -1716,6 +1752,7 @@ impl ToolRegistry {
         // doesn't keep running commands under the old project root.
         "bash",
         "read_file",
+        "watch_external_job",
         "write_file",
         "apply_patch",
         "edit_file",
@@ -1772,6 +1809,17 @@ impl ToolRegistry {
         registry.sandbox = sandbox.clone();
         registry.filesystem_scope = permissions.filesystem_scope;
         // Re-register cwd-bound tools with the new workspace
+        if self.get("watch_external_job").is_some() {
+            registry.register(
+                WatchExternalJobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope),
+            );
+            if self.is_spawn_only("watch_external_job") {
+                registry.mark_spawn_only(
+                    "watch_external_job",
+                    Some(super::watch_external_job::START_MESSAGE.into()),
+                );
+            }
+        }
         registry.register(
             ShellTool::new(cwd)
                 .with_shared_sandbox(sandbox.clone())

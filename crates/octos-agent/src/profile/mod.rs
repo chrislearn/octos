@@ -102,8 +102,8 @@ pub enum ProfileSource {
 ///   profiles that strip a single capability (e.g. drop `web_fetch` from
 ///   an otherwise-default set).
 ///
-/// `spawn_only` tools are *never* filtered out regardless of mode — they
-/// carry background-execution wiring that the runtime depends on.
+/// Host-installed `spawn_only` wiring is normally retained regardless of mode.
+/// Optional built-in observers opt out of that retention and are filtered.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ProfileTools {
@@ -131,8 +131,8 @@ impl ProfileTools {
     /// Mirrors [`crate::tools::ToolRegistry::filter_by_profile`]'s
     /// name-matching exactly — `group:<id>` expansion, `<prefix>*`
     /// wildcards, exact names, and the empty-allow-list pass-through —
-    /// but deliberately WITHOUT the spawn_only carve-out. Once a
-    /// spawn_only tool is registered it can never be evicted by the
+    /// but deliberately WITHOUT the legacy spawn_only carve-out. A background
+    /// tool that preserves its registration cannot be evicted by the
     /// filter, so bootstrap sites (chat/acp `run_pipeline`) consult this
     /// predicate FIRST and skip registration when the profile excludes
     /// the tool.
