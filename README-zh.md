@@ -214,6 +214,10 @@ Octos 管理会话标识、工作区作用域、对话历史和已提交事件�
 批量读取文件、图片与网页，并一起获取 Agent 状态和结果。详见
 [工具审查与使用说明](docs/compact-tool-surface.md)。
 
+使用 `octos chat --profile coding-dispatch`，向模型固定提供四个常用工具及
+`discover_tools` / `run_tool` 两个入口。可选工具的参数说明通过对话结果返回，
+发现工具时不会改写工具声明列表。详见[固定调度入口说明](docs/fixed-tool-dispatcher.md)。
+
 内核按照宿主的工具策略与平台沙箱配置执行文件系统、shell、Web 和 MCP 工具。
 宿主配置的生命周期 hooks 可以在模型调用和工具执行前后介入。OUP 暴露执行过程与
 需要决定的节点，让应用提供自己的审批界面，或将已授权范围内的决定交给控制 Agent。

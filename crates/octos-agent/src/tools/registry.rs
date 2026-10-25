@@ -182,12 +182,15 @@ pub const RESERVED_BUILTIN_TOOL_NAMES: &[&str] = &[
     "view_video",
     "tool_search",
     "configure_tool",
+    "discover_tools",
+    "run_tool",
 ];
 
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     compact_surface: bool,
+    fixed_dispatcher: bool,
     workspace_root: Option<PathBuf>,
     /// The filesystem reach the cwd-bound tools were registered with. The
     /// request build reads this (#2480) so media paths are only re-walked
@@ -317,6 +320,7 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             compact_surface: false,
+            fixed_dispatcher: false,
             workspace_root: None,
             provider_policy: None,
             context_filter: None,
@@ -806,7 +810,9 @@ impl ToolRegistry {
         if self.internal_hidden.contains(name) {
             return false;
         }
-        self.is_tool_visible_post_activation(name) && self.compact_surface_includes(name)
+        self.is_tool_visible_post_activation(name)
+            && self.compact_surface_includes(name)
+            && self.dispatch_surface_includes(name)
     }
 
     /// Select canonical model-facing entry points, without changing the host's
@@ -814,6 +820,55 @@ impl ToolRegistry {
     pub fn set_compact_surface(&mut self, enabled: bool) {
         self.compact_surface = enabled;
         self.invalidate_cache();
+    }
+
+    /// Opt in to four common tools plus two stable discovery/invocation tools.
+    /// Registration is presentation only: host and profile lists still apply.
+    pub fn set_fixed_dispatcher(&mut self, enabled: bool) {
+        self.fixed_dispatcher = enabled;
+        if enabled {
+            self.register(super::dispatcher::DiscoverTools);
+            self.register(super::dispatcher::RunTool);
+        } else {
+            for name in ["discover_tools", "run_tool"] {
+                if self.is_dispatch_gateway(name) {
+                    self.tools.remove(name);
+                }
+            }
+        }
+        self.invalidate_cache();
+    }
+
+    fn dispatch_surface_includes(&self, name: &str) -> bool {
+        !self.fixed_dispatcher
+            || !(self.is_tool_visible_post_activation("run_tool")
+                && self.is_tool_visible_post_activation("discover_tools"))
+            || super::dispatcher::DIRECT.contains(&name)
+    }
+
+    /// Includes optional tools reachable via the fixed gateway.
+    pub fn is_tool_model_reachable(&self, name: &str) -> bool {
+        self.is_tool_visible(name)
+            || (self.fixed_dispatcher
+                && self.is_tool_visible("run_tool")
+                && self.is_tool_visible_post_activation(name)
+                && self.get(name).is_some_and(|tool| tool.is_available()))
+    }
+
+    pub(super) fn dispatch_catalog(
+        &self,
+        permissions: &super::ToolPermissions,
+    ) -> Vec<(String, String)> {
+        self.tools
+            .values()
+            .filter(|tool| {
+                self.is_tool_visible_post_activation(tool.name())
+                    && tool.is_available()
+                    && permissions.is_tool_allowed(tool.name())
+                    && !self.is_dispatch_gateway(tool.name())
+            })
+            .map(|tool| (tool.name().to_string(), tool.description().to_string()))
+            .collect()
     }
 
     fn compact_surface_includes(&self, name: &str) -> bool {
@@ -909,6 +964,7 @@ impl ToolRegistry {
             })
             .filter(|t| self.active_context_allows(t.as_ref()))
             .filter(|t| self.compact_surface_includes(t.name()))
+            .filter(|t| self.dispatch_surface_includes(t.name()))
             .map(|t| ToolSpec {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -1200,6 +1256,7 @@ impl ToolRegistry {
         let mut snapshot = Self {
             tools,
             compact_surface: self.compact_surface,
+            fixed_dispatcher: self.fixed_dispatcher,
             // Carried, not reset: a snapshot that EXCLUDES the MCP tools would
             // otherwise replace the last owner and let the transport die when
             // the original registry drops. Cheap — one Arc per server.
@@ -1357,6 +1414,24 @@ impl ToolRegistry {
         name: &str,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
+        let resolved;
+        let (name, args) = if name == "run_tool" && self.is_dispatch_gateway(name) {
+            resolved = self.resolve_dispatch_call(
+                &octos_core::ToolCall {
+                    id: ctx.tool_id.clone(),
+                    name: name.to_string(),
+                    arguments: args.clone(),
+                    metadata: None,
+                },
+                &ctx.permissions,
+            )?;
+            (resolved.name.as_str(), &resolved.arguments)
+        } else {
+            (name, args)
+        };
+        if name == "discover_tools" && self.is_dispatch_gateway(name) {
+            return self.discover_tools(args, &ctx.permissions);
+        }
         if !self.host_tool_allowlist_permits(name) {
             eyre::bail!("tool '{}' is not in this session's tool list", name);
         }
@@ -1620,8 +1695,10 @@ impl ToolRegistry {
         registry.register(ImageGenerationTool::new());
         // Model presentation is independent from authorization. An explicit
         // host/profile allowlist still applies; this switch never broadens it.
-        if std::env::var("OCTOS_TOOL_SURFACE").is_ok_and(|value| value == "compact") {
-            registry.set_compact_surface(true);
+        match std::env::var("OCTOS_TOOL_SURFACE").as_deref() {
+            Ok("compact") => registry.set_compact_surface(true),
+            Ok("dispatcher") => registry.set_fixed_dispatcher(true),
+            _ => {}
         }
         // Final refresh so the catalog reflects the just-registered
         // search/suggest tools too (cosmetic — they show up in their

@@ -356,6 +356,8 @@ impl McpClient {
     const PROTECTED_NAMES: &[&str] = &[
         "shell",
         "read_file",
+        "discover_tools",
+        "run_tool",
         "write_file",
         "edit_file",
         "diff_edit",

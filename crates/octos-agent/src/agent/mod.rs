@@ -10,6 +10,7 @@ pub use budget::result_md_owner_content_is_peer;
 mod compaction;
 mod convergence;
 mod detection;
+mod dispatch;
 mod execution;
 mod llm_call;
 mod loop_compaction;

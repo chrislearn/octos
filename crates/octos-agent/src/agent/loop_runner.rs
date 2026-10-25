@@ -757,25 +757,34 @@ impl Agent {
                 continue;
             }
 
-            let call_allowed = check_per_tool_limit(&usage, tool_call.name.as_str(), limits);
+            let effective = self.effective_tool_call(tool_call);
+            let limiting_name = if !check_per_tool_limit(&usage, &tool_call.name, limits) {
+                &tool_call.name
+            } else {
+                &effective.name
+            };
+            let call_allowed = check_per_tool_limit(&usage, limiting_name, limits);
             if call_allowed {
                 if !recorded_round {
                     usage.record_tool_round();
                     recorded_round = true;
                 }
                 usage.record_tool_call(&tool_call.name);
+                if effective.name != tool_call.name {
+                    usage.record_tool_call(&effective.name);
+                }
                 allowed_calls.push(tool_call.clone());
             } else {
                 let max_calls = limits
                     .per_tool_limits
-                    .get(&tool_call.name)
+                    .get(limiting_name)
                     .copied()
                     .unwrap_or_default();
                 blocked_messages.push(session_limit_message(
                     tool_call,
                     format!(
                         "[SESSION LIMIT] Tool '{}' exceeded its workflow limit (max {}). Do not retry this tool in this run.",
-                        tool_call.name, max_calls
+                        limiting_name, max_calls
                     ),
                 ));
             }
@@ -1887,7 +1896,8 @@ impl Agent {
                         StopReason::ToolUse => {
                             // Terminal tool contracts always apply. Heuristic
                             // pre-execution stops belong to legacy periodic mode.
-                            for tc in &response.tool_calls {
+                            for raw_call in &response.tool_calls {
+                                let tc = self.effective_tool_call(raw_call);
                                 if terminal_tools_for_turn.contains(&tc.name) {
                                     self.emit_cost_update(&turn, &response, attributed_cost);
                                     warn!(
@@ -2380,7 +2390,7 @@ impl Agent {
                             let current_iter_has_spawn_only = response
                                 .tool_calls
                                 .iter()
-                                .any(|tc| self.tools.is_spawn_only(&tc.name));
+                                .any(|tc| self.tools.is_spawn_only(&self.effective_tool_call(tc).name));
                             if current_iter_has_spawn_only {
                                 // Fleet-UX soak B4 (mini1 / dspfac, 2026-05-22):
                                 // when the LLM called a spawn_only tool AND
@@ -2489,6 +2499,7 @@ impl Agent {
                                     // for the same reason — it stays in
                                     // lock-step with what the LLM observed.
                                     let supervisor = self.tools.supervisor();
+                                    let sanitized_response = self.effective_tool_response(&sanitized_response);
                                     for tc in &sanitized_response.tool_calls {
                                         if self.tools.is_spawn_only(&tc.name) {
                                             supervisor.mark_synth_ack_emitted(&tc.id);
@@ -3342,7 +3353,8 @@ impl Agent {
             let orig_len = response.tool_calls.len();
             let mut seen_calls = std::collections::HashSet::new();
             response.tool_calls.retain(|tc| {
-                let key = format!("{}:{}", tc.name, tc.arguments);
+                let effective = self.effective_tool_call(tc);
+                let key = format!("{}:{}", effective.name, effective.arguments);
                 seen_calls.insert(key)
             });
             if response.tool_calls.len() < orig_len {
@@ -3354,6 +3366,8 @@ impl Agent {
         }
         let assistant_msg = self.response_to_message(&response);
         messages.push(assistant_msg.clone());
+        let wire_response = response;
+        let response = self.effective_tool_response(&wire_response);
 
         // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): human-approval
         // interception. When any callable tool call in this batch matches a
@@ -3364,14 +3378,21 @@ impl Agent {
         // executed non-matching peers): not executing anything around a
         // gated call is simpler and strictly safer.
         if let Some(rules) = self.config.human_approval_rules.as_ref() {
-            let matched = response
-                .tool_calls
-                .iter()
-                .find(|tc| {
-                    self.tools.get(&tc.name).is_some() && rules.matching_rule(&tc.name).is_some()
-                })
-                .map(|tc| (tc.name.clone(), tc.id.clone(), tc.arguments.clone()));
-            if let Some((matched_name, matched_id, matched_args)) = matched {
+            let matched = response.tool_calls.iter().find_map(|tc| {
+                self.tools.get(&tc.name)?;
+                let outer = wire_response
+                    .tool_calls
+                    .iter()
+                    .find(|raw| raw.id == tc.id)?;
+                let rule = rules
+                    .matching_rule(&tc.name)
+                    .or_else(|| rules.matching_rule(&outer.name))?;
+                let mut rule = rule.clone();
+                rule.tools = vec![tc.name.clone()];
+                Some((tc.name.clone(), tc.id.clone(), tc.arguments.clone(), rule))
+            });
+            if let Some((matched_name, matched_id, matched_args, rule)) = matched {
+                let rules = crate::approval::HumanApprovalRules::new(vec![rule]);
                 let has_resume_host = pending_approval_out.is_some();
                 let outcome = rules.draft_for_tool_call(
                     &matched_name,
@@ -3441,7 +3462,7 @@ impl Agent {
                                  host; denying instead of suspending"
                             );
                         }
-                        return Ok(response);
+                        return Ok(wire_response);
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -3466,14 +3487,15 @@ impl Agent {
                             log.extend(placeholders.iter().cloned());
                         }
                         messages.extend(placeholders);
-                        return Ok(response);
+                        return Ok(wire_response);
                     }
                 }
             }
         }
 
         let (limited_response, blocked_messages) =
-            self.enforce_session_limits_on_tool_calls(&response);
+            self.enforce_session_limits_on_tool_calls(&wire_response);
+        let limited_response = self.effective_tool_response(&limited_response);
         let tool_batches = split_tool_calls(
             &limited_response.tool_calls,
             MAX_PARALLEL_TOOL_CALLS_PER_BATCH,
@@ -3653,7 +3675,7 @@ impl Agent {
         // Codex round-3: return the sanitized response so the caller's
         // synth-ack gate sees the SAME tool_call_ids that the success-bit
         // sink was keyed by. See doc-comment on this fn.
-        Ok(response)
+        Ok(wire_response)
     }
 }
 
@@ -4031,12 +4053,15 @@ fn resolve_shell_command_key(messages: &[Message], tool_msg_index: usize) -> Opt
                 .iter()
                 .find(|tool_call| tool_call.id == tool_call_id)
                 .map(|tool_call| {
-                    tool_call
-                        .arguments
+                    let (_, arguments) = crate::tools::dispatcher::logical_call(
+                        &tool_call.name,
+                        &tool_call.arguments,
+                    );
+                    arguments
                         .get("command")
                         .and_then(|value| value.as_str())
                         .map(|command| command.split_whitespace().collect::<Vec<_>>().join(" "))
-                        .unwrap_or_else(|| tool_call.arguments.to_string())
+                        .unwrap_or_else(|| arguments.to_string())
                 })
         })
     })
@@ -4094,7 +4119,9 @@ fn resolve_tool_name(messages: &[Message], tool_msg_index: usize) -> Option<&str
             tool_calls
                 .iter()
                 .find(|tool_call| tool_call.id == tool_call_id)
-                .map(|tool_call| tool_call.name.as_str())
+                .map(|tool_call| {
+                    crate::tools::dispatcher::logical_call(&tool_call.name, &tool_call.arguments).0
+                })
         })
     })
 }

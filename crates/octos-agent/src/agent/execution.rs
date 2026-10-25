@@ -611,6 +611,25 @@ impl Agent {
         explicit_send_file_requested: bool,
         turn_attachment_ctx: &crate::tools::TurnAttachmentContext,
     ) -> JoinHandle<ToolCallResult> {
+        // Only invalid/unavailable wrappers reach this point: valid dispatch
+        // was resolved before batch admission. Never let an argument-modifying
+        // hook repair a wrapper after native concurrency/approval checks.
+        if tool_call.name == "run_tool" && self.tools.is_dispatch_gateway("run_tool") {
+            let permissions = self
+                .profile
+                .as_deref()
+                .map(crate::tools::ToolPermissions::from_profile)
+                .unwrap_or_default();
+            let reason = self
+                .tools
+                .resolve_dispatch_call(tool_call, &permissions)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unresolved dispatcher invocation".into());
+            let mut result = cancelled_result(tool_call);
+            result.0.content = format!("Error: {reason}");
+            return tokio::spawn(async move { result });
+        }
         // Clone Arc-wrapped fields so the spawned task is 'static
         let tools = self.tools.clone();
         // Peer-goal soak fix: pre-clone the real LLM provider + this agent's
@@ -2084,13 +2103,13 @@ impl Agent {
                 // via `read_task_output`.
                 //
                 // Codex P2 (round 1+2): gate the envelope on the
-                // `read_task_output` tool actually being VISIBLE to the
-                // LLM in this turn — registered AND not filtered out by
+                // `read_task_output` being reachable directly or via the
+                // fixed dispatcher — registered AND not filtered out by
                 // provider policy / deferred set / context tag filter.
                 // Otherwise the envelope advertises a tool the LLM was
                 // not offered. Fall back to the legacy free-text message
                 // for those entry points.
-                let handle_payload = if tools.is_tool_visible("read_task_output") {
+                let handle_payload = if tools.is_tool_model_reachable("read_task_output") {
                     tools.spawn_only_handle_message(&tc_name, &task_id_for_handle, &[])
                 } else {
                     tools.spawn_only_message(&tc_name)
@@ -2569,6 +2588,8 @@ impl Agent {
         // started" bubble alongside it.
         Vec<(String, bool)>,
     )> {
+        let effective = self.effective_tool_response(response);
+        let response = &effective;
         let tool_names: Vec<&str> = response
             .tool_calls
             .iter()
@@ -3834,6 +3855,59 @@ mod tests {
         for path in &messages[0].media {
             assert_eq!(std::fs::read(path).unwrap(), b"\x89PNG\r\n\x1a\n");
         }
+    }
+
+    #[tokio::test]
+    async fn fixed_dispatcher_native_timeout_cancels_mutation_and_drops_future() {
+        let dir = tempfile::tempdir().unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mutated = Arc::new(AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(DropAwareExclusiveTool {
+            dropped: dropped.clone(),
+        });
+        tools.register(MutatingTool {
+            mutated: mutated.clone(),
+        });
+        tools.set_fixed_dispatcher(true);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("dispatch-timeout"),
+            Arc::new(NoChatProvider),
+            tools,
+            memory,
+        )
+        .with_config(crate::AgentConfig {
+            default_interactive_tool_timeout_secs: 1,
+            tool_timeout_secs: 1,
+            ..Default::default()
+        });
+        let calls = ["drop_aware_exclusive_tool", "mutating_tool"]
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| ToolCall {
+                id: format!("call_{idx}"),
+                name: "run_tool".into(),
+                arguments: serde_json::json!({"name":name,"arguments":{}}),
+                metadata: None,
+            })
+            .collect();
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: calls,
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        let (messages, _, _, _, _, success) = agent.execute_tools(&response).await.unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(!mutated.load(Ordering::SeqCst));
+        assert!(messages[0].content.contains("drop_aware_exclusive_tool"));
+        assert_eq!(
+            success,
+            [("call_0".into(), false), ("call_1".into(), false)]
+        );
     }
 
     /// Sleeps far past the batch ceiling so the batch timeout always fires

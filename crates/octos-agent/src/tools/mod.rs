@@ -835,6 +835,7 @@ pub trait Tool: Send + Sync {
 }
 
 // Tool registry (extracted to its own module)
+pub(crate) mod dispatcher;
 /// Observe-only probe for the read-paging decision (changes no behaviour).
 pub(crate) mod read_paging_probe;
 pub(crate) mod read_window;

@@ -10315,3 +10315,319 @@ async fn configured_compaction_cache_tracks_actual_visibility_across_all_compact
         }
     }
 }
+
+fn dispatched_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "run_tool".into(),
+        arguments: serde_json::json!({"name":name,"arguments":arguments}),
+        metadata: None,
+    }
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_preserves_wire_history_schemas_and_image_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("test.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.set_fixed_dispatcher(true);
+    let expected_specs = serde_json::to_value(tools.specs()).unwrap();
+    let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+    let wrapped = dispatched_call(
+        "call_see",
+        "view_image",
+        serde_json::json!({"path":"test.png"}),
+    );
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_find".into(),
+                    name: "discover_tools".into(),
+                    arguments: serde_json::json!({"name":"view_image"}),
+                    metadata: None,
+                }],
+                1,
+                1,
+            ),
+            tool_use(vec![wrapped.clone()], 1, 1),
+            end_turn("done", 1, 1),
+        ],
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("dispatch-images"), provider, tools, memory);
+    let result = agent
+        .process_message("inspect image", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "done");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for (_, specs) in requests.iter() {
+        assert_eq!(serde_json::to_value(specs).unwrap(), expected_specs);
+    }
+    let final_history = &requests[2].0;
+    let actual = final_history
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().flatten())
+        .find(|call| call.id == "call_see")
+        .expect("original gateway call must remain in model history");
+    assert_eq!(actual.name, "run_tool");
+    assert_eq!(actual.arguments, wrapped.arguments);
+    let tool_message = final_history
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("call_see"))
+        .unwrap();
+    assert_eq!(tool_message.media.len(), 1, "{:?}", tool_message);
+    std::fs::write(&image, "overwritten").unwrap();
+    assert_eq!(
+        std::fs::read(&tool_message.media[0]).unwrap(),
+        b"\x89PNG\r\n\x1a\n"
+    );
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_native_and_gateway_limits_cannot_be_bypassed() {
+    for limited in ["alpha", "run_tool"] {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(CountingEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+            calls: calls.clone(),
+        });
+        tools.set_fixed_dispatcher(true);
+        let mut second = dispatched_call("two", "alpha", serde_json::json!({"different":true}));
+        if limited == "alpha" {
+            second.name = "alpha".into();
+            second.arguments = serde_json::json!({});
+        }
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use(
+                vec![dispatched_call("one", "alpha", serde_json::json!({}))],
+                1,
+                1,
+            ),
+            tool_use(vec![second], 1, 1),
+            end_turn("done", 1, 1),
+        ]));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("dispatch-limit"), provider, tools, memory)
+            .with_session_limits(crate::session::SessionLimits {
+                per_tool_limits: [(limited.into(), 1)].into(),
+                ..Default::default()
+            });
+        let result = agent.process_message("work", &[], vec![]).await.unwrap();
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "{limited}");
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[SESSION LIMIT]"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_approval_uses_native_identity_and_original_call_id() {
+    for rule_name in ["alpha", "run_tool"] {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(CountingEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+            calls: calls.clone(),
+        });
+        tools.set_fixed_dispatcher(true);
+        let provider = Arc::new(ScriptedProvider::new(vec![tool_use(
+            vec![dispatched_call("wrapped", "alpha", serde_json::json!({}))],
+            1,
+            1,
+        )]));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("dispatch-approval"), provider, tools, memory)
+            .with_config(AgentConfig {
+                human_approval_rules: Some(human_approval_rules_for(rule_name)),
+                ..Default::default()
+            });
+        let result = agent.process_message("work", &[], vec![]).await.unwrap();
+        let pending = result.pending_approval.unwrap();
+        assert_eq!(pending.request.tool_name, "alpha");
+        assert_eq!(pending.tool_id, "wrapped");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            result
+                .messages
+                .iter()
+                .flat_map(|m| m.tool_calls.iter().flatten())
+                .any(|call| call.name == "run_tool")
+        );
+        let pending = pending.into_pending("!room:example.org", "@alice:example.org");
+        let approved = agent.execute_approved_tool(&pending).await.unwrap();
+        assert!(approved.success);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fixed_dispatcher_hooks_see_native_tool_and_file_arguments() {
+    use crate::hooks::{HookConfig, HookEvent, HookExecutor};
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.set_fixed_dispatcher(true);
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_use(
+            vec![dispatched_call(
+                "write",
+                "write_file",
+                serde_json::json!({"path":"protected.txt","content":"bad"}),
+            )],
+            1,
+            1,
+        ),
+        end_turn("denied", 1, 1),
+    ]));
+    let hooks = Arc::new(HookExecutor::new(vec![HookConfig {
+        event: HookEvent::BeforeToolCall,
+        command: vec!["false".into()],
+        timeout_ms: 5000,
+        tool_filter: vec!["write_file".into()],
+        path_filter: vec!["protected.txt".into()],
+        requires_bin: None,
+    }]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent =
+        Agent::new(AgentId::new("dispatch-hook"), provider, tools, memory).with_hooks(hooks);
+    let result = agent.process_message("write", &[], vec![]).await.unwrap();
+    assert!(!dir.path().join("protected.txt").exists());
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Tool && m.content.to_lowercase().contains("denied"))
+    );
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_keeps_terminal_native_failure_across_entry_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(TerminalFailureTool {
+        calls: calls.clone(),
+    });
+    tools.set_fixed_dispatcher(true);
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_use(
+            vec![dispatched_call(
+                "first",
+                "lesson_generate",
+                serde_json::json!({}),
+            )],
+            1,
+            1,
+        ),
+        tool_use(
+            vec![ToolCall {
+                id: "again".into(),
+                name: "lesson_generate".into(),
+                arguments: serde_json::json!({"changed":true}),
+                metadata: None,
+            }],
+            1,
+            1,
+        ),
+    ]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("dispatch-terminal"), provider, tools, memory);
+    let result = agent.process_message("work", &[], vec![]).await.unwrap();
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        result.content,
+        terminal_tool_retry_message("lesson_generate")
+    );
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_background_job_uses_native_handle_and_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(NamedEchoTool {
+        name: "run_pipeline",
+        output: "background result",
+    });
+    tools.mark_spawn_only("run_pipeline", None);
+    tools.register(NamedEchoTool {
+        name: "read_task_output",
+        output: "result",
+    });
+    tools.set_fixed_dispatcher(true);
+    assert!(!tools.is_tool_visible("read_task_output"));
+    assert!(tools.is_tool_model_reachable("read_task_output"));
+    let provider = Arc::new(ScriptedProvider::new(vec![tool_use(
+        vec![dispatched_call(
+            "call_job",
+            "run_pipeline",
+            serde_json::json!({}),
+        )],
+        1,
+        1,
+    )]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("dispatch-background"), provider, tools, memory);
+    let result = agent
+        .process_message("start work", &[], vec![])
+        .await
+        .unwrap();
+    assert!(result.synthesized_from_spawn_only, "{:?}", result);
+    assert!(result.content.contains("run_pipeline"));
+    let tool_message = result
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("call_job"))
+        .unwrap();
+    assert!(
+        tool_message.content.contains("task_handle"),
+        "{}",
+        tool_message.content
+    );
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_deduplicates_same_native_call_in_one_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(CountingEchoTool {
+        name: "alpha",
+        output: "done",
+        calls: calls.clone(),
+    });
+    tools.set_fixed_dispatcher(true);
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_use(
+            vec![
+                dispatched_call("call_one", "alpha", serde_json::json!({})),
+                ToolCall {
+                    id: "call_two".into(),
+                    name: "alpha".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                },
+            ],
+            1,
+            1,
+        ),
+        end_turn("done", 1, 1),
+    ]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("dispatch-duplicate"), provider, tools, memory);
+    let result = agent.process_message("work", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "done");
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+}

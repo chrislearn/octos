@@ -86,9 +86,10 @@ MCP entries are additional. These are schema-byte measurements, not billed
 token counts, and compare the two modes of this build rather than a live run
 against the earlier four-tool configuration.
 
-This is not a universal dispatcher. Approval rules, progress accounting and
-hooks are keyed to native tools; hiding arbitrary calls inside another tool
-would require more than renaming schemas. Commands and dependent verification
+The compact profile only consolidates overlapping entries. For stable discovery
+and invocation of optional tools, use the separate `coding-dispatch` profile;
+see [fixed dispatcher](fixed-tool-dispatcher.md). It resolves native identities
+before approval, progress accounting, hooks and concurrency admission. Commands and dependent verification
 still require sequencing: a normal mixed batch executes safe reads before
 mutations, so do not place a read-after-write dependency in that batch.
 
