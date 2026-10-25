@@ -192,6 +192,10 @@ impl Tool for WatchExternalJobTool {
         Some(MAX_WAIT_SECS + 5)
     }
 
+    fn preserve_background_registration(&self) -> bool {
+        false
+    }
+
     fn retry_background_on_transient_error(&self) -> bool {
         false
     }

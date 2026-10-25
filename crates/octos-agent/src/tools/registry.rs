@@ -1092,12 +1092,12 @@ impl ToolRegistry {
     ///   preserves today's behaviour byte-for-byte.
     /// - [`crate::profile::ProfileTools::AllowList`] — keeps tools whose
     ///   names match the allow list (plain name, `group:<id>`, or
-    ///   `<prefix>*` wildcard). Any tool marked `spawn_only` is retained
-    ///   regardless — they carry background-execution wiring the runtime
-    ///   depends on.
+    ///   `<prefix>*` wildcard). Host-installed `spawn_only` wiring is retained
+    ///   unless its tool opts out via `preserve_background_registration`;
+    ///   built-in optional observers are filtered normally.
     /// - [`crate::profile::ProfileTools::DenyList`] — drops tools matching
     ///   any deny list entry (same matching rules). Spawn-only tools are
-    ///   likewise preserved.
+    ///   likewise preserved unless the tool opts out.
     ///
     /// The filter runs in-place. Cache invalidation is handled by
     /// [`ToolRegistry::retain`]. Intended to be called as a post-build
@@ -1105,6 +1105,16 @@ impl ToolRegistry {
     pub fn filter_by_profile(&mut self, tools: &crate::profile::ProfileTools) {
         use crate::profile::ProfileTools;
 
+        let preserved: HashSet<String> = self
+            .spawn_only
+            .iter()
+            .filter(|name| {
+                self.tools
+                    .get(*name)
+                    .is_some_and(|tool| tool.preserve_background_registration())
+            })
+            .cloned()
+            .collect();
         match tools {
             ProfileTools::Default => {
                 // No-op — the default mode is the behaviour-parity path.
@@ -1122,10 +1132,9 @@ impl ToolRegistry {
                     );
                     return;
                 }
-                let spawn_only = self.spawn_only.clone();
                 let allow_entries: Vec<String> = allow.clone();
                 self.retain(|name| {
-                    spawn_only.contains(name)
+                    preserved.contains(name)
                         || allow_entries
                             .iter()
                             .any(|entry| policy::entry_matches(entry, name))
@@ -1135,10 +1144,9 @@ impl ToolRegistry {
                 if deny.is_empty() {
                     return;
                 }
-                let spawn_only = self.spawn_only.clone();
                 let deny_entries: Vec<String> = deny.clone();
                 self.retain(|name| {
-                    spawn_only.contains(name)
+                    preserved.contains(name)
                         || !deny_entries
                             .iter()
                             .any(|entry| policy::entry_matches(entry, name))
@@ -1801,14 +1809,16 @@ impl ToolRegistry {
         registry.sandbox = sandbox.clone();
         registry.filesystem_scope = permissions.filesystem_scope;
         // Re-register cwd-bound tools with the new workspace
-        registry.register(
-            WatchExternalJobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope),
-        );
-        if self.is_spawn_only("watch_external_job") {
-            registry.mark_spawn_only(
-                "watch_external_job",
-                Some(super::watch_external_job::START_MESSAGE.into()),
+        if self.get("watch_external_job").is_some() {
+            registry.register(
+                WatchExternalJobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope),
             );
+            if self.is_spawn_only("watch_external_job") {
+                registry.mark_spawn_only(
+                    "watch_external_job",
+                    Some(super::watch_external_job::START_MESSAGE.into()),
+                );
+            }
         }
         registry.register(
             ShellTool::new(cwd)

@@ -801,6 +801,14 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Preserve legacy, host-installed background wiring during startup
+    /// profile filtering. Built-in optional observers opt out so their
+    /// registration obeys the same allow/deny lists as foreground tools.
+    /// This retention is not permission to execute a denied tool.
+    fn preserve_background_registration(&self) -> bool {
+        true
+    }
+
     /// Whether the spawn-only executor may retry a failed result whose text
     /// resembles a transient transport error. Observers of already submitted
     /// jobs opt out: a terminal receipt is evidence, even when the external

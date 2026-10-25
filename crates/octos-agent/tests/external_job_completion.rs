@@ -678,3 +678,29 @@ async fn watcher_rejects_symlink_escape_and_non_regular_receipts() {
         assert!(!result.success, "{path}: {}", result.output);
     }
 }
+
+#[test]
+fn profile_filter_cannot_retain_or_resurrect_an_excluded_observer() {
+    use octos_agent::profile::ProfileTools;
+    let first = TempDir::new().unwrap();
+    let second = TempDir::new().unwrap();
+    for filter in [
+        ProfileTools::AllowList {
+            tools: vec!["grep".into()],
+        },
+        ProfileTools::DenyList {
+            tools: vec!["watch_external_job".into()],
+        },
+        ProfileTools::DenyList {
+            tools: vec!["group:fs".into()],
+        },
+    ] {
+        let mut registry = ToolRegistry::with_builtins(first.path());
+        registry.filter_by_profile(&filter);
+        assert!(registry.get("watch_external_job").is_none());
+        assert!(!registry.is_tool_model_reachable("watch_external_job"));
+        let rebound = registry.rebind_cwd(second.path(), Box::new(octos_agent::sandbox::NoSandbox));
+        assert!(rebound.get("watch_external_job").is_none());
+        assert!(!rebound.is_spawn_only("watch_external_job"));
+    }
+}
