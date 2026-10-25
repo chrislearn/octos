@@ -2839,7 +2839,7 @@ mod tests {
 
         let registered = rt.tool_specs.tool_names();
         assert!(
-            !registered.iter().any(|n| n == &"ut"),
+            !registered.iter().any(|n| n == "ut"),
             "unsigned skill tool `ut` must NOT load when host strict policy is on; \
              registered: {registered:?}"
         );
