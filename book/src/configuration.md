@@ -237,9 +237,9 @@ public origin.
 ## Runtime Tool Profiles
 
 `octos chat` and `octos acp` resolve a **runtime profile** at startup that
-decides which tools are exposed to the LLM. Every tool schema in the registry
-is serialized into *every* LLM round, so the default profile is deliberately
-lean.
+controls tool authorization and agent setup. Model requests use a fixed set
+of common tools and dispatch gateways; optional schemas are returned through
+discovery instead of being serialized into every request.
 
 Built-in profiles:
 
@@ -255,12 +255,12 @@ needed to access optional tools.
 
 Per-project customization — drop a profile file in
 `~/.octos/profiles/<name>/profile.json` (or pass a path via `--profile`) and
-add tools back with allow-list entries (`group:<id>`, exact names, or
+select authorized tools with allow-list entries (`group:<id>`, exact names, or
 `prefix*` wildcards):
 
 ```json
 {
-  "name": "coding-plus-web",
+  "name": "coding-project",
   "version": 1,
   "tools": {
     "mode": "allow_list",
@@ -277,13 +277,12 @@ Notes:
   applies to bundled-skill and plugin tools exactly as to builtins. Tools
   marked `spawn_only` are never evicted by the filter; `run_pipeline` is
   instead gated at registration time by the profile allow list.
-- Sub-agents are unaffected: `spawn` workers build their own registries, so
-  the built-in `research-worker` keeps `web_search`/`web_fetch` under the
-  lean default.
+- `spawn` workers build their own registries under their effective profiles
+  and permissions. Their standard interface also uses fixed dispatch.
 - `config.json`'s `tool_policy` (below) still applies and can further narrow
   (deny-wins) any profile.
-- `octos gateway` / `octos serve` do not use runtime profiles; their tool
-  surface is unchanged.
+- `octos gateway` / `octos serve` also use the standard dispatch interface;
+  host and session restrictions continue to determine available capabilities.
 
 ## Human Approval Rules
 

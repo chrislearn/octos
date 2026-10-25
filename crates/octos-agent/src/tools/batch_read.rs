@@ -20,7 +20,9 @@ pub(super) fn schema(mut single: Value, field: &str) -> Value {
     });
     // Avoid oneOf: some supported providers reject it. Runtime checks enforce
     // exclusive single/batch arguments; the item schema remains fully typed.
-    single.as_object_mut().unwrap().remove("required");
+    if let Some(object) = single.as_object_mut() {
+        object.remove("required");
+    }
     single
 }
 

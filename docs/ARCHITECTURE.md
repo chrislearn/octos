@@ -688,11 +688,12 @@ pub struct ToolResult {
 | **workspace_show** | project, commit, file | Read a file at a specific commit (`git show <commit>:<file>`). All three fields required. Source: `tools/workspace_history.rs:199`. |
 | **workspace_diff** | project, from_commit, to_commit?, file? | Diff two commits (`from_commit..to_commit`); `to_commit` defaults to `HEAD`; `file` optionally scopes the diff. Source: `tools/workspace_history.rs:322`. |
 
-`edit_file` accepts multiple replacements in one invocation:
+`edit_file` accepts multiple replacements in one invocation. For an illustrative
+`settings.ts` file:
 
 ```json
 {
-  "path": "src/config.ts",
+  "path": "settings.ts",
   "edits": [
     {"old_string": "const retries = 1;", "new_string": "const retries = 3;"},
     {"old_string": "const timeout = 100;", "new_string": "const timeout = 500;"}
