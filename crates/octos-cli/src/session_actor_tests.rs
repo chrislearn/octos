@@ -6350,6 +6350,7 @@ async fn build_minimal_actor_factory(
         memory_refresh_enabled: true,
         system_prompt: Arc::new(std::sync::RwLock::new(
             crate::commands::gateway::prompt::GatewayPromptParts {
+                uses_bundled_base: false,
                 pre_memory: "default prompt".to_string(),
                 post_memory: String::new(),
             },

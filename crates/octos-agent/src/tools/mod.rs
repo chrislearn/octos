@@ -29,7 +29,9 @@
 //! migrated the task-local becomes redundant and can be retired, but that
 //! clean-up is out of scope for M8.1.
 
+mod batch_read;
 mod build_cache_usage;
+mod output_claims;
 pub use build_cache_usage::{BuildCacheUsage, BuildCacheUseGuard};
 
 use std::collections::HashSet;
@@ -277,9 +279,9 @@ pub struct ToolContext {
     ///
     /// File tools consult this cache on read and invalidate it on write. When
     /// `None`, tools behave as they did pre-M8.4 (no cache, no stub). The
-    /// cache is wrapped in `Arc` so it can be cloned cheaply into subagents;
-    /// use [`FileStateCache::clone_for_subagent`] when a delegate should
-    /// receive an independent copy instead of a shared handle.
+    /// cache is wrapped in `Arc` for tools in the SAME model context.
+    /// Independent children use [`FileStateCache::empty_for_new_context`];
+    /// copying or sharing parent entries would claim unseen file bodies.
     pub file_state_cache: Option<Arc<FileStateCache>>,
     /// Notification inbox surfaced to tools. M8.2/M8.3 will populate this.
     pub notifications: Arc<Notifications>,
@@ -642,6 +644,12 @@ pub struct ToolResult {
 /// two independent entry paths that the executor cannot reconcile.
 #[async_trait]
 pub trait Tool: Send + Sync {
+    /// Whether this implementation has a usable backend. Compatibility stubs
+    /// remain callable but need not consume space in discovery results.
+    fn is_available(&self) -> bool {
+        true
+    }
+
     /// Tool name (must be unique).
     fn name(&self) -> &str;
 
@@ -820,6 +828,7 @@ pub trait Tool: Send + Sync {
 }
 
 // Tool registry (extracted to its own module)
+pub(crate) mod dispatcher;
 /// Observe-only probe for the read-paging decision (changes no behaviour).
 pub(crate) mod read_paging_probe;
 pub(crate) mod read_window;
@@ -852,6 +861,7 @@ pub mod args;
 pub mod apply_patch;
 pub mod ask_user_question;
 pub mod coding_tools;
+pub(crate) mod command_output;
 pub mod deep_search;
 pub mod delegate;
 pub mod diff_edit;
@@ -889,6 +899,7 @@ pub mod shell;
 pub(crate) mod site_crawl;
 pub mod spawn;
 pub mod synthesize_research;
+pub(crate) mod terminal;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;

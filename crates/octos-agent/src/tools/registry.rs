@@ -182,6 +182,8 @@ pub const RESERVED_BUILTIN_TOOL_NAMES: &[&str] = &[
     "view_video",
     "tool_search",
     "configure_tool",
+    "discover_tools",
+    "run_tool",
 ];
 
 /// Registry of available tools.
@@ -804,7 +806,40 @@ impl ToolRegistry {
         if self.internal_hidden.contains(name) {
             return false;
         }
-        self.is_tool_visible_post_activation(name)
+        self.is_tool_visible_post_activation(name) && self.dispatch_surface_includes(name)
+    }
+
+    fn dispatch_surface_includes(&self, name: &str) -> bool {
+        !(self.is_dispatch_gateway("run_tool")
+            && self.is_dispatch_gateway("discover_tools")
+            && self.is_tool_visible_post_activation("run_tool")
+            && self.is_tool_visible_post_activation("discover_tools"))
+            || super::dispatcher::DIRECT.contains(&name)
+    }
+
+    /// Includes optional tools reachable via the fixed gateway.
+    pub fn is_tool_model_reachable(&self, name: &str) -> bool {
+        self.is_tool_visible(name)
+            || (self.is_dispatch_gateway("run_tool")
+                && self.is_tool_visible("run_tool")
+                && self.is_tool_visible_post_activation(name)
+                && self.get(name).is_some_and(|tool| tool.is_available()))
+    }
+
+    pub(super) fn dispatch_catalog(
+        &self,
+        permissions: &super::ToolPermissions,
+    ) -> Vec<(String, String)> {
+        self.tools
+            .values()
+            .filter(|tool| {
+                self.is_tool_visible_post_activation(tool.name())
+                    && tool.is_available()
+                    && permissions.is_tool_allowed(tool.name())
+                    && !self.is_dispatch_gateway(tool.name())
+            })
+            .map(|tool| (tool.name().to_string(), tool.description().to_string()))
+            .collect()
     }
 
     /// Visibility predicate shared with [`is_tool_visible`] that applies the
@@ -853,11 +888,9 @@ impl ToolRegistry {
         }
         let allowlist = self.host_tool_allowlist_snapshot();
 
-        // RFC-0 (#1289): every enabled tool is emitted every turn. The only
-        // exclusions remaining are internal-hidden tools (mofa_make
-        // dispatcher targets), provider-policy denials, and context-filter
-        // misses. There is no longer any recency-based (LRU) deferral nor an
-        // `activate_tools` meta-tool description to inject.
+        // The runtime advertises the common tools and fixed gateways. Native
+        // implementations remain registered for authorized discovery/execution.
+        // Explicit host lists excluding a gateway retain their exact tool list.
         let mut specs: Vec<ToolSpec> = self
             .tools
             .values()
@@ -880,6 +913,7 @@ impl ToolRegistry {
                 })
             })
             .filter(|t| self.active_context_allows(t.as_ref()))
+            .filter(|t| self.dispatch_surface_includes(t.name()))
             .map(|t| ToolSpec {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -1327,6 +1361,24 @@ impl ToolRegistry {
         name: &str,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
+        let resolved;
+        let (name, args) = if name == "run_tool" && self.is_dispatch_gateway(name) {
+            resolved = self.resolve_dispatch_call(
+                &octos_core::ToolCall {
+                    id: ctx.tool_id.clone(),
+                    name: name.to_string(),
+                    arguments: args.clone(),
+                    metadata: None,
+                },
+                &ctx.permissions,
+            )?;
+            (resolved.name.as_str(), &resolved.arguments)
+        } else {
+            (name, args)
+        };
+        if name == "discover_tools" && self.is_dispatch_gateway(name) {
+            return self.discover_tools(args, &ctx.permissions);
+        }
         if !self.host_tool_allowlist_permits(name) {
             eyre::bail!("tool '{}' is not in this session's tool list", name);
         }
@@ -1588,6 +1640,10 @@ impl ToolRegistry {
         // found" miss. Follow-up to wire a real backend lives on
         // issue #1149.
         registry.register(ImageGenerationTool::new());
+        // Standard runtime interface. Host/profile filters still authorize
+        // both gateways and targets; no selectable legacy presentation mode.
+        registry.register(super::dispatcher::DiscoverTools);
+        registry.register(super::dispatcher::RunTool);
         // Final refresh so the catalog reflects the just-registered
         // search/suggest tools too (cosmetic — they show up in their
         // own search results).
@@ -1595,7 +1651,7 @@ impl ToolRegistry {
         registry
     }
 
-    /// Snapshot of every currently model-visible tool as a [`ToolCatalogEntry`]
+    /// Snapshot of every currently authorized, available tool as a [`ToolCatalogEntry`]
     /// list. Used by `with_builtins` to wire `tool_search` / `tool_suggest`
     /// against the effective coding tool contract.
     pub fn catalog_snapshot(&self) -> Vec<ToolCatalogEntry> {
@@ -1619,6 +1675,7 @@ impl ToolRegistry {
                 })
             })
             .filter(|tool| self.active_context_allows(tool.as_ref()))
+            .filter(|tool| tool.is_available())
             .map(|tool| {
                 ToolCatalogEntry::new(
                     tool.name(),
@@ -2265,7 +2322,7 @@ mod registry_dispatch_tests {
         // a tool the provider policy hid from the LLM's tool list.
         let mut reg = make_registry();
         // After make_registry, "shell" exists.
-        assert!(reg.is_tool_visible("shell"));
+        assert!(reg.is_tool_model_reachable("shell"));
 
         let policy = ToolPolicy {
             deny: vec!["shell".to_string()],
@@ -3031,28 +3088,22 @@ mod profile_filter_tests {
     }
 
     #[test]
-    fn coding_full_profile_produces_same_registry_as_default_builtins() {
-        // Behaviour parity gate: applying the built-in `coding-full`
-        // profile to a builtin registry must leave the registry IDENTICAL
-        // to what the no-flag default path produced before the lean
-        // `coding` default landed. This is the critical regression guard
-        // called out in the M8.3 issue, retargeted at the unfiltered
-        // escape hatch now that `coding` itself carries an allow list
-        // (see `crate::profile::tests` for the lean-narrowing pins).
+    fn coding_profile_produces_same_registry_as_default_builtins() {
+        // Default coding retains the authorized implementations and fixed interface.
         use crate::profile::ProfileDefinition;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let reference = ToolRegistry::with_builtins(dir.path());
         let reference_names = builtin_names(&reference);
 
-        let full = ProfileDefinition::builtin("coding-full").expect("coding-full builtin");
+        let full = ProfileDefinition::builtin("coding").expect("coding builtin");
         let mut profiled = ToolRegistry::with_builtins(dir.path());
         full.apply_to_registry(&mut profiled);
 
         let profiled_names = builtin_names(&profiled);
         assert_eq!(
             reference_names, profiled_names,
-            "coding-full profile must preserve behaviour parity with the default path",
+            "coding profile must preserve behaviour parity with the default path",
         );
     }
 
