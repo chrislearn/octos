@@ -809,6 +809,9 @@ macro_rules! simple_codex_tool {
 
         #[async_trait]
         impl Tool for $name {
+            fn compact_replacement(&self) -> Option<&'static str> {
+                if $tool_name == "request_user_input" { Some("ask_user_question") } else { None }
+            }
             fn name(&self) -> &str {
                 $tool_name
             }
@@ -1721,13 +1724,26 @@ struct AgentTargetInput {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct WaitAgentInput {
+    #[serde(flatten)]
+    target: AgentTargetInput,
+    #[serde(default)]
+    include_output: bool,
+    #[serde(default)]
+    max_output_bytes: Option<usize>,
+}
+
 fn collect_agent_statuses(
     supervisor: &crate::task_supervisor::TaskSupervisor,
     targets: &[String],
+    session_key: Option<&str>,
 ) -> (Vec<Value>, bool) {
     let statuses: Vec<Value> = targets
         .iter()
-        .map(|target| match supervisor.get_task(target) {
+        .map(|target| match supervisor.get_task(target).filter(|task| {
+            session_key.is_none_or(|session| task.session_key.as_deref() == Some(session))
+        }) {
             Some(task) => json!({
                 "agent_id": target,
                 "status": task.status.as_str(),
@@ -1752,7 +1768,7 @@ fn collect_agent_statuses(
 }
 
 async fn wait_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
-    let input: AgentTargetInput = match serde_json::from_value(args.clone()) {
+    let input: WaitAgentInput = match serde_json::from_value(args.clone()) {
         Ok(input) => input,
         Err(error) => {
             return Ok(ToolResult {
@@ -1762,6 +1778,9 @@ async fn wait_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Resul
             });
         }
     };
+    let include_output = input.include_output;
+    let output_budget = input.max_output_bytes.unwrap_or(4096).min(8192);
+    let input = input.target;
     let mut targets = input.targets;
     if let Some(target) = input.target.or(input.agent_id) {
         targets.push(target);
@@ -1784,14 +1803,38 @@ async fn wait_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Resul
     };
     let timeout_ms = input.timeout_ms.unwrap_or(30_000).min(3_600_000);
     let started = Instant::now();
-    let statuses = loop {
-        let (statuses, all_terminal) = collect_agent_statuses(supervisor, &targets);
+    let mut statuses = loop {
+        let (statuses, all_terminal) =
+            collect_agent_statuses(supervisor, &targets, ctx.parent_session_key.as_deref());
         let has_unknown = statuses.iter().any(|status| status["status"] == "unknown");
         if has_unknown || all_terminal || started.elapsed() >= Duration::from_millis(timeout_ms) {
             break statuses;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    if include_output {
+        let per_task_budget = output_budget / statuses.len().max(1);
+        for status in &mut statuses {
+            if status["terminal"] != true {
+                continue;
+            }
+            let Some(task) = status["agent_id"]
+                .as_str()
+                .and_then(|id| supervisor.get_task(id))
+            else {
+                continue;
+            };
+            if let Some(mut output) = task.final_output {
+                let truncated = output.len() > per_task_budget;
+                octos_core::truncate_utf8(&mut output, per_task_budget, "");
+                status["output"] = json!(output);
+                status["output_truncated"] = json!(truncated);
+            } else {
+                // Absence of captured output is not proof of an empty answer.
+                status["output"] = Value::Null;
+            }
+        }
+    }
     Ok(ToolResult {
         output: json!({ "agents": statuses }).to_string(),
         success: statuses.iter().all(|status| status["status"] != "unknown"),
@@ -1884,12 +1927,35 @@ simple_codex_tool!(
     "Resume a Codex-compatible subagent handle.",
     resume_agent_body
 );
-simple_codex_tool!(
-    WaitAgentTool,
-    "wait_agent",
-    "Inspect or wait on Codex-compatible subagent handles.",
-    wait_agent_body
-);
+pub struct WaitAgentTool;
+
+#[async_trait]
+impl Tool for WaitAgentTool {
+    fn name(&self) -> &str {
+        "wait_agent"
+    }
+    fn description(&self) -> &str {
+        "Wait for exact task IDs. With include_output=true, return status, artifacts and bounded final output together; avoid separate polling and result calls. Unknown IDs are not completed tasks."
+    }
+    fn tags(&self) -> &[&str] {
+        &["code"]
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object", "properties": {
+            "targets": {"type":"array", "items":{"type":"string"}, "description":"Exact task IDs returned by spawn."},
+            "target": {"type":"string", "description":"Single task ID; alias: agent_id."},
+            "timeout_ms": {"type":"integer", "minimum":0, "maximum":3600000},
+            "include_output": {"type":"boolean", "description":"Return final output together with status and artifact paths (default false)."},
+            "max_output_bytes": {"type":"integer", "minimum":0, "maximum":8192, "description":"Total final-output budget across tasks (default 4096)."}
+        }})
+    }
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        wait_agent_body(self, args, ctx).await
+    }
+}
 simple_codex_tool!(
     CloseAgentTool,
     "close_agent",
@@ -1979,6 +2045,10 @@ impl BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
+    fn compact_replacement(&self) -> Option<&'static str> {
+        Some("exec_command")
+    }
+
     fn name(&self) -> &str {
         "bash"
     }
@@ -2853,6 +2923,10 @@ fn detect_image_format(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
 
 #[async_trait]
 impl Tool for ViewImageTool {
+    fn compact_replacement(&self) -> Option<&'static str> {
+        Some("read_file")
+    }
+
     fn name(&self) -> &str {
         "view_image"
     }
@@ -3514,6 +3588,10 @@ impl ToolSuggestTool {
 
 #[async_trait]
 impl Tool for ToolSuggestTool {
+    fn compact_replacement(&self) -> Option<&'static str> {
+        Some("tool_search")
+    }
+
     fn name(&self) -> &str {
         "tool_suggest"
     }
@@ -3652,6 +3730,10 @@ impl ImageGenerationTool {
 
 #[async_trait]
 impl Tool for ImageGenerationTool {
+    fn is_available(&self) -> bool {
+        self.backend_bound
+    }
+
     fn name(&self) -> &str {
         "image_generation"
     }
@@ -3848,6 +3930,36 @@ mod background_handle_contract {
             task_supervisor: Some(Arc::new(crate::TaskSupervisor::new())),
             ..ToolContext::zero()
         }
+    }
+
+    #[tokio::test]
+    async fn should_collect_bounded_final_output_without_leaking_sibling_tasks() {
+        let mut ctx = context();
+        ctx.parent_session_key = Some("session-a".into());
+        let supervisor = ctx.task_supervisor.as_ref().unwrap();
+        let done = supervisor.register("work", "done", Some("session-a"));
+        supervisor.record_final_output(&done, "结果完成，检查通过");
+        supervisor.mark_completed(&done, vec!["report.txt".into()]);
+        let sibling = supervisor.register("work", "sibling", Some("session-b"));
+        supervisor.record_final_output(&sibling, "SIBLING_SECRET");
+        supervisor.mark_completed(&sibling, vec![]);
+        let result = wait_agent_body(
+            &WaitAgentTool,
+            &json!({
+                "targets":[done,sibling], "timeout_ms":0, "include_output":true,
+                "max_output_bytes":12
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(!result.success);
+        assert_eq!(payload["agents"][0]["output"], "结果");
+        assert_eq!(payload["agents"][0]["output_truncated"], true);
+        assert_eq!(payload["agents"][0]["output_files"][0], "report.txt");
+        assert_eq!(payload["agents"][1]["status"], "unknown");
+        assert!(!result.output.contains("SIBLING_SECRET"));
     }
 
     #[tokio::test]

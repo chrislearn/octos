@@ -3796,6 +3796,46 @@ mod tests {
         assert!(messages[1].media.is_empty());
     }
 
+    #[tokio::test]
+    async fn should_deliver_all_batch_read_images_as_immutable_main_history_media() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.png", "b.png"] {
+            std::fs::write(dir.path().join(name), b"\x89PNG\r\n\x1a\n").unwrap();
+        }
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("batch-images"),
+            Arc::new(NoChatProvider),
+            tools,
+            memory,
+        );
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![octos_core::ToolCall {
+                id: "read-both".into(),
+                name: "read_file".into(),
+                metadata: None,
+                arguments: serde_json::json!({"files":[{"path":"a.png"},{"path":"b.png"}]}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        let (messages, _, _, _, _, success) = agent.execute_tools(&response).await.unwrap();
+        assert_eq!(success, [("read-both".into(), true)]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("read-both"));
+        assert_eq!(messages[0].media.len(), 2);
+        for name in ["a.png", "b.png"] {
+            std::fs::write(dir.path().join(name), "changed").unwrap();
+        }
+        for path in &messages[0].media {
+            assert_eq!(std::fs::read(path).unwrap(), b"\x89PNG\r\n\x1a\n");
+        }
+    }
+
     /// Sleeps far past the batch ceiling so the batch timeout always fires
     /// while this call is still pending.
     struct SleepingTool;

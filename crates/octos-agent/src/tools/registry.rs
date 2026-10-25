@@ -187,6 +187,7 @@ pub const RESERVED_BUILTIN_TOOL_NAMES: &[&str] = &[
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    compact_surface: bool,
     workspace_root: Option<PathBuf>,
     /// The filesystem reach the cwd-bound tools were registered with. The
     /// request build reads this (#2480) so media paths are only re-walked
@@ -315,6 +316,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            compact_surface: false,
             workspace_root: None,
             provider_policy: None,
             context_filter: None,
@@ -804,7 +806,33 @@ impl ToolRegistry {
         if self.internal_hidden.contains(name) {
             return false;
         }
-        self.is_tool_visible_post_activation(name)
+        self.is_tool_visible_post_activation(name) && self.compact_surface_includes(name)
+    }
+
+    /// Select canonical model-facing entry points, without changing the host's
+    /// permission list, registered tools, or execution of historical calls.
+    pub fn set_compact_surface(&mut self, enabled: bool) {
+        self.compact_surface = enabled;
+        self.invalidate_cache();
+    }
+
+    fn compact_surface_includes(&self, name: &str) -> bool {
+        if !self.compact_surface {
+            return true;
+        }
+        let Some(tool) = self.tools.get(name) else {
+            return false;
+        };
+        if !tool.is_available() {
+            return false;
+        }
+        !tool.compact_replacement().is_some_and(|replacement| {
+            self.is_tool_visible_post_activation(replacement)
+                && self
+                    .tools
+                    .get(replacement)
+                    .is_some_and(|tool| tool.is_available())
+        })
     }
 
     /// Visibility predicate shared with [`is_tool_visible`] that applies the
@@ -880,6 +908,7 @@ impl ToolRegistry {
                 })
             })
             .filter(|t| self.active_context_allows(t.as_ref()))
+            .filter(|t| self.compact_surface_includes(t.name()))
             .map(|t| ToolSpec {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -1170,6 +1199,7 @@ impl ToolRegistry {
 
         let mut snapshot = Self {
             tools,
+            compact_surface: self.compact_surface,
             // Carried, not reset: a snapshot that EXCLUDES the MCP tools would
             // otherwise replace the last owner and let the transport die when
             // the original registry drops. Cheap — one Arc per server.
@@ -1588,6 +1618,11 @@ impl ToolRegistry {
         // found" miss. Follow-up to wire a real backend lives on
         // issue #1149.
         registry.register(ImageGenerationTool::new());
+        // Model presentation is independent from authorization. An explicit
+        // host/profile allowlist still applies; this switch never broadens it.
+        if std::env::var("OCTOS_TOOL_SURFACE").is_ok_and(|value| value == "compact") {
+            registry.set_compact_surface(true);
+        }
         // Final refresh so the catalog reflects the just-registered
         // search/suggest tools too (cosmetic — they show up in their
         // own search results).
@@ -1619,6 +1654,7 @@ impl ToolRegistry {
                 })
             })
             .filter(|tool| self.active_context_allows(tool.as_ref()))
+            .filter(|tool| self.compact_surface_includes(tool.name()))
             .map(|tool| {
                 ToolCatalogEntry::new(
                     tool.name(),

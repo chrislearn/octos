@@ -117,9 +117,8 @@ impl Tool for ReadFileTool {
     }
 
     // #1638 R6: the tool spec (description + schema) is serialized into the
-    // LLM prompt-cache prefix for EVERY session, so it must be byte-identical
-    // to origin/main when the flag is OFF, or arming one process would bust
-    // the prefix for all of them. Both are therefore conditional on the arm:
+    // LLM prompt-cache prefix for EVERY session, so the batch-capable unarmed
+    // schema must remain stable across sessions. Both are therefore conditional on the arm:
     // unarmed returns exactly the origin strings; armed adds the windowing
     // contract and the byte-mode parameters. (`window_armed()` reads the
     // per-instance override or `OCTOS_READ_WINDOW`, both stable for a process,
@@ -140,7 +139,7 @@ impl Tool for ReadFileTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        // Origin/main properties — MUST stay byte-identical when unarmed.
+        // Single-read parameters are shared by both forms.
         let mut properties = serde_json::json!({
             "path": {
                 "type": "string",
@@ -176,11 +175,14 @@ impl Tool for ReadFileTool {
                 }),
             );
         }
-        serde_json::json!({
-            "type": "object",
-            "properties": properties,
-            "required": ["path"]
-        })
+        super::batch_read::schema(
+            serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": ["path"]
+            }),
+            "files",
+        )
     }
 
     /// `read_file` paginates, so a truncated read has a real next call.
@@ -230,6 +232,9 @@ impl Tool for ReadFileTool {
         ctx: &ToolContext,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
+        if args.get("files").is_some() {
+            return super::batch_read::execute(self, ctx, args, "files").await;
+        }
         let mut result = self.execute_capped_inner(ctx, args).await?;
         // #2193 R4: ONE release-enforced cap over every armed return (success
         // and early errors), so no caller-controlled path or message can slip
@@ -252,8 +257,12 @@ impl ReadFileTool {
         ctx: &ToolContext,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
-        let input: ReadFileInput =
-            super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
+        let schema = self.input_schema();
+        let input: ReadFileInput = super::args::parse_tool_args(
+            self.name(),
+            &schema["properties"]["files"]["items"],
+            args,
+        )?;
 
         // M8.1 permission gate (stub): consult the typed permissions record
         // so the hook is in place before M8.3 wires real allow lists. Today
@@ -1906,7 +1915,7 @@ mod tests {
     /// stays stable across sessions. Image support is deliberately present in
     /// both modes; changing the windowing flag must not remove that capability.
     fn read_file_base_toolspec() -> serde_json::Value {
-        serde_json::json!({
+        let mut spec = serde_json::json!({
             "name": "read_file",
             "description": "Read text with line numbers, or attach PNG/JPEG/WEBP images (up to 5 MiB) directly to the model.",
             "input_schema": {
@@ -1931,7 +1940,10 @@ mod tests {
                 },
                 "required": ["path"]
             }
-        })
+        });
+        spec["input_schema"] =
+            super::super::batch_read::schema(spec["input_schema"].take(), "files");
+        spec
     }
 
     fn read_file_toolspec(tool: &ReadFileTool) -> serde_json::Value {

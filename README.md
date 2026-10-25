@@ -243,6 +243,10 @@ reload, or build a different interface over the same stored session.
 
 ### Tools, permissions, and human input
 
+Use `octos chat --profile coding-compact` for full authorized capabilities with
+canonical tool entries, batched file/image and web reads, and combined agent
+status/result collection. See [the tool audit and usage guide](docs/compact-tool-surface.md).
+
 The kernel executes filesystem, shell, web, and MCP tools under the host's tool
 policy and platform sandbox configuration. Host-configured lifecycle hooks can
 participate around model calls and tool execution. OUP exposes execution and

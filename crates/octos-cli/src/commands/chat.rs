@@ -109,7 +109,8 @@ pub struct ChatCommand {
     /// shell, search, memory, spawn, check, plan tracking, user questions,
     /// and tool_search). Use `coding-full` for the unfiltered pre-lean tool
     /// set (web, research, pipelines, bundled skills) that the allow list
-    /// excludes.
+    /// excludes. Use `coding-compact` for full authorized capabilities with
+    /// redundant tool entries collapsed and native batched reads.
     #[arg(long)]
     pub profile: Option<String>,
 

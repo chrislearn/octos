@@ -41,7 +41,8 @@
 //! 3. Finally the loader falls back to the crate-shipped built-in registry
 //!    (JSON files under `crates/octos-agent/src/assets/profiles/`).
 //!
-//! Today's built-in profiles are `coding` (the lean default), `coding-full`
+//! Built-in profiles include `coding` (the lean default), `coding-compact`
+//! (full authorized capabilities with canonical tool entries), `coding-full`
 //! (the unfiltered pre-lean surface), and `swarm` (an allow-list extension
 //! that enables multi-worker swarm coordination tools).
 //!
@@ -81,6 +82,10 @@ pub const PROFILE_SCHEMA_VERSION: u32 = 1;
 /// user-config search. Ordered (name, raw JSON text).
 const BUILTIN_PROFILES: &[(&str, &str)] = &[
     ("coding", include_str!("../assets/profiles/coding.json")),
+    (
+        "coding-compact",
+        include_str!("../assets/profiles/coding-compact.json"),
+    ),
     (
         "coding-full",
         include_str!("../assets/profiles/coding-full.json"),
@@ -242,6 +247,11 @@ pub struct ProfileDefinition {
     /// registry is left untouched.
     #[serde(default)]
     pub tools: ProfileTools,
+    /// Model-facing canonical entries; independent of tool authorization.
+    /// None preserves the registry/host setting. False explicitly selects the
+    /// legacy surface. True hides redundant specs, never implementations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_tool_surface: Option<bool>,
     /// MCP servers to attach. Only ids are captured today.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerRef>,
@@ -273,6 +283,7 @@ impl Default for ProfileDefinition {
             version: PROFILE_SCHEMA_VERSION,
             description: None,
             tools: ProfileTools::default(),
+            compact_tool_surface: None,
             mcp_servers: Vec::new(),
             permissions: PermissionMode::default(),
             compaction_policy: None,
@@ -435,6 +446,9 @@ impl ProfileDefinition {
     /// spawn-only carve-out.
     pub fn apply_to_registry(&self, registry: &mut ToolRegistry) {
         registry.filter_by_profile(&self.tools);
+        if let Some(compact) = self.compact_tool_surface {
+            registry.set_compact_surface(compact);
+        }
     }
 }
 
@@ -554,6 +568,7 @@ mod tests {
         let original = ProfileDefinition {
             name: "rt".to_string(),
             version: 1,
+            compact_tool_surface: Some(true),
             description: Some("round-trip".to_string()),
             tools: ProfileTools::DenyList {
                 tools: vec!["web_fetch".to_string()],

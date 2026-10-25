@@ -763,7 +763,7 @@ impl ProfileRuntime {
             tools.apply_policy(policy);
         }
         if let Some(profile) = &self.agent_profile {
-            tools.filter_by_profile(&profile.tools);
+            profile.apply_to_registry(tools);
             if !profile.tools.allows("run_pipeline") {
                 tools.retain(|name| name != "run_pipeline");
             }
