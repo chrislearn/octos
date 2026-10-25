@@ -45,10 +45,6 @@ struct DiffEditInput {
 
 #[async_trait]
 impl Tool for DiffEditTool {
-    fn compact_replacement(&self) -> Option<&'static str> {
-        Some("apply_patch")
-    }
-
     fn name(&self) -> &str {
         "diff_edit"
     }

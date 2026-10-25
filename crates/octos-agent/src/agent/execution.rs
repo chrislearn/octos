@@ -3862,14 +3862,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dropped = Arc::new(AtomicBool::new(false));
         let mutated = Arc::new(AtomicBool::new(false));
-        let mut tools = ToolRegistry::new();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
         tools.register(DropAwareExclusiveTool {
             dropped: dropped.clone(),
         });
         tools.register(MutatingTool {
             mutated: mutated.clone(),
         });
-        tools.set_fixed_dispatcher(true);
+
         let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
         let agent = Agent::new(
             AgentId::new("dispatch-timeout"),

@@ -1,8 +1,0 @@
-{
-  "name": "coding-dispatch",
-  "version": 1,
-  "description": "Four common direct tools plus stable discovery and invocation of authorized optional tools.",
-  "tools": {"mode": "default"},
-  "fixed_tool_dispatcher": true,
-  "agents": ["repo-editor", "research-worker"]
-}

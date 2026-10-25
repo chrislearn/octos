@@ -1442,9 +1442,8 @@ fn workflow_phase_progress_is_coarse_but_non_null_and_monotonic() {
 #[test]
 fn subagent_tool_preflight_passes_when_allowed_tool_present() {
     let tools = ToolRegistry::with_builtins("/tmp");
-    // RFC-0 (#1289): `shell` is always registered and visible — no
-    // deferral to un-hide.
-    assert!(tools.specs().iter().any(|spec| spec.name == "shell"));
+    // The dispatcher keeps the authorized shell capability reachable.
+    assert!(tools.is_tool_model_reachable("shell"));
     ensure_subagent_tools_available(&tools, &[String::from("shell")], true).unwrap();
 }
 

@@ -2,48 +2,15 @@ use octos_agent::ToolRegistry;
 use serde_json::json;
 
 #[test]
-fn coding_compact_profile_restores_useful_tools_without_widening_host_policy() {
-    use octos_agent::profile::ProfileDefinition;
+fn standard_dispatcher_keeps_distinct_capabilities_and_historical_entry_points() {
     let dir = tempfile::tempdir().unwrap();
-    let mut registry = ToolRegistry::with_builtins(dir.path());
-    let profile = ProfileDefinition::builtin("coding-compact").unwrap();
-    profile.apply_to_registry(&mut registry);
-    for name in [
-        "apply_patch",
-        "web_search",
-        "web_fetch",
-        "wait_agent",
-        "workspace_diff",
-    ] {
-        assert!(registry.is_tool_visible(name), "missing {name}");
-    }
-    assert!(!registry.is_tool_visible("diff_edit"));
-    registry.set_host_tool_allowlist(Some(&["read_file".into()]));
-    profile.apply_to_registry(&mut registry);
-    assert_eq!(registry.specs().len(), 1);
-}
-
-#[test]
-fn compact_surface_preserves_distinct_capabilities_and_native_aliases() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut registry = ToolRegistry::with_builtins(dir.path());
-    let original = registry.specs();
-    registry.set_compact_surface(true);
-    let compact = registry.specs();
-    eprintln!(
-        "native: {} tools / {} schema bytes; compact: {} tools / {} schema bytes",
-        original.len(),
-        serde_json::to_vec(&original).unwrap().len(),
-        compact.len(),
-        serde_json::to_vec(&compact).unwrap().len()
-    );
-    assert!(compact.len() < original.len());
+    let registry = ToolRegistry::with_builtins(dir.path());
+    assert_eq!(registry.specs().len(), 6);
     for name in [
         "glob",
         "grep",
         "list_dir",
         "apply_patch",
-        "exec_command",
         "write_stdin",
         "shell",
         "web_search",
@@ -51,43 +18,22 @@ fn compact_surface_preserves_distinct_capabilities_and_native_aliases() {
         "browser",
         "wait_agent",
         "view_video",
-    ] {
-        assert!(compact.iter().any(|s| s.name == name), "lost {name}");
-    }
-    for name in [
         "bash",
         "diff_edit",
         "view_image",
         "tool_suggest",
         "request_user_input",
-        "image_generation",
     ] {
-        assert!(!compact.iter().any(|s| s.name == name), "redundant {name}");
+        assert!(registry.get(name).is_some(), "lost native entry {name}");
         assert!(
-            registry.get(name).is_some(),
-            "compatibility removed: {name}"
+            registry.is_tool_model_reachable(name),
+            "lost capability {name}"
         );
     }
     assert_eq!(
-        serde_json::to_value(&compact).unwrap(),
+        serde_json::to_value(registry.specs()).unwrap(),
         serde_json::to_value(registry.snapshot_excluding(&[]).specs()).unwrap()
     );
-    registry.set_compact_surface(false);
-    assert_eq!(
-        serde_json::to_value(original).unwrap(),
-        serde_json::to_value(registry.specs()).unwrap()
-    );
-}
-
-#[test]
-fn compact_surface_keeps_alias_when_replacement_is_not_allowed() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut registry = ToolRegistry::with_builtins(dir.path());
-    registry.retain(|name| matches!(name, "view_image" | "bash"));
-    registry.set_compact_surface(true);
-    let names: Vec<_> = registry.specs().into_iter().map(|s| s.name).collect();
-    assert_eq!(names, ["bash", "view_image"]);
-    assert_eq!(registry.catalog_snapshot().len(), 2);
 }
 
 #[tokio::test]
@@ -142,10 +88,9 @@ async fn batch_read_enforces_scope_and_rejects_ambiguous_input() {
 }
 
 #[tokio::test]
-async fn compact_surface_never_expands_a_host_allowlist() {
+async fn dispatcher_never_expands_a_host_allowlist() {
     let dir = tempfile::tempdir().unwrap();
-    let mut registry = ToolRegistry::with_builtins(dir.path());
-    registry.set_compact_surface(true);
+    let registry = ToolRegistry::with_builtins(dir.path());
     registry.set_host_tool_allowlist(Some(&["view_image".into()]));
     assert_eq!(
         registry

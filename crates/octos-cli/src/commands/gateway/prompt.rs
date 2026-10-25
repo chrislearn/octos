@@ -52,7 +52,16 @@ pub struct GatewayPromptParts {
 impl GatewayPromptParts {
     /// Project once when constructing the session, after tool policy is bound.
     /// Never rebuild this prefix per model request or based on recent tool use.
-    pub fn pre_memory_for_tools(&self, tools: &[octos_llm::ToolSpec]) -> String {
+    pub fn pre_memory_for_registry(&self, registry: &octos_agent::ToolRegistry) -> String {
+        self.project_available_rules(|name| registry.is_tool_model_reachable(name))
+    }
+
+    #[cfg(test)]
+    fn pre_memory_for_tools(&self, tools: &[octos_llm::ToolSpec]) -> String {
+        self.project_available_rules(|name| tools.iter().any(|tool| tool.name == name))
+    }
+
+    fn project_available_rules(&self, available: impl Fn(&str) -> bool) -> String {
         if !self.uses_bundled_base {
             return self.pre_memory.clone();
         }
@@ -60,7 +69,6 @@ impl GatewayPromptParts {
             // A later operator override replaced the base.
             return self.pre_memory.clone();
         };
-        let available = |name: &str| tools.iter().any(|tool| tool.name == name);
         let research_available = [
             "search",
             "deep_crawl",
@@ -138,6 +146,23 @@ mod capability_projection_tests {
             post_memory: "\n## Available Skills\nPreserve skill guidance.".into(),
             uses_bundled_base: true,
         }
+    }
+
+    #[test]
+    fn dispatcher_keeps_rules_for_callable_optional_tools_and_honors_host_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = octos_agent::ToolRegistry::with_builtins(dir.path());
+        assert!(!registry.is_tool_visible("web_search"));
+        let parts = bundled();
+        let rules = parts.pre_memory_for_registry(&registry);
+        assert!(
+            rules.contains("podcast_generate"),
+            "research rules remain for discovered web tools"
+        );
+        registry.set_host_tool_allowlist(Some(&["read_file".into()]));
+        let restricted = parts.pre_memory_for_registry(&registry);
+        assert!(!restricted.contains("podcast_generate"));
+        assert!(restricted.contains("Workspace instructions: preserve me."));
     }
 
     #[test]

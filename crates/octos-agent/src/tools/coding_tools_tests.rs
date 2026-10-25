@@ -99,10 +99,11 @@ const CODEX_P0: &[&str] = &[
 fn builtins_expose_codex_p0_tool_names() {
     let temp = tempfile::tempdir().expect("tempdir");
     let registry = ToolRegistry::with_builtins(temp.path());
-    let names: std::collections::HashSet<_> =
-        registry.specs().into_iter().map(|spec| spec.name).collect();
     for name in CODEX_P0 {
-        assert!(names.contains(*name), "{name} should be model-visible");
+        assert!(
+            registry.is_tool_model_reachable(name),
+            "{name} should be model-reachable"
+        );
     }
 }
 
@@ -2339,10 +2340,11 @@ async fn tool_search_live_catalog_respects_visibility_filters() {
 async fn builtins_expose_p1_codex_tool_names() {
     let temp = tempfile::tempdir().expect("tempdir");
     let registry = ToolRegistry::with_builtins(temp.path());
-    let names: std::collections::HashSet<_> =
-        registry.specs().into_iter().map(|spec| spec.name).collect();
     for name in &["view_image", "tool_search", "tool_suggest"] {
-        assert!(names.contains(*name), "{name} must be model-visible");
+        assert!(
+            registry.is_tool_model_reachable(name),
+            "{name} must be model-reachable"
+        );
     }
 }
 
@@ -2358,10 +2360,11 @@ async fn builtins_expose_p1_codex_tool_names() {
 async fn builtins_expose_codex_naming_aliases() {
     let temp = tempfile::tempdir().expect("tempdir");
     let registry = ToolRegistry::with_builtins(temp.path());
-    let names: std::collections::HashSet<_> =
-        registry.specs().into_iter().map(|spec| spec.name).collect();
     for name in &["bash", "delegate"] {
-        assert!(names.contains(*name), "{name} must be model-visible");
+        assert!(
+            registry.is_tool_model_reachable(name),
+            "{name} must be model-reachable"
+        );
     }
 }
 
@@ -2817,15 +2820,11 @@ async fn exec_command_kills_child_process_on_timeout() {
 /// The stub MUST surface `image_generation` as model-visible so
 /// the canonical Codex tool surface is wire-complete.
 #[tokio::test]
-async fn builtins_expose_image_generation_tool_name() {
-    let temp = tempfile::tempdir().expect("tempdir");
+async fn unbound_image_generation_is_registered_but_not_discoverable() {
+    let temp = tempfile::tempdir().unwrap();
     let registry = ToolRegistry::with_builtins(temp.path());
-    let names: std::collections::HashSet<_> =
-        registry.specs().into_iter().map(|spec| spec.name).collect();
-    assert!(
-        names.contains("image_generation"),
-        "image_generation must be model-visible: {names:?}"
-    );
+    assert!(registry.get("image_generation").is_some());
+    assert!(!registry.is_tool_model_reachable("image_generation"));
 }
 
 /// Happy stub path: a valid prompt returns a structured

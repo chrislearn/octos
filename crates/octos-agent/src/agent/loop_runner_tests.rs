@@ -10330,8 +10330,8 @@ async fn fixed_dispatcher_preserves_wire_history_schemas_and_image_delivery() {
     let dir = tempfile::tempdir().unwrap();
     let image = dir.path().join("test.png");
     std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
-    let mut tools = ToolRegistry::with_builtins(dir.path());
-    tools.set_fixed_dispatcher(true);
+    let tools = ToolRegistry::with_builtins(dir.path());
+
     let expected_specs = serde_json::to_value(tools.specs()).unwrap();
     let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
     let wrapped = dispatched_call(
@@ -10399,7 +10399,7 @@ async fn fixed_dispatcher_native_and_gateway_limits_cannot_be_bypassed() {
             output: "alpha ok",
             calls: calls.clone(),
         });
-        tools.set_fixed_dispatcher(true);
+
         let mut second = dispatched_call("two", "alpha", serde_json::json!({"different":true}));
         if limited == "alpha" {
             second.name = "alpha".into();
@@ -10442,7 +10442,7 @@ async fn fixed_dispatcher_approval_uses_native_identity_and_original_call_id() {
             output: "alpha ok",
             calls: calls.clone(),
         });
-        tools.set_fixed_dispatcher(true);
+
         let provider = Arc::new(ScriptedProvider::new(vec![tool_use(
             vec![dispatched_call("wrapped", "alpha", serde_json::json!({}))],
             1,
@@ -10478,8 +10478,8 @@ async fn fixed_dispatcher_approval_uses_native_identity_and_original_call_id() {
 async fn fixed_dispatcher_hooks_see_native_tool_and_file_arguments() {
     use crate::hooks::{HookConfig, HookEvent, HookExecutor};
     let dir = tempfile::tempdir().unwrap();
-    let mut tools = ToolRegistry::with_builtins(dir.path());
-    tools.set_fixed_dispatcher(true);
+    let tools = ToolRegistry::with_builtins(dir.path());
+
     let provider = Arc::new(ScriptedProvider::new(vec![
         tool_use(
             vec![dispatched_call(
@@ -10521,7 +10521,7 @@ async fn fixed_dispatcher_keeps_terminal_native_failure_across_entry_points() {
     tools.register(TerminalFailureTool {
         calls: calls.clone(),
     });
-    tools.set_fixed_dispatcher(true);
+
     let provider = Arc::new(ScriptedProvider::new(vec![
         tool_use(
             vec![dispatched_call(
@@ -10566,7 +10566,7 @@ async fn fixed_dispatcher_background_job_uses_native_handle_and_ack() {
         name: "read_task_output",
         output: "result",
     });
-    tools.set_fixed_dispatcher(true);
+
     assert!(!tools.is_tool_visible("read_task_output"));
     assert!(tools.is_tool_model_reachable("read_task_output"));
     let provider = Arc::new(ScriptedProvider::new(vec![tool_use(
@@ -10608,7 +10608,7 @@ async fn fixed_dispatcher_deduplicates_same_native_call_in_one_batch() {
         output: "done",
         calls: calls.clone(),
     });
-    tools.set_fixed_dispatcher(true);
+
     let provider = Arc::new(ScriptedProvider::new(vec![
         tool_use(
             vec![

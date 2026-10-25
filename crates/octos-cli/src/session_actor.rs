@@ -3966,10 +3966,7 @@ impl ActorFactory {
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                (
-                    parts.pre_memory_for_tools(&tools.specs()),
-                    parts.post_memory,
-                )
+                (parts.pre_memory_for_registry(&tools), parts.post_memory)
             }
         };
         // Per-chat soul override (set via /soul in this chat) — appended to

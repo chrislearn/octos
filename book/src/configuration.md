@@ -243,18 +243,15 @@ lean.
 
 Built-in profiles:
 
-| Profile | Tool surface |
-|---------|--------------|
-| `coding` (default) | **Lean core-coding loop only**: files (`group:fs`), shell (`group:runtime`), search (`group:search`), long-term memory (`group:memory`), `spawn`, `ask_user_question` — ≈15–18 tools, ≈3.3K tokens of schemas per round. Web/research/media/messaging tools, `run_pipeline`, and bundled skills (weather, news, send_email, …) are **excluded**. |
-| `coding-full` | The unfiltered pre-lean surface — every native, bundled-skill, plugin, and MCP tool (≈48 tools, ≈9K tokens per round). Byte-for-byte the old `coding` behaviour. |
-| `swarm` | Coding set plus swarm-coordination tools (`send_to_agent`, `cancel_task`, `relaunch_task`, …). |
+| Profile | Tool access |
+|---------|-------------|
+| `coding` (default) | Four common direct tools plus `discover_tools` / `run_tool`. All registered and authorized optional capabilities remain accessible through discovery. |
+| `swarm` | The same fixed interface, with an explicit allowlist for coordination workflows. |
 
-Switching profiles:
-
-```bash
-octos chat --profile coding-full        # one-off: everything back
-ln -s coding-full ~/.octos/profile      # persistent default (name or path)
-```
+Run `octos chat` for the standard interface. Custom profiles still configure
+permissions, model preferences and agent setup. The old tool-surface variants
+and their presentation switches have been removed; no special profile flag is
+needed to access optional tools.
 
 Per-project customization — drop a profile file in
 `~/.octos/profiles/<name>/profile.json` (or pass a path via `--profile`) and

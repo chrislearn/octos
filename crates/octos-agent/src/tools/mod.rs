@@ -644,15 +644,8 @@ pub struct ToolResult {
 /// two independent entry paths that the executor cannot reconcile.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Optional canonical entry point with equivalent capability. A compact
-    /// model surface may omit this spec only when that entry point is allowed.
-    /// This never changes execution permissions or removes legacy entry points.
-    fn compact_replacement(&self) -> Option<&'static str> {
-        None
-    }
-
     /// Whether this implementation has a usable backend. Compatibility stubs
-    /// remain callable but need not consume space in a compact model prompt.
+    /// remain callable but need not consume space in discovery results.
     fn is_available(&self) -> bool {
         true
     }

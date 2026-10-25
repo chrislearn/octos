@@ -1762,70 +1762,26 @@ mod profile_integration_tests {
     }
 
     #[tokio::test]
-    async fn coding_profile_narrows_default_tool_set() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    async fn coding_profile_uses_the_same_fixed_dispatcher_as_default_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
         let base = agent_default(tmp.path()).await;
         let profiled = agent_with_builtin_profile(tmp.path(), "coding").await;
-
-        let base_names = tool_names(&base);
-        let lean_names = tool_names(&profiled);
-        // Lean default: `coding` narrows the surface to the core coding
-        // loop instead of passing the registry through untouched.
-        assert!(
-            lean_names.len() < base_names.len(),
-            "lean coding profile must narrow the default set \
-             ({} -> {})",
-            base_names.len(),
-            lean_names.len(),
-        );
-        assert!(
-            lean_names.iter().all(|n| base_names.contains(n)),
-            "lean set must be a subset of the default set",
-        );
-        for kept in [
-            "read_file",
-            "shell",
-            "bash",
-            "edit_file",
-            "grep",
-            "check",
-            "update_plan",
-        ] {
-            assert!(
-                lean_names.contains(&kept.to_string()),
-                "core-loop tool {kept} missing from lean set: {lean_names:?}",
-            );
-        }
-        for dropped in ["web_search", "browser", "image_generation"] {
-            assert!(
-                !lean_names.contains(&dropped.to_string()),
-                "non-core tool {dropped} must be filtered by the lean coding profile",
-            );
-        }
-
-        // The profiled agent also exposes the recorded profile handle.
-        let prof = profiled.profile().expect("profile handle present");
-        assert_eq!(prof.name, "coding");
-        assert_eq!(prof.version, 1);
-    }
-
-    #[tokio::test]
-    async fn coding_full_profile_matches_default_tool_set() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let base = agent_default(tmp.path()).await;
-        let profiled = agent_with_builtin_profile(tmp.path(), "coding-full").await;
-
-        // The byte-for-byte parity contract moved from `coding` to the
-        // `coding-full` escape hatch when the lean default landed.
+        assert_eq!(tool_names(&base), tool_names(&profiled));
         assert_eq!(
             tool_names(&base),
-            tool_names(&profiled),
-            "coding-full profile must preserve the default tool set byte-for-byte",
+            [
+                "discover_tools",
+                "edit_file",
+                "exec_command",
+                "read_file",
+                "run_tool",
+                "write_file"
+            ]
         );
-
-        let prof = profiled.profile().expect("profile handle present");
-        assert_eq!(prof.name, "coding-full");
-        assert_eq!(prof.version, 1);
+        for name in ["web_search", "apply_patch", "shell", "check", "update_plan"] {
+            assert!(profiled.tool_registry().is_tool_model_reachable(name));
+        }
+        assert_eq!(profiled.profile().unwrap().name, "coding");
     }
 
     #[tokio::test]

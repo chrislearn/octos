@@ -14410,7 +14410,7 @@ fn coding_tool_status_distinguishes_registered_hidden_tools_from_missing_tools()
     let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
     registry.set_context_filter(vec!["read".into()]);
 
-    let visible = model_visible_tool_names(Some(&registry));
+    let visible = model_callable_tool_names(Some(&registry));
     let registered = registered_tool_names(Some(&registry));
     assert!(!visible.iter().any(|name| name == "exec_command"));
     assert!(registered.iter().any(|name| name == "exec_command"));

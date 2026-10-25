@@ -243,14 +243,12 @@ reload, or build a different interface over the same stored session.
 
 ### Tools, permissions, and human input
 
-Use `octos chat --profile coding-compact` for full authorized capabilities with
-canonical tool entries, batched file/image and web reads, and combined agent
-status/result collection. See [the tool audit and usage guide](docs/compact-tool-surface.md).
-
-Use `octos chat --profile coding-dispatch` to advertise four common tools plus
-fixed `discover_tools` / `run_tool` gateways. Optional tool schemas arrive in
-conversation results; discovery does not change the advertised tool list.
-See [fixed dispatcher usage and boundaries](docs/fixed-tool-dispatcher.md).
+Run `octos chat` to use the standard fixed tool interface: four common tools
+plus `discover_tools` / `run_tool`. Optional tool schemas arrive in conversation
+results without changing the advertised tool list. Authorized capabilities,
+batched reads, images and agent coordination remain available.
+See [dispatcher usage](docs/fixed-tool-dispatcher.md) and the
+[capability audit](docs/tool-capabilities.md).
 
 The kernel executes filesystem, shell, web, and MCP tools under the host's tool
 policy and platform sandbox configuration. Host-configured lifecycle hooks can

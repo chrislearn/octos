@@ -768,7 +768,7 @@ impl SessionRuntime {
         // bus channels only; serve sessions get the client's own commands
         // instead, via `apply_client_commands` (octoscode#664).
         let base_prompt =
-            strip_slash_commands(&profile.prompt_parts.pre_memory_for_tools(&tools.specs()));
+            strip_slash_commands(&profile.prompt_parts.pre_memory_for_registry(&tools));
         let mut agent = Agent::new_shared(
             AgentId::new("api"),
             profile.llm.clone(),

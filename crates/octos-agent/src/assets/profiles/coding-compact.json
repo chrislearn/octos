@@ -1,9 +1,0 @@
-{
-  "name": "coding-compact",
-  "version": 1,
-  "description": "Full authorized capabilities with canonical model-facing tools. Keeps search, web, patching, background jobs and agent coordination; hides redundant entry points only when their replacements are available. Plugin and MCP tools remain available under the host policy.",
-  "tools": {"mode": "default"},
-  "compact_tool_surface": true,
-  "permissions": "default",
-  "agents": ["research-worker", "repo-editor"]
-}

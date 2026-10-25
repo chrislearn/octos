@@ -5,8 +5,8 @@ use serde_json::json;
 async fn discovery_and_execution_preserve_the_advertised_schema() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("input.txt"), "needle\n").unwrap();
-    let mut registry = ToolRegistry::with_builtins(dir.path());
-    registry.set_fixed_dispatcher(true);
+    let registry = ToolRegistry::with_builtins(dir.path());
+
     let before = serde_json::to_value(registry.specs()).unwrap();
     let names: Vec<_> = registry.specs().into_iter().map(|s| s.name).collect();
     assert_eq!(
@@ -47,7 +47,7 @@ async fn discovery_and_execution_preserve_the_advertised_schema() {
 async fn gateway_does_not_bypass_host_or_hidden_tool_boundaries() {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = ToolRegistry::with_builtins(dir.path());
-    registry.set_fixed_dispatcher(true);
+
     registry.set_host_tool_allowlist(Some(&[
         "discover_tools".into(),
         "run_tool".into(),
@@ -90,8 +90,8 @@ async fn gateway_does_not_bypass_host_or_hidden_tool_boundaries() {
 #[test]
 fn denying_the_gateway_keeps_allowed_tools_directly_accessible() {
     let dir = tempfile::tempdir().unwrap();
-    let mut registry = ToolRegistry::with_builtins(dir.path());
-    registry.set_fixed_dispatcher(true);
+    let registry = ToolRegistry::with_builtins(dir.path());
+
     registry.set_host_tool_allowlist(Some(&["grep".into(), "read_file".into()]));
     assert!(registry.is_tool_visible("grep"));
     assert!(registry.specs().iter().any(|s| s.name == "grep"));
@@ -127,7 +127,7 @@ impl Tool for OptionalTool {
 async fn late_plugin_registration_is_discoverable_without_changing_specs() {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = ToolRegistry::with_builtins(dir.path());
-    registry.set_fixed_dispatcher(true);
+
     let before = serde_json::to_value(registry.specs()).unwrap();
     registry.register(OptionalTool { large: false });
     registry.mark_as_plugin("optional_plugin");
@@ -152,7 +152,7 @@ async fn late_plugin_registration_is_discoverable_without_changing_specs() {
 async fn oversized_schema_has_bounded_valid_json_and_can_be_inspected_in_fragments() {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = ToolRegistry::with_builtins(dir.path());
-    registry.set_fixed_dispatcher(true);
+
     registry.register(OptionalTool { large: true });
     let result = registry
         .execute("discover_tools", &json!({"name":"optional_plugin"}))
@@ -195,8 +195,8 @@ async fn oversized_schema_has_bounded_valid_json_and_can_be_inspected_in_fragmen
 #[tokio::test]
 async fn runtime_profile_denials_apply_to_target_and_gateway_and_discovery() {
     let dir = tempfile::tempdir().unwrap();
-    let mut registry = ToolRegistry::with_builtins(dir.path());
-    registry.set_fixed_dispatcher(true);
+    let registry = ToolRegistry::with_builtins(dir.path());
+
     for denied in ["write_file", "run_tool"] {
         let profile = octos_agent::profile::ProfileDefinition {
             tools: octos_agent::profile::ProfileTools::DenyList {
@@ -231,12 +231,11 @@ async fn runtime_profile_denials_apply_to_target_and_gateway_and_discovery() {
 }
 
 #[test]
-fn profile_preserves_exact_allowlist_and_can_disable_dispatch() {
+fn profile_preserves_exact_allowlist() {
     use octos_agent::profile::{ProfileDefinition, ProfileTools};
     let dir = tempfile::tempdir().unwrap();
     let mut registry = ToolRegistry::with_builtins(dir.path());
     ProfileDefinition {
-        fixed_tool_dispatcher: Some(true),
         tools: ProfileTools::AllowList {
             tools: vec!["grep".into()],
         },
@@ -251,11 +250,6 @@ fn profile_preserves_exact_allowlist_and_can_disable_dispatch() {
             .collect::<Vec<_>>(),
         ["grep"]
     );
-    let mut registry = ToolRegistry::with_builtins(dir.path());
-    let original = serde_json::to_value(registry.specs()).unwrap();
-    registry.set_fixed_dispatcher(true);
-    registry.set_fixed_dispatcher(false);
-    assert_eq!(serde_json::to_value(registry.specs()).unwrap(), original);
 }
 
 struct PendingTool(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -284,10 +278,11 @@ impl Tool for PendingTool {
 
 #[tokio::test]
 async fn cancelling_dispatch_drops_the_native_future_without_detaching_it() {
-    let mut registry = ToolRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::with_builtins(dir.path());
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     registry.register(PendingTool(dropped.clone()));
-    registry.set_fixed_dispatcher(true);
+
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(30),
         registry.execute("run_tool", &json!({"name":"pending_tool","arguments":{}})),
@@ -301,7 +296,7 @@ async fn cancelling_dispatch_drops_the_native_future_without_detaching_it() {
 async fn provider_policy_blocks_target_even_when_the_gateway_is_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = ToolRegistry::with_builtins(dir.path());
-    registry.set_fixed_dispatcher(true);
+
     registry.set_provider_policy(octos_agent::tools::policy::ToolPolicy {
         deny: vec!["write_file".into()],
         ..Default::default()
@@ -325,18 +320,78 @@ async fn provider_policy_blocks_target_even_when_the_gateway_is_allowed() {
 }
 
 #[test]
-fn schema_footprint_is_smaller_without_removing_capabilities() {
+fn dispatcher_schema_footprint_stays_small_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ToolRegistry::with_builtins(dir.path());
+    assert_eq!(registry.specs().len(), 6);
+    let bytes = serde_json::to_vec(&registry.specs()).unwrap().len();
+    assert!(bytes < 6000, "dispatcher schema grew to {bytes} bytes");
+    println!(
+        "default dispatcher: {} tools / {bytes} schema bytes",
+        registry.specs().len()
+    );
+}
+
+#[tokio::test]
+async fn ordinary_coding_session_uses_dispatcher_without_an_opt_in() {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = ToolRegistry::with_builtins(dir.path());
-    let native_count = registry.specs().len();
-    let native_bytes = serde_json::to_vec(&registry.specs()).unwrap().len();
-    octos_agent::profile::ProfileDefinition::builtin("coding-dispatch")
+    octos_agent::profile::ProfileDefinition::builtin("coding")
         .unwrap()
         .apply_to_registry(&mut registry);
-    let dispatch_bytes = serde_json::to_vec(&registry.specs()).unwrap().len();
-    assert!(dispatch_bytes < native_bytes);
-    println!(
-        "schema_metrics: {}",
-        json!({"native_count":native_count,"native_bytes":native_bytes,"dispatcher_count":registry.specs().len(),"dispatcher_bytes":dispatch_bytes})
+    let names: Vec<_> = registry.specs().into_iter().map(|spec| spec.name).collect();
+    assert_eq!(
+        names,
+        [
+            "discover_tools",
+            "edit_file",
+            "exec_command",
+            "read_file",
+            "run_tool",
+            "write_file"
+        ]
     );
+    assert!(
+        registry
+            .execute("discover_tools", &json!({"name":"web_search"}))
+            .await
+            .unwrap()
+            .success
+    );
+    assert!(registry.is_tool_model_reachable("apply_patch"));
+}
+
+#[test]
+fn obsolete_tool_surface_profiles_are_removed() {
+    for name in ["coding-full", "coding-compact", "coding-dispatch"] {
+        assert!(
+            octos_agent::profile::ProfileDefinition::builtin(name).is_none(),
+            "obsolete profile {name} still available"
+        );
+    }
+}
+
+#[test]
+fn swarm_profile_uses_standard_dispatcher_and_preserves_command_polling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::with_builtins(dir.path());
+    octos_agent::profile::ProfileDefinition::builtin("swarm")
+        .unwrap()
+        .apply_to_registry(&mut registry);
+    assert_eq!(
+        registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>(),
+        [
+            "discover_tools",
+            "edit_file",
+            "exec_command",
+            "read_file",
+            "run_tool",
+            "write_file"
+        ]
+    );
+    assert!(registry.is_tool_model_reachable("write_stdin"));
 }

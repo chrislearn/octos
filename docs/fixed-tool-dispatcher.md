@@ -1,16 +1,18 @@
 # Fixed tool dispatcher
 
-Use `octos chat --profile coding-dispatch`. The model sees six stable tool
+Run `octos chat`. The model sees six stable tool
 specifications: `read_file`, `write_file`, `edit_file`, `exec_command`,
 `discover_tools`, and `run_tool`. Other authorized implementations remain in
 the registry, including search, patches, web, browser, persistent command input,
 background task inspection, agent lifecycles, plugin and MCP tools.
 
-This is opt-in. Existing coding profiles keep their behavior. Embedders can call
-`ToolRegistry::set_fixed_dispatcher(true)` or use a profile with
-`"fixed_tool_dispatcher": true`. `OCTOS_TOOL_SURFACE=dispatcher` enables it when
-constructing built-ins; subsequent host/profile restrictions still apply.
-Enable this before starting a conversation to obtain a stable tool prefix.
+This is the standard interface for built-in runtime registries. No presentation
+mode switch is required. The old `coding-full`, `coding-compact` and
+`coding-dispatch` built-in variants, the `OCTOS_TOOL_SURFACE` switch and the
+profile presentation flags have been removed. Custom profiles still configure
+authorization, model preferences and agent setup; explicit host restrictions
+remain in force. A low-level `ToolRegistry::new()` remains empty for hosts that
+construct their own authorized registry.
 
 ## Model workflow
 
@@ -56,8 +58,9 @@ Resolution checks the current registry, host list, provider policy, context,
 availability, internal-hidden flag and profile permissions. Discovery applies
 the same filters. Neither gateway authorizes a tool the host removed or denied.
 If discovery or invocation is excluded, optional tools fall back to direct
-advertisement so the presentation setting does not silently remove allowed
-capabilities. Snapshots inherit the setting and the host restrictions.
+advertisement to honor that exact host policy without making allowed tools
+inaccessible. This authorization fallback is not a selectable presentation mode.
+Snapshots inherit the registered gateways and the host restrictions.
 
 Invalid or unavailable invocations fail as ordinary tool errors; they cannot
 be repaired by a wrapper hook after native admission has already happened.
@@ -69,17 +72,17 @@ native calls.
 
 The fixed tool array reduces upfront schema bytes and avoids discovery-driven
 changes to that array. Descriptions/schema results append to conversation
-history. This trades discovery requests for a smaller stable tool prefix;
-workloads that use most tools repeatedly may prefer `coding-compact` or
-`coding-full`. System prompts, provider serialization, compaction and changing
-authorization can still affect cache hits. No live cache-rate or throughput
+history. Discovery adds requests for previously unused capabilities; known
+schemas can be reused in later calls. System prompts, provider serialization,
+compaction and changing authorization can still affect cache hits. No live cache-rate or throughput
 improvement is implied by schema size alone.
 
-With optional Git/AST features disabled, the same build advertises 34 native
-specifications (23,631 serialized JSON bytes) versus six dispatcher specs
-(4,607 bytes), a reduction of 80.5%. These are schema bytes, not provider token
-counts. Reproduce with `cargo test -p octos-agent --no-default-features --test
-fixed_dispatcher -- --nocapture`; `schema_metrics` records both measurements.
+With optional Git/AST features disabled, the default six specifications use
+4,607 serialized JSON bytes. The prior full-surface build used 23,631 bytes
+for 34 entries (an 80.5% reduction in schema bytes). This is a historical schema-byte comparison,
+not a provider token or live-cache benchmark. Run `cargo test -p octos-agent
+--no-default-features --test fixed_dispatcher -- --nocapture` to check the
+current default footprint and behavior.
 
 Tests cover stable schemas across late registration and actual agent requests,
 permission denial, image delivery, native approval/resume, hooks, native and

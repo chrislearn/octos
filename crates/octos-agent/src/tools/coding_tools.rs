@@ -809,9 +809,8 @@ macro_rules! simple_codex_tool {
 
         #[async_trait]
         impl Tool for $name {
-            fn compact_replacement(&self) -> Option<&'static str> {
-                if $tool_name == "request_user_input" { Some("ask_user_question") } else { None }
-            }
+
+
             fn name(&self) -> &str {
                 $tool_name
             }
@@ -2045,10 +2044,6 @@ impl BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
-    fn compact_replacement(&self) -> Option<&'static str> {
-        Some("exec_command")
-    }
-
     fn name(&self) -> &str {
         "bash"
     }
@@ -2923,10 +2918,6 @@ fn detect_image_format(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
 
 #[async_trait]
 impl Tool for ViewImageTool {
-    fn compact_replacement(&self) -> Option<&'static str> {
-        Some("read_file")
-    }
-
     fn name(&self) -> &str {
         "view_image"
     }
@@ -3588,10 +3579,6 @@ impl ToolSuggestTool {
 
 #[async_trait]
 impl Tool for ToolSuggestTool {
-    fn compact_replacement(&self) -> Option<&'static str> {
-        Some("tool_search")
-    }
-
     fn name(&self) -> &str {
         "tool_suggest"
     }
