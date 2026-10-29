@@ -8408,15 +8408,24 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::SessionFilesRead(params) => {
-                handle_session_files_read(
-                    &ws,
-                    &state,
-                    &connection_headers,
-                    connection_identity.as_ref(),
-                    id,
-                    params,
-                )
-                .await;
+                if connection_is_external
+                    && let Err(error) = super::host_managed::external_session_file_read_permitted(
+                        &external_opened_sessions,
+                        &params.session_id,
+                    )
+                {
+                    let _ = send_rpc_error(&ws, Some(id), error);
+                } else {
+                    handle_session_files_read(
+                        &ws,
+                        &state,
+                        &connection_headers,
+                        connection_identity.as_ref(),
+                        id,
+                        params,
+                    )
+                    .await;
+                }
             }
             UiCommand::SessionTasksList(params) => {
                 handle_session_tasks_list(
