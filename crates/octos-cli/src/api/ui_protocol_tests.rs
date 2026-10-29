@@ -3767,6 +3767,10 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         | methods::SESSION_TASKS_LIST
         | methods::SESSION_WORKSPACE_GET
         | methods::SESSION_DELETE => json!({ "session_id": session_id.to_string() }),
+        methods::SESSION_FILES_READ => json!({
+            "session_id": session_id.to_string(),
+            "path": "report.md"
+        }),
         methods::SESSION_TITLE_SET => json!({
             "session_id": session_id.to_string(),
             "title": "Dispatch parity",
@@ -14547,6 +14551,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14623,6 +14628,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14744,6 +14750,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14820,6 +14827,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14889,6 +14897,7 @@ fn shell_approval_still_emits_risk_field() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -15003,6 +15012,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -19381,6 +19391,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
             header_present: true,
             stdio_transport: false,
         },

@@ -528,6 +528,7 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `session/list`, `session/snapshot`, `session/messages_page`,
   `session/status.get`, `session/files.list`, `session/tasks.list`,
   `session/workspace.get`, `session/title.set`, `session/delete`
+- `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`)
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
@@ -2087,6 +2088,17 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Params type: `SessionFilesListParams` — `{ session_id: string }`.
 - Result type: `SessionFilesListResult` — `{ files: SessionFileInfo[] }`.
 - Errors: `unknown_session` on REST 404.
+
+#### `session/files/read`
+
+- Gate: `session.files.read.v1` (accepted `UPCR-2026-057`).
+- Purpose: read-only, bounded download of one explicitly named regular file from the authorized session workspace. Complements `session/files.list`; it is not directory browsing or a general repository filesystem API.
+- Params type: `SessionFilesReadParams` — `{ session_id, path, offset?, length? }`.
+  `path` is workspace-relative and must not contain absolute roots, backslashes or `..`. `offset` defaults to 0; `length` defaults to and is clamped to 512 KiB (524,288 bytes), and must be nonzero.
+- Result type: `SessionFilesReadResult` — `{ session_id, path, size_bytes, offset, eof, mime_type, encoding, content_base64 }`. `encoding` is `"base64"`; only the requested chunk is returned. `size_bytes` is the full file size and `eof` marks whether this chunk reaches the current end. Clients may reassemble binary files in multiple requests.
+- Limits: files over 32 MiB return `workspace_file_too_large`. One base64 response stays below the 1 MiB WS frame limit.
+- Authorization and containment: the same session/profile workspace owner as #1377. The approved root is canonicalized once (allowing legitimate symlinked ancestors), then on Unix it and every user-controlled relative component are opened relative to a trusted directory descriptor with `O_NOFOLLOW` (non-Unix uses checked paths); type and size are validated on the opened descriptor. Absolute paths, traversal, directories, non-regular files and ancestor/leaf symlink escapes are refused. Host-managed external access is separately reviewable and, when enabled, requires that this connection has already opened the same session; another session returns `external_session_not_opened`.
+- Errors: `method_not_supported` without the feature, plus typed `data.kind` values `workspace_file_invalid_path`, `workspace_file_escape`, `workspace_file_not_found`, `workspace_file_not_regular`, `workspace_file_too_large`, `workspace_file_offset_out_of_range`, `workspace_file_invalid_length`, `session_workspace_not_found`, and `workspace_file_access_denied`. Absolute host paths are never included.
 
 #### `session/tasks.list`
 

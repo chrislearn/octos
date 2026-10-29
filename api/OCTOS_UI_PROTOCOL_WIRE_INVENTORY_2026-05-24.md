@@ -39,6 +39,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/messages_page` | shipped REST-to-WS method |
 | `session/status.get` | shipped REST-to-WS method |
 | `session/files.list` | shipped REST-to-WS method |
+| `session/files/read` | capability-gated read-only session workspace file chunks, UPCR-2026-057 |
 | `session/tasks.list` | shipped REST-to-WS method |
 | `session/workspace.get` | shipped REST-to-WS method |
 | `session/title.set` | shipped REST-to-WS method |

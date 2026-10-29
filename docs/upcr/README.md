@@ -82,6 +82,7 @@ records.
 | 053 | Participant on `session/append_message` and participant-scoped memory extraction | implemented | `..._053_APPEND_MESSAGE_PARTICIPANT.md` | #2859 |
 | 054 | Dispatcher capability availability and transport context projection | implemented (pending merge) | `..._054_DISPATCHER_CAPABILITY_STATUS.md` | #2862 |
 | 056 | Interrupted-turn durability: dispatched prompt commits to durable history | implemented (pending merge) | `..._056_INTERRUPTED_TURN_DURABILITY.md` | #2849 |
+| 057 | Read a file from a session workspace | proposed (implemented for review) | `..._057_SESSION_FILES_READ.md` | — |
 
 ## Renumbering history
 
