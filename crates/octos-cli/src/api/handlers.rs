@@ -2675,6 +2675,19 @@ fn open_workspace_file(
     relative: &std::path::Path,
 ) -> std::io::Result<std::fs::File> {
     let path = super::file_mutations::checked_path(root, relative)?;
+    let metadata = path.symlink_metadata()?;
+    if metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "workspace path is not a regular file",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "workspace path is not a regular file",
+        ));
+    }
     std::fs::OpenOptions::new().read(true).open(path)
 }
 
