@@ -1425,6 +1425,7 @@ impl ProfileRuntime {
 
         #[async_trait::async_trait]
         impl CronDelivery for ServeCronDelivery {
+            #[cfg(feature = "api")]
             async fn deliver(&self, job: &octos_bus::CronJob) -> Result<(), String> {
                 let Some(session_id) = job.origin.session_id.as_deref() else {
                     return Err("session_not_found".to_owned());
@@ -1462,6 +1463,12 @@ impl ProfileRuntime {
                     crate::autonomy::master_continuation_scheduler::MasterContinuationEnqueueOutcome::Queued(_)
                     | crate::autonomy::master_continuation_scheduler::MasterContinuationEnqueueOutcome::Duplicate { .. } => Ok(()),
                 }
+            }
+
+            #[cfg(not(feature = "api"))]
+            async fn deliver(&self, _job: &octos_bus::CronJob) -> Result<(), String> {
+                let _ = &self.profile_id;
+                Err("session_open_required".to_owned())
             }
         }
 
