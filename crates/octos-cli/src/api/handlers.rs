@@ -2680,6 +2680,7 @@ fn open_workspace_file(
 
 fn workspace_open_error(error: std::io::Error) -> RpcError {
     match error.kind() {
+        #[cfg(unix)]
         _ if error.raw_os_error() == Some(libc::ELOOP)
             || error.kind() == std::io::ErrorKind::NotADirectory =>
         {
@@ -2689,6 +2690,12 @@ fn workspace_open_error(error: std::io::Error) -> RpcError {
                 "workspace file must stay inside the session workspace",
             )
         }
+        #[cfg(not(unix))]
+        _ if error.kind() == std::io::ErrorKind::NotADirectory => workspace_file_error(
+            rpc_error_codes::PERMISSION_DENIED,
+            "workspace_file_escape",
+            "workspace file must stay inside the session workspace",
+        ),
         std::io::ErrorKind::PermissionDenied => workspace_file_error(
             rpc_error_codes::PERMISSION_DENIED,
             "workspace_file_escape",
@@ -6187,6 +6194,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn workspace_open_error_maps_not_a_directory_to_escape() {
         let error = workspace_open_error(std::io::Error::from_raw_os_error(libc::ENOTDIR));
