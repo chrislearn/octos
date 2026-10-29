@@ -3767,6 +3767,10 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         | methods::SESSION_TASKS_LIST
         | methods::SESSION_WORKSPACE_GET
         | methods::SESSION_DELETE => json!({ "session_id": session_id.to_string() }),
+        methods::SESSION_FILES_READ => json!({
+            "session_id": session_id.to_string(),
+            "path": "report.md"
+        }),
         methods::SESSION_TITLE_SET => json!({
             "session_id": session_id.to_string(),
             "title": "Dispatch parity",

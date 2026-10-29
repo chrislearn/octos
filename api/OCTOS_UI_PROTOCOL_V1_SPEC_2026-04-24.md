@@ -527,8 +527,8 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 
 - `session/list`, `session/snapshot`, `session/messages_page`,
   `session/status.get`, `session/files.list`, `session/tasks.list`,
-- `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`),
   `session/workspace.get`, `session/title.set`, `session/delete`
+- `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`)
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`

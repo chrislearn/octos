@@ -25809,12 +25809,7 @@ pub(crate) fn set_session_workspace_root_for_test(
     session_id: &SessionKey,
     root: PathBuf,
 ) {
-    session_workspaces().set_resolved(
-        &profile_id.to_owned(),
-        session_id.clone(),
-        root.clone(),
-        Some(root),
-    );
+    session_workspaces().set_resolved(profile_id, session_id.clone(), root.clone(), Some(root));
 }
 
 pub(crate) fn session_workspace_root_for_state(
