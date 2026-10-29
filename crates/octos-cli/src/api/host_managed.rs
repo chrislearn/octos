@@ -191,12 +191,10 @@ pub fn external_session_file_read_permitted(
     if opened_sessions.contains(session_id) {
         Ok(())
     } else {
-        Err(
-            octos_core::ui_protocol::RpcError::permission_denied(
-                "external file reads require session/open on this connection",
-            )
-            .with_data(serde_json::json!({ "kind": EXTERNAL_SESSION_NOT_OPENED })),
+        Err(octos_core::ui_protocol::RpcError::permission_denied(
+            "external file reads require session/open on this connection",
         )
+        .with_data(serde_json::json!({ "kind": EXTERNAL_SESSION_NOT_OPENED })))
     }
 }
 

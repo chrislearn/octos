@@ -50,10 +50,9 @@ use octos_core::ui_protocol::{
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionAppendMessageParams, SessionAppendMessageResult, SessionBtwParams, SessionDeleteParams,
     SessionFilesListParams, SessionFilesReadParams, SessionHydrateParams, SessionHydrateResult,
-    SessionListParams,
-    SessionMessagesPageParams, SessionOpenParams, SessionOpenResult, SessionOpened,
-    SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult, SessionSnapshotParams,
-    SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
+    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
+    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
     SessionWorkspaceGetParams, SkillActionJobUpdatedEvent, SystemStatusGetParams,
     TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
     TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
@@ -2366,6 +2365,8 @@ struct ConnectionUiFeatures {
     session_append_full_history_retry_v1: bool,
     /// UPCR-2026-053: client asked whether `participant` is persisted.
     session_append_participant_v1: bool,
+    /// UPCR-2026-057: bounded read-only chunks from a session workspace.
+    session_files_read_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -2490,6 +2491,11 @@ impl ConnectionUiFeatures {
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
             ),
+            session_files_read_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -2534,6 +2540,7 @@ impl ConnectionUiFeatures {
             turn_steer_dropped_v1: true,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: true,
             header_present: true,
             stdio_transport: true,
         }
@@ -2586,6 +2593,9 @@ impl ConnectionUiFeatures {
             ),
             session_append_participant_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+            ),
+            session_files_read_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
             ),
             header_present: true,
             stdio_transport,
@@ -2711,6 +2721,9 @@ impl ConnectionUiFeatures {
         if self.session_append_participant_v1 {
             requested
                 .push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1);
+        }
+        if self.session_files_read_v1 {
+            requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -22297,6 +22310,9 @@ fn route_rpc_command(
         | octos_core::ui_protocol::methods::MEMORY_PROMOTE
         | octos_core::ui_protocol::methods::CRON_LIST
         | octos_core::ui_protocol::methods::CRON_TOGGLE => Some(features.auxiliary_rest_to_ws_v1),
+        octos_core::ui_protocol::methods::SESSION_FILES_READ => {
+            Some(features.session_files_read_v1)
+        }
         // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
         // that did not negotiate `user_question.v1` never received a
         // `user_question/requested`, so it has nothing to answer; reject the
@@ -25785,6 +25801,20 @@ pub(crate) fn session_workspace_root_for_profile(
     // raw session id.
     let workspace_profile_id = workspace_profile_scope(profile_id, session_id);
     session_workspaces().get(&workspace_profile_id, session_id)
+}
+
+#[cfg(test)]
+pub(crate) fn set_session_workspace_root_for_test(
+    profile_id: &str,
+    session_id: &SessionKey,
+    root: PathBuf,
+) {
+    session_workspaces().set_resolved(
+        &profile_id.to_owned(),
+        session_id.clone(),
+        root.clone(),
+        Some(root),
+    );
 }
 
 pub(crate) fn session_workspace_root_for_state(

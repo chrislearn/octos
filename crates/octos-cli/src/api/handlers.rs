@@ -193,6 +193,26 @@ fn resolve_session_workspace_root(
     Some(data_dir.join("users").join(encoded).join("workspace"))
 }
 
+/// Workspace binding for UPCR-2026-057. An approved external cwd recorded by
+/// `session/open` is authoritative even when it is outside the profile data
+/// dir; the legacy `/api/files` resolver deliberately rejects that broader
+/// case and must keep its narrower behavior. The legacy fallback remains for
+/// an evicted session that has no recorded binding.
+fn resolve_session_workspace_root_for_read(
+    state: &AppState,
+    data_dir: &std::path::Path,
+    profile_id: Option<&str>,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    let key = octos_core::SessionKey(session_id.to_owned());
+    if let Some(root) =
+        crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
+    {
+        return Some(root);
+    }
+    resolve_session_workspace_root(state, data_dir, profile_id, session_id)
+}
+
 /// True when `ws` is contained under the authenticated profile data dir.
 /// Canonicalizes both sides and fails closed if either path is unavailable.
 fn map_workspace_belongs_to_tenant(ws: &std::path::Path, data_dir: &std::path::Path) -> bool {
@@ -1642,12 +1662,9 @@ async fn read_session_workspace_file(
             "path must be a workspace-relative file path without '..'",
         ));
     }
-    let Some(workspace) = resolve_session_workspace_root(
-        state,
-        data_dir,
-        profile_id,
-        &params.session_id,
-    ) else {
+    let Some(workspace) =
+        resolve_session_workspace_root_for_read(state, data_dir, profile_id, &params.session_id)
+    else {
         return Err(workspace_file_error(
             rpc_error_codes::RESOURCE_NOT_FOUND,
             "session_workspace_not_found",
@@ -5961,7 +5978,10 @@ mod tests {
         assert!(!first.eof);
         assert_eq!(first.mime_type, "text/markdown");
         assert_eq!(first.encoding, "base64");
-        assert_eq!(BASE64_STANDARD.decode(&first.content_base64).unwrap(), b"ello");
+        assert_eq!(
+            BASE64_STANDARD.decode(&first.content_base64).unwrap(),
+            b"ello"
+        );
 
         let last = read_session_workspace_file(
             &state,
@@ -5972,7 +5992,10 @@ mod tests {
         .await
         .unwrap();
         assert!(last.eof);
-        assert_eq!(BASE64_STANDARD.decode(&last.content_base64).unwrap(), b" octos");
+        assert_eq!(
+            BASE64_STANDARD.decode(&last.content_base64).unwrap(),
+            b" octos"
+        );
 
         std::fs::write(workspace.join("raw.bin"), [0, 255, 1, 128]).unwrap();
         let binary = read_session_workspace_file(
@@ -5984,7 +6007,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(binary.mime_type, "application/octet-stream");
-        assert_eq!(BASE64_STANDARD.decode(binary.content_base64).unwrap(), [0, 255, 1, 128]);
+        assert_eq!(
+            BASE64_STANDARD.decode(binary.content_base64).unwrap(),
+            [0, 255, 1, 128]
+        );
     }
 
     #[tokio::test]
@@ -6002,7 +6028,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(BASE64_STANDARD.decode(result.content_base64.clone()).unwrap().len() as u64, SESSION_FILE_READ_CHUNK_BYTES);
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(result.content_base64.clone())
+                .unwrap()
+                .len() as u64,
+            SESSION_FILE_READ_CHUNK_BYTES
+        );
         assert!(result.content_base64.len() < 1024 * 1024);
         assert!(!result.eof);
     }
@@ -6022,7 +6054,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(error.data.as_ref().unwrap()["kind"], "workspace_file_invalid_path");
+            assert_eq!(
+                error.data.as_ref().unwrap()["kind"],
+                "workspace_file_invalid_path"
+            );
         }
         std::fs::create_dir(workspace.join("directory")).unwrap();
         let error = read_session_workspace_file(
@@ -6033,7 +6068,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.data.as_ref().unwrap()["kind"], "workspace_file_not_regular");
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_not_regular"
+        );
 
         #[cfg(unix)]
         {
@@ -6048,8 +6086,38 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(error.data.as_ref().unwrap()["kind"], "workspace_file_escape");
+            assert_eq!(
+                error.data.as_ref().unwrap()["kind"],
+                "workspace_file_escape"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn session_file_read_uses_approved_external_workspace_binding() {
+        let data = tempfile::tempdir().unwrap();
+        let approved = tempfile::tempdir().unwrap();
+        assert!(!approved.path().starts_with(data.path()));
+        std::fs::write(approved.path().join("report.md"), b"approved").unwrap();
+        let session = SessionKey("api:external-cwd".to_owned());
+        crate::api::ui_protocol_transport::set_session_workspace_root_for_test(
+            MAIN_PROFILE_ID,
+            &session,
+            approved.path().to_path_buf(),
+        );
+        let state = AppState::empty_for_tests();
+        let result = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params(&session.0, "report.md", None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            BASE64_STANDARD.decode(result.content_base64).unwrap(),
+            b"approved"
+        );
     }
 
     #[tokio::test]
@@ -6074,7 +6142,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.data.as_ref().unwrap()["kind"], "workspace_file_too_large");
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_too_large"
+        );
 
         std::fs::write(workspace.join("small.md"), b"ok").unwrap();
         let error = read_session_workspace_file(
@@ -6085,7 +6156,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.data.as_ref().unwrap()["kind"], "workspace_file_offset_out_of_range");
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_offset_out_of_range"
+        );
         let error = read_session_workspace_file(
             &state,
             data.path(),
@@ -6094,7 +6168,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.data.as_ref().unwrap()["kind"], "workspace_file_invalid_length");
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_invalid_length"
+        );
     }
 
     #[test]
