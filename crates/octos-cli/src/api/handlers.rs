@@ -1671,6 +1671,16 @@ async fn read_session_workspace_file(
             "session workspace was not found",
         ));
     };
+    // Canonicalizing the approved root preserves legitimate symlinked
+    // ancestors (for example macOS /var -> /private/var). Only the
+    // user-controlled relative components then need the no-follow walk.
+    let root = std::fs::canonicalize(&workspace).map_err(|_| {
+        workspace_file_error(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            "session_workspace_not_found",
+            "session workspace was not found",
+        )
+    })?;
     let offset = params.offset.unwrap_or(0);
     let length = params
         .length
@@ -1685,7 +1695,7 @@ async fn read_session_workspace_file(
     }
     let length = length.min(SESSION_FILE_READ_CHUNK_BYTES);
     let (bytes, size_bytes, eof) =
-        read_file_chunk_no_follow(workspace, relative, offset, length).await?;
+        read_file_chunk_no_follow(root, relative, offset, length).await?;
     Ok(SessionFilesReadResult {
         session_id: params.session_id,
         path: params.path.clone(),
@@ -6183,6 +6193,35 @@ mod tests {
         assert_eq!(
             error.data.as_ref().unwrap()["kind"],
             "workspace_file_escape"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_file_read_supports_symlinked_workspace_ancestors() {
+        let data = tempfile::tempdir().unwrap();
+        let real_root = tempfile::tempdir().unwrap();
+        std::fs::write(real_root.path().join("report.md"), b"canonical").unwrap();
+        let alias = data.path().join("workspace-alias");
+        std::os::unix::fs::symlink(real_root.path(), &alias).unwrap();
+        let session = SessionKey("api:symlinked-root".to_owned());
+        crate::api::ui_protocol_transport::set_session_workspace_root_for_test(
+            MAIN_PROFILE_ID,
+            &session,
+            alias,
+        );
+        let state = AppState::empty_for_tests();
+        let result = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params(&session.0, "report.md", None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            BASE64_STANDARD.decode(result.content_base64).unwrap(),
+            b"canonical"
         );
     }
 
