@@ -49,7 +49,8 @@ use octos_core::ui_protocol::{
     SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionAppendMessageParams, SessionAppendMessageResult, SessionBtwParams, SessionDeleteParams,
-    SessionFilesListParams, SessionHydrateParams, SessionHydrateResult, SessionListParams,
+    SessionFilesListParams, SessionFilesReadParams, SessionHydrateParams, SessionHydrateResult,
+    SessionListParams,
     SessionMessagesPageParams, SessionOpenParams, SessionOpenResult, SessionOpened,
     SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult, SessionSnapshotParams,
     SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
@@ -8406,6 +8407,17 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionFilesRead(params) => {
+                handle_session_files_read(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::SessionTasksList(params) => {
                 handle_session_tasks_list(
                     &ws,
@@ -9388,6 +9400,10 @@ where
                 }
                 UiCommand::SessionFilesList(params) => {
                     handle_session_files_list(&ws, &state, &connection_headers, None, id, params)
+                        .await;
+                }
+                UiCommand::SessionFilesRead(params) => {
+                    handle_session_files_read(&ws, &state, &connection_headers, None, id, params)
                         .await;
                 }
                 UiCommand::SessionTasksList(params) => {
@@ -22528,6 +22544,7 @@ fn validate_session_ingress_command_scope(
             string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
         }
         UiCommand::SessionFilesList(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionFilesRead(params) => SessionKey(params.session_id.clone()),
         UiCommand::SessionTasksList(params) => {
             string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
         }
@@ -33350,6 +33367,24 @@ async fn handle_session_files_list(
     match rest_response_to_rpc_value(response, method, context).await {
         Ok(files) => {
             send_aux_rpc_result(ws, id, method, json!({ "files": files }));
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_session_files_read(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: String,
+    params: SessionFilesReadParams,
+) {
+    match super::handlers::session_file_read(state, headers, identity, params).await {
+        Ok(result) => {
+            let _ = send_rpc_result(ws, id, serde_json::to_value(result).unwrap_or_default());
         }
         Err(error) => {
             let _ = send_rpc_error(ws, Some(id), error);
