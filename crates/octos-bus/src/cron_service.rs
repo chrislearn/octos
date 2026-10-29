@@ -13,11 +13,23 @@ use tracing::{debug, info, warn};
 
 use crate::cron_types::{CronJob, CronMode, CronOrigin, CronPayload, CronSchedule, CronStore};
 
+/// Serve-only delivery adapter. Returning `Ok(())` means the exact session's
+/// durable continuation queue accepted the occurrence; a later turn failure
+/// does not re-fire it. The gateway's ordinary mpsc path is unchanged.
+#[async_trait::async_trait]
+pub trait CronDelivery: Send + Sync {
+    async fn deliver(&self, job: &CronJob) -> Result<(), String>;
+}
+
+const MAX_DELIVERY_ATTEMPTS: u32 = 5;
+const DELIVERY_RETRY_DELAY_MS: i64 = 15 * 60 * 1000;
+
 /// Service that manages and executes cron jobs.
 pub struct CronService {
     store_path: PathBuf,
     store: Mutex<CronStore>,
     inbound_tx: mpsc::Sender<InboundMessage>,
+    delivery: Option<std::sync::Arc<dyn CronDelivery>>,
     running: AtomicBool,
     timer_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     /// Shutdown notification: every sleeper task in `arm_timer`
@@ -58,10 +70,23 @@ impl CronService {
             store_path,
             store: Mutex::new(store),
             inbound_tx,
+            delivery: None,
             running: AtomicBool::new(false),
             timer_handle: tokio::sync::Mutex::new(None),
             shutdown_notify: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Create a serve cron service whose delivery is acknowledged by the
+    /// session continuation queue rather than an mpsc sender with no receiver.
+    pub fn new_with_delivery(
+        store_path: impl AsRef<Path>,
+        delivery: std::sync::Arc<dyn CronDelivery>,
+    ) -> Self {
+        let (inbound_tx, _unused) = mpsc::channel(1);
+        let mut service = Self::new(store_path, inbound_tx);
+        service.delivery = Some(delivery);
+        service
     }
 
     /// Start the cron service: recompute next runs and arm the timer.
@@ -599,15 +624,20 @@ impl CronService {
                     if !stored_job.is_due(now_ms) {
                         continue;
                     }
+                    if reserve.delivery.is_some() {
+                        stored_job.state.delivery_fire_at_ms = stored_job.state.next_run_at_ms;
+                    }
                     due.push(stored_job.clone());
 
-                    stored_job.state.last_run_at_ms = Some(now_ms);
-                    stored_job.state.last_status = Some("ok".into());
+                    if reserve.delivery.is_none() {
+                        stored_job.state.last_run_at_ms = Some(now_ms);
+                        stored_job.state.last_status = Some("ok".into());
 
-                    if stored_job.delete_after_run {
-                        to_delete.push(stored_job.id.clone());
-                    } else {
-                        stored_job.compute_next_run(now_ms);
+                        if stored_job.delete_after_run {
+                            to_delete.push(stored_job.id.clone());
+                        } else {
+                            stored_job.compute_next_run(now_ms);
+                        }
                     }
                 }
 
@@ -632,7 +662,7 @@ impl CronService {
     }
 
     /// Fire a single job by sending an InboundMessage into the bus.
-    async fn execute_job(&self, job: &CronJob) {
+    async fn execute_job(self: &std::sync::Arc<Self>, job: &CronJob) {
         info!(job_id = %job.id, name = %job.name, mode = ?job.payload.mode, "executing cron job");
 
         // Notify jobs never reach the bus. The bus is what turns a cron fire
@@ -646,6 +676,9 @@ impl CronService {
                 channel = ?job.payload.channel,
                 "cron notify: delivering message verbatim, no model turn"
             );
+            if self.delivery.is_some() {
+                self.complete_delivery(job).await;
+            }
             return;
         }
 
@@ -664,6 +697,30 @@ impl CronService {
             message_id: None,
             origin: octos_core::MessageOrigin::ExternalUser,
         };
+
+        if let Some(delivery) = self.delivery.clone() {
+            let notified = self.shutdown_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.running.load(Ordering::Relaxed) {
+                self.record_delivery_failure(job, "delivery_unavailable".to_owned())
+                    .await;
+                return;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut notified => {
+                    self.record_delivery_failure(job, "delivery_unavailable".to_owned()).await;
+                }
+                outcome = delivery.deliver(job) => {
+                    match outcome {
+                        Ok(()) => self.complete_delivery(job).await,
+                        Err(reason) => self.record_delivery_failure(job, reason).await,
+                    }
+                }
+            }
+            return;
+        }
 
         // The delivery unit is detached (not abort-targeted), so a
         // shutdown can no longer cancel an in-flight send by aborting
@@ -703,6 +760,64 @@ impl CronService {
                 }
             }
         }
+    }
+
+    async fn complete_delivery(self: &std::sync::Arc<Self>, job: &CronJob) {
+        let this = std::sync::Arc::clone(self);
+        let job = job.clone();
+        let now_ms = Utc::now().timestamp_millis();
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut store = this.store.lock().unwrap_or_else(|e| e.into_inner());
+            if job.delete_after_run {
+                store.jobs.retain(|candidate| candidate.id != job.id);
+            } else if let Some(stored) = store
+                .jobs
+                .iter_mut()
+                .find(|candidate| candidate.id == job.id)
+            {
+                stored.state.last_run_at_ms = Some(now_ms);
+                stored.state.last_status = Some("ok".into());
+                stored.state.last_error = None;
+                stored.state.delivery_attempts = 0;
+                stored.state.delivery_fire_at_ms = None;
+                stored.compute_next_run(now_ms);
+            }
+            if let Err(error) = persist_store_locked(&this.store_path, &store) {
+                warn!(%error, job_id = %job.id, "failed to persist accepted cron delivery");
+            }
+        })
+        .await;
+    }
+
+    async fn record_delivery_failure(self: &std::sync::Arc<Self>, job: &CronJob, reason: String) {
+        let this = std::sync::Arc::clone(self);
+        let mut failed = job.clone();
+        let now_ms = Utc::now().timestamp_millis();
+        let _ = tokio::task::spawn_blocking(move || {
+            failed.state.delivery_attempts = failed.state.delivery_attempts.saturating_add(1);
+            let attempts = failed.state.delivery_attempts;
+            failed.state.last_error = Some(reason);
+            failed.state.last_status = Some(if attempts >= MAX_DELIVERY_ATTEMPTS {
+                "disabled".into()
+            } else {
+                "error".into()
+            });
+            failed.state.next_run_at_ms =
+                (attempts < MAX_DELIVERY_ATTEMPTS).then_some(now_ms + DELIVERY_RETRY_DELAY_MS);
+            failed.enabled = attempts < MAX_DELIVERY_ATTEMPTS;
+            let mut store = this.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(stored) = store
+                .jobs
+                .iter_mut()
+                .find(|candidate| candidate.id == failed.id)
+            {
+                *stored = failed;
+            }
+            if let Err(error) = persist_store_locked(&this.store_path, &store) {
+                warn!(%error, "failed to persist cron delivery failure");
+            }
+        })
+        .await;
     }
 }
 
@@ -1748,6 +1863,127 @@ mod tests {
 
     /// A MISSING store is the normal first run — it must stay silent and must
     /// NOT create a quarantine file.
+    #[derive(Clone)]
+    struct TestDelivery {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CronDelivery for TestDelivery {
+        async fn deliver(&self, _job: &CronJob) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                Err("session_not_found".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn delivery_service(
+        dir: &std::path::Path,
+        fail: bool,
+    ) -> (
+        std::sync::Arc<CronService>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = std::sync::Arc::new(CronService::new_with_delivery(
+            dir.join("cron.json"),
+            std::sync::Arc::new(TestDelivery {
+                calls: calls.clone(),
+                fail,
+            }),
+        ));
+        (service, calls)
+    }
+
+    #[tokio::test]
+    async fn serve_delivery_deletes_one_shot_only_after_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, calls) = delivery_service(dir.path(), false);
+        service
+            .add_job_with_origin(
+                "once".into(),
+                CronSchedule::At { at_ms: 0 },
+                payload("deliver", CronMode::Agent),
+                None,
+                CronOrigin::default(),
+            )
+            .unwrap();
+        service.running.store(true, Ordering::Relaxed);
+        service.on_timer().await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(
+            load_store(&dir.path().join("cron.json"))
+                .unwrap()
+                .jobs
+                .is_empty()
+        );
+        service.on_timer().await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "accepted occurrence never refires"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_delivery_failure_retains_then_disables_after_five_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, calls) = delivery_service(dir.path(), true);
+        service
+            .add_job_with_origin(
+                "retry".into(),
+                CronSchedule::At { at_ms: 0 },
+                payload("deliver", CronMode::Agent),
+                None,
+                CronOrigin::default(),
+            )
+            .unwrap();
+        service.running.store(true, Ordering::Relaxed);
+        service.on_timer().await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let first = load_store(&dir.path().join("cron.json")).unwrap();
+        assert_eq!(first.jobs.len(), 1);
+        assert_eq!(first.jobs[0].state.delivery_attempts, 1);
+        assert_eq!(first.jobs[0].state.last_status.as_deref(), Some("error"));
+        assert_eq!(
+            first.jobs[0].state.last_error.as_deref(),
+            Some("session_not_found")
+        );
+        assert!(first.jobs[0].enabled);
+        assert!(first.jobs[0].state.next_run_at_ms.is_some());
+        assert_eq!(first.jobs[0].state.delivery_fire_at_ms, Some(0));
+        assert!(first.jobs[0].state.last_run_at_ms.is_none());
+
+        for _ in 0..4 {
+            {
+                let mut store = service.store.lock().unwrap();
+                store.jobs[0].state.next_run_at_ms = Some(0);
+            }
+            service.on_timer().await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let last = load_store(&dir.path().join("cron.json")).unwrap();
+        assert_eq!(
+            last.jobs.len(),
+            1,
+            "failed job is retained, never silently deleted"
+        );
+        assert_eq!(last.jobs[0].state.delivery_attempts, 5);
+        assert_eq!(last.jobs[0].state.last_status.as_deref(), Some("disabled"));
+        assert_eq!(
+            last.jobs[0].state.last_error.as_deref(),
+            Some("session_not_found")
+        );
+        assert!(!last.jobs[0].enabled);
+        assert!(last.jobs[0].state.next_run_at_ms.is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+    }
+
     #[test]
     fn missing_cron_store_is_not_treated_as_corruption() {
         let dir = tempfile::tempdir().unwrap();

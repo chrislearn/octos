@@ -17,7 +17,7 @@ use octos_agent::{
     HookExecutor, PluginLoadOptions, PluginLoadResult, PluginLoader, SandboxConfig,
     ToolConfigStore, ToolPolicy, ToolRegistry, create_sandbox,
 };
-use octos_bus::CronService;
+use octos_bus::{CronDelivery, CronService};
 use octos_llm::{AdaptiveRouter, LlmProvider, QosCatalog};
 use octos_memory::{EpisodeStore, MemoryStore};
 use tracing::{info, warn};
@@ -1418,6 +1418,53 @@ impl ProfileRuntime {
         // hook empty, including for spawned agents and plugin reloads.
         let pipeline_factory = None;
 
+        #[derive(Clone)]
+        struct ServeCronDelivery {
+            profile_id: String,
+        }
+
+        #[async_trait::async_trait]
+        impl CronDelivery for ServeCronDelivery {
+            async fn deliver(&self, job: &octos_bus::CronJob) -> Result<(), String> {
+                let Some(session_id) = job.origin.session_id.as_deref() else {
+                    return Err("session_not_found".to_owned());
+                };
+                if job.origin.profile_id.as_deref() != Some(self.profile_id.as_str()) {
+                    return Err("session_profile_mismatch".to_owned());
+                }
+                let session = octos_core::SessionKey(session_id.to_owned());
+                // A newly opened session has no transcript file yet; its
+                // rehydrated workspace is the authoritative live-session check.
+                if crate::api::ui_protocol_transport::session_workspace_root_for_profile(
+                    Some(&self.profile_id),
+                    &session,
+                )
+                .is_none()
+                {
+                    return Err("session_open_required".to_owned());
+                }
+                let scheduled_fire_at_ms = job
+                    .state
+                    .delivery_fire_at_ms
+                    .or(job.state.next_run_at_ms)
+                    .unwrap_or(job.created_at_ms);
+                let late = chrono::Utc::now().timestamp_millis() > scheduled_fire_at_ms;
+                match crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                    .enqueue_cron_fire_continuation(
+                        &session,
+                        &self.profile_id,
+                        &job.id,
+                        scheduled_fire_at_ms,
+                        &job.payload.message,
+                        late,
+                    )
+                {
+                    crate::autonomy::master_continuation_scheduler::MasterContinuationEnqueueOutcome::Queued(_)
+                    | crate::autonomy::master_continuation_scheduler::MasterContinuationEnqueueOutcome::Duplicate { .. } => Ok(()),
+                }
+            }
+        }
+
         // M11-F regression fix REG-2: restore the CronTool registration.
         //
         // Pre-M11-F `serve.rs::try_create_agent` built one `CronService`
@@ -1430,17 +1477,12 @@ impl ProfileRuntime {
         // (`episodes.redb`, `memory.json`) that already live in
         // `data_dir`.
         //
-        // The `cron_tx` here is a dummy channel: serve mode does not
-        // route cron fires through the gateway-style inbound bus, so
-        // the timer-driven sends will fill the bounded channel and be
-        // dropped when the receiver is dropped at the end of this
-        // function. That preserves the pre-M11-F semantics — cron CRUD
-        // (`add` / `list` / `remove` / `enable` / `disable`) works in
-        // serve mode but actual firing only happens under `octos
-        // gateway`. We keep the `Arc<CronService>` alive by stashing it
-        // on `ProfileRuntime::cron_service`; without that field the
-        // tokio task `start()` spawned would be cancelled the moment
-        // this function returned.
+        // Serve uses an acknowledged delivery adapter: an exact existing
+        // session's durable continuation queue must accept the occurrence
+        // before the store records ok/deletes it. The gateway keeps its own
+        // inbound mpsc path unchanged. We keep the `Arc<CronService>` alive
+        // by stashing it on `ProfileRuntime::cron_service`; without that field
+        // the tokio task `start()` spawned would be cancelled on return.
         // A replacement runtime keeps the running service and its shutdown
         // owner: a second `start()` on the same `cron.json` would fire jobs
         // twice, and dropping the previous lifecycle would stop the timer.
@@ -1452,8 +1494,12 @@ impl ProfileRuntime {
         }) {
             Some((cron_service, lifecycle)) => (cron_service, Some(lifecycle)),
             None => {
-                let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
-                let cron_service = Arc::new(CronService::new(data_dir.join("cron.json"), cron_tx));
+                let cron_service = Arc::new(CronService::new_with_delivery(
+                    data_dir.join("cron.json"),
+                    Arc::new(ServeCronDelivery {
+                        profile_id: profile.id.clone(),
+                    }),
+                ));
                 cron_service.start();
                 let lifecycle = Arc::new(ProfileRuntimeLifecycle {
                     cron_service: Some(cron_service.clone()),

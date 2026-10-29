@@ -27819,6 +27819,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         || matches!(
             &continuation.reason,
             MasterContinuationReason::External(kind) if kind == workspace_team::MESSAGE_KIND
+                || kind == crate::autonomy::agent_orchestrator::CRON_FIRE_EXTERNAL_KIND
         );
     let cache_reservation = match reserve_peer_build_cache_turn(
         state,
