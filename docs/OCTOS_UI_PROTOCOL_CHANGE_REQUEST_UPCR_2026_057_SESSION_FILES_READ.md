@@ -27,7 +27,7 @@ Result: `SessionFilesReadResult` — `{ session_id, path, size_bytes, offset, eo
 - `mime_type` is a conservative extension mapping with `application/octet-stream` fallback.
 - A file larger than 32 MiB (33,554,432 bytes) returns `workspace_file_too_large`; smaller files are readable in multiple calls. One response stays below the 1 MiB WebSocket text-frame limit.
 
-The path is canonicalized and checked for containment before opening. The final open uses `O_NOFOLLOW` on Unix; non-Unix re-checks the leaf for symlinks. Reads are bounded and occur on a blocking thread. Errors use typed `data.kind` values (`workspace_file_invalid_path`, `workspace_file_escape`, `workspace_file_not_found`, `workspace_file_not_regular`, `workspace_file_too_large`, `workspace_file_offset_out_of_range`, `workspace_file_invalid_length`, `session_workspace_not_found`, `workspace_file_access_denied`) and do not disclose absolute host paths.
+On Unix the approved root and every path component are opened relative to a trusted directory descriptor with `O_NOFOLLOW`; non-Unix uses the checked-path fallback. File type and size are validated on the opened descriptor, not a prior pathname stat, preventing ancestor-swap and size TOCTOU races. Reads are bounded and occur on a blocking thread. Errors use typed `data.kind` values (`workspace_file_invalid_path`, `workspace_file_escape`, `workspace_file_not_found`, `workspace_file_not_regular`, `workspace_file_too_large`, `workspace_file_offset_out_of_range`, `workspace_file_invalid_length`, `session_workspace_not_found`, `workspace_file_access_denied`) and do not disclose absolute host paths.
 
 ## Capability and authorization
 

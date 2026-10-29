@@ -1671,60 +1671,7 @@ async fn read_session_workspace_file(
             "session workspace was not found",
         ));
     };
-    let root = std::fs::canonicalize(&workspace).map_err(|_| {
-        workspace_file_error(
-            rpc_error_codes::RESOURCE_NOT_FOUND,
-            "session_workspace_not_found",
-            "session workspace was not found",
-        )
-    })?;
-    let candidate = root.join(relative);
-    let path = std::fs::canonicalize(&candidate).map_err(|_| {
-        workspace_file_error(
-            rpc_error_codes::RESOURCE_NOT_FOUND,
-            "workspace_file_not_found",
-            "workspace file was not found",
-        )
-    })?;
-    if !path.starts_with(&root) {
-        return Err(workspace_file_error(
-            rpc_error_codes::PERMISSION_DENIED,
-            "workspace_file_escape",
-            "workspace file must stay inside the session workspace",
-        ));
-    }
-    if !path.is_file() {
-        return Err(workspace_file_error(
-            rpc_error_codes::RESOURCE_NOT_FOUND,
-            "workspace_file_not_regular",
-            "workspace path is not a regular file",
-        ));
-    }
-    let size_bytes = path
-        .metadata()
-        .map_err(|_| {
-            workspace_file_error(
-                rpc_error_codes::RESOURCE_NOT_FOUND,
-                "workspace_file_not_found",
-                "workspace file was not found",
-            )
-        })?
-        .len();
-    if size_bytes > SESSION_FILE_READ_MAX_BYTES {
-        return Err(workspace_file_error(
-            rpc_error_codes::INVALID_PARAMS,
-            "workspace_file_too_large",
-            format!("workspace file exceeds the {SESSION_FILE_READ_MAX_BYTES}-byte limit"),
-        ));
-    }
     let offset = params.offset.unwrap_or(0);
-    if offset > size_bytes {
-        return Err(workspace_file_error(
-            rpc_error_codes::INVALID_PARAMS,
-            "workspace_file_offset_out_of_range",
-            "offset exceeds the workspace file size",
-        ));
-    }
     let length = params
         .length
         .map(u64::from)
@@ -1737,14 +1684,15 @@ async fn read_session_workspace_file(
         ));
     }
     let length = length.min(SESSION_FILE_READ_CHUNK_BYTES);
-    let (bytes, eof) = read_file_chunk_no_follow(path.clone(), offset, length).await?;
+    let (bytes, size_bytes, eof) =
+        read_file_chunk_no_follow(workspace, relative, offset, length).await?;
     Ok(SessionFilesReadResult {
         session_id: params.session_id,
-        path: params.path,
+        path: params.path.clone(),
         size_bytes,
         offset,
         eof,
-        mime_type: workspace_mime_type(&path).to_owned(),
+        mime_type: workspace_mime_type(relative).to_owned(),
         encoding: "base64".to_owned(),
         content_base64: BASE64_STANDARD.encode(bytes),
     })
@@ -2663,44 +2611,138 @@ async fn read_file_no_follow(path: std::path::PathBuf) -> std::io::Result<Vec<u8
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
-async fn read_file_chunk_no_follow(
-    path: std::path::PathBuf,
-    offset: u64,
-    length: u64,
-) -> Result<(Vec<u8>, bool), RpcError> {
-    let result = tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Seek};
+#[cfg(unix)]
+fn open_workspace_file(
+    root: &std::path::Path,
+    relative: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, open, openat};
 
-        let mut opts = std::fs::OpenOptions::new();
-        opts.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.custom_flags(libc::O_NOFOLLOW);
-        }
-        #[cfg(not(unix))]
-        {
-            if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    // Walk the approved root itself component-by-component. NOFOLLOW on only
+    // the final leaf would still allow a post-validation ancestor swap.
+    let mut directory = open("/", directory_flags, Mode::empty())?;
+    for component in root.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                directory = openat(&directory, name, directory_flags, Mode::empty())?;
+            }
+            _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    "symlink rejected",
+                    "invalid workspace root",
                 ));
             }
         }
-        let mut file = opts.open(&path)?;
-        let size = file.metadata()?.len();
-        file.seek(std::io::SeekFrom::Start(offset))?;
+    }
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid workspace file path",
+            ));
+        };
+        if components.peek().is_some() {
+            directory = openat(&directory, name, directory_flags, Mode::empty())?;
+        } else {
+            return Ok(
+                openat(&directory, name, file_flags, Mode::empty()).map(std::fs::File::from)?
+            );
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "empty workspace file path",
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_workspace_file(
+    root: &std::path::Path,
+    relative: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    let path = super::file_mutations::checked_path(root, relative)?;
+    std::fs::OpenOptions::new().read(true).open(path)
+}
+
+fn workspace_open_error(error: std::io::Error) -> RpcError {
+    match error.kind() {
+        _ if error.raw_os_error() == Some(libc::ELOOP)
+            || error.kind() == std::io::ErrorKind::NotADirectory =>
+        {
+            workspace_file_error(
+                rpc_error_codes::PERMISSION_DENIED,
+                "workspace_file_escape",
+                "workspace file must stay inside the session workspace",
+            )
+        }
+        std::io::ErrorKind::PermissionDenied => workspace_file_error(
+            rpc_error_codes::PERMISSION_DENIED,
+            "workspace_file_escape",
+            "workspace file must stay inside the session workspace",
+        ),
+        std::io::ErrorKind::NotFound => workspace_file_error(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            "workspace_file_not_found",
+            "workspace file was not found",
+        ),
+        std::io::ErrorKind::IsADirectory => workspace_file_error(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            "workspace_file_not_regular",
+            "workspace path is not a regular file",
+        ),
+        _ => workspace_file_error(
+            rpc_error_codes::INTERNAL_ERROR,
+            "workspace_file_read_failed",
+            "workspace file could not be read",
+        ),
+    }
+}
+
+async fn read_file_chunk_no_follow(
+    root: std::path::PathBuf,
+    relative: &std::path::Path,
+    offset: u64,
+    length: u64,
+) -> Result<(Vec<u8>, u64, bool), RpcError> {
+    let relative = relative.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek};
+
+        let mut file = open_workspace_file(&root, &relative).map_err(workspace_open_error)?;
+        let size = file.metadata().map_err(workspace_open_error)?.len();
+        if size > SESSION_FILE_READ_MAX_BYTES {
+            return Err(workspace_file_error(
+                rpc_error_codes::INVALID_PARAMS,
+                "workspace_file_too_large",
+                format!("workspace file exceeds the {SESSION_FILE_READ_MAX_BYTES}-byte limit"),
+            ));
+        }
+        if offset > size {
+            return Err(workspace_file_error(
+                rpc_error_codes::INVALID_PARAMS,
+                "workspace_file_offset_out_of_range",
+                "offset exceeds the workspace file size",
+            ));
+        }
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(workspace_open_error)?;
         let mut bytes = Vec::new();
-        file.take(length).read_to_end(&mut bytes)?;
+        file.take(length)
+            .read_to_end(&mut bytes)
+            .map_err(workspace_open_error)?;
         let eof = offset.saturating_add(bytes.len() as u64) >= size;
-        Ok::<(Vec<u8>, bool), std::io::Error>((bytes, eof))
+        Ok((bytes, size, eof))
     })
     .await;
     match result {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(_)) | Err(_) => Err(workspace_file_error(
-            rpc_error_codes::RESOURCE_NOT_FOUND,
-            "workspace_file_not_found",
+        Ok(value) => value,
+        Err(_) => Err(workspace_file_error(
+            rpc_error_codes::INTERNAL_ERROR,
+            "workspace_file_read_failed",
             "workspace file could not be read",
         )),
     }
@@ -6090,7 +6132,58 @@ mod tests {
                 error.data.as_ref().unwrap()["kind"],
                 "workspace_file_escape"
             );
+
+            let outside_dir = data.path().join("outside-dir");
+            std::fs::create_dir(&outside_dir).unwrap();
+            std::fs::write(outside_dir.join("secret.md"), b"secret").unwrap();
+            std::os::unix::fs::symlink(&outside_dir, workspace.join("dir-link")).unwrap();
+            let error = read_session_workspace_file(
+                &state,
+                data.path(),
+                Some(MAIN_PROFILE_ID),
+                file_read_params("api:demo", "dir-link/secret.md", None, None),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.data.as_ref().unwrap()["kind"],
+                "workspace_file_escape"
+            );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_file_read_rejects_symlinked_directory_components() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::empty_for_tests();
+        let workspace = workspace_for_session(data.path(), "api:demo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outside_dir = data.path().join("outside-dir");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("secret.md"), b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, workspace.join("dir-link")).unwrap();
+        let error = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params("api:demo", "dir-link/secret.md", None, None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_escape"
+        );
+    }
+
+    #[test]
+    fn workspace_open_error_maps_not_a_directory_to_escape() {
+        let error = workspace_open_error(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_escape"
+        );
     }
 
     #[tokio::test]
